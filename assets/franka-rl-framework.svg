@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
+    <!-- Definitions for reusable elements -->
+    <defs>
+        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+        </marker>
+        <marker id="arrowhead-red" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#b71c1c"/>
+        </marker>
+    </defs>
+
+    <!-- Background -->
+    <rect width="800" height="500" fill="#ffffff"/>
+
+    <!-- Title -->
+    <text x="400" y="40" text-anchor="middle" font-size="24" font-weight="bold" fill="#333">
+        Reinforcement Learning Framework for Franka Robots
+    </text>
+
+    <!-- RL Agent Section -->
+    <g transform="translate(80,150)">
+        <rect x="0" y="0" width="120" height="60" rx="5" fill="#e1f5fe" stroke="#01579b" stroke-width="2"/>
+        <text x="60" y="35" text-anchor="middle" font-size="16" fill="#01579b">RL Agent</text>
+    </g>
+
+    <!-- Python Bindings -->
+    <g transform="translate(250,150)">
+        <rect x="0" y="0" width="120" height="60" rx="5" fill="#e0f2f1" stroke="#004d40" stroke-width="2"/>
+        <text x="60" y="28" text-anchor="middle" font-size="14" fill="#004d40">Python</text>
+        <text x="60" y="48" text-anchor="middle" font-size="14" fill="#004d40">Bindings</text>
+    </g>
+
+    <!-- Libfranka -->
+    <g transform="translate(420,150)">
+        <rect x="0" y="0" width="120" height="60" rx="5" fill="#fff3e0" stroke="#e65100" stroke-width="2"/>
+        <text x="60" y="35" text-anchor="middle" font-size="16" fill="#e65100">Libfranka</text>
+    </g>
+
+    <!-- Python Server -->
+    <g transform="translate(590,150)">
+        <rect x="0" y="0" width="120" height="60" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+        <text x="60" y="35" text-anchor="middle" font-size="16" fill="#2e7d32">Python</text>
+        <text x="60" y="55" text-anchor="middle" font-size="16" fill="#2e7d32">Server</text>
+    </g>
+
+    <!-- Real Robot Hardware -->
+    <g transform="translate(380,300)">
+        <rect x="0" y="0" width="120" height="80" rx="5" fill="#ffebee" stroke="#b71c1c" stroke-width="2"/>
+        <text x="60" y="35" text-anchor="middle" font-size="14" fill="#b71c1c">Real Robot</text>
+        <text x="60" y="55" text-anchor="middle" font-size="14" fill="#b71c1c">Hardware</text>
+    </g>
+
+    <!-- Genesis Simulator -->
+    <g transform="translate(620,300)">
+        <rect x="0" y="0" width="120" height="80" rx="5" fill="#f3e5f5" stroke="#4a148c" stroke-width="2"/>
+        <text x="60" y="35" text-anchor="middle" font-size="16" fill="#4a148c">Genesis</text>
+        <text x="60" y="55" text-anchor="middle" font-size="16" fill="#4a148c">Simulator</text>
+    </g>
+
+    <!-- Switch Circle with Simple Arrows -->
+    <g transform="translate(500,340)">
+        <circle cx="60" cy="0" r="18" fill="#ffd700" stroke="#666" stroke-width="2"/>
+        <path d="M50,0 L70,0 M50,0 L54,-4 M50,0 L54,4 M70,0 L66,-4 M70,0 L66,4"
+              stroke="#666" stroke-width="2" fill="none"/>
+    </g>
+
+    <!-- Connections -->
+    <!-- Agent to Python Bindings -->
+    <path d="M200,180 L250,180" stroke="#666" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/>
+
+    <!-- Python Bindings to Libfranka -->
+    <path d="M370,180 L420,180" stroke="#666" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/>
+
+    <!-- Libfranka to Server -->
+    <path d="M540,180 L590,180" stroke="#666" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/>
+
+    <!-- Server to Genesis -->
+    <path d="M650,210 L650,300" stroke="#666" stroke-width="2" marker-end="url(#arrowhead)" fill="none"/>
+
+    <!-- Libfranka to Hardware -->
+    <path d="M480,210 L480,300" stroke="#b71c1c" stroke-width="2" marker-end="url(#arrowhead-red)" fill="none"/>
+
+    <!-- Labels -->
+    <text x="205" y="140" font-size="12" fill="#666">Training</text>
+    <text x="470" y="140" font-size="12" fill="#666">TCP Connection</text>
+
+    <!-- Key Features Box -->
+    <rect x="40" y="405" width="720" height="85" rx="5" fill="#f8f9fa" stroke="#ddd" stroke-width="1"/>
+    <g transform="translate(50,420)">
+        <text x="0" y="0" font-size="14" font-weight="bold" fill="#333">Key Features:</text>
+        <text x="0" y="25" font-size="12" fill="#666">• Same application code for both simulation training and hardware deployment</text>
+        <text x="0" y="45" font-size="12" fill="#666">• Seamless switching between simulation and real hardware during inference</text>
+        <text x="0" y="65" font-size="12" fill="#666">• Differentiable simulation enables end-to-end training through backpropagation</text>
+    </g>
+</svg>

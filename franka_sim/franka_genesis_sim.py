@@ -1,20 +1,25 @@
 import argparse
-import numpy as np
-import genesis as gs
-import pinocchio as pin
-from pathlib import Path
+import logging
+import platform
 import threading
 import time
-import logging
 from enum import Enum
+from pathlib import Path
+
+import genesis as gs
+import numpy as np
+
+# import pinocchio as pin
 
 logger = logging.getLogger(__name__)
+
 
 class ControlMode(Enum):
     POSITION = "position"
     VELOCITY = "velocity"
     TORQUE = "torque"
     NONE = "none"
+
 
 class FrankaGenesisSim:
     def __init__(self, enable_vis=False):
@@ -34,21 +39,23 @@ class FrankaGenesisSim:
         self.control_mode_lock = threading.Lock()
         self.dt = 0.01  # Simulation timestep
         self.sim_thread = None
-        
-        # Set up URDF path
-        current_dir = Path(__file__).parent
-        root_dir = current_dir.parent.parent  # Go up two levels to reach libfranka root
-        self.urdf_path = root_dir / "assets/urdf/panda_bullet/panda.urdf"
-        self.xml_path = root_dir / "assets/xml/franka_emika_panda/panda.xml"
+        self.ddq_filtered = np.zeros(9)
+        # Set up paths relative to this file's location
+        current_dir = Path(__file__).parent  # franka_sim directory
+        assets_dir = current_dir.parent / "assets"
+        self.urdf_path = assets_dir / "urdf/panda_bullet/panda.urdf"
+        self.xml_path = assets_dir / "xml/franka_emika_panda/panda.xml"
 
     def load_panda_model(self):
-        model = pin.buildModelFromUrdf(str(self.urdf_path))
-        data = model.createData()
-        return model, data
+        pass
+        # TODO: load pinocchio model
+        # model = pin.buildModelFromUrdf(str(self.urdf_path))
+        # data = model.createData()
+        # return model, data
 
     def initialize_simulation(self):
         # Initialize Genesis
-        gs.init(backend=gs.gpu, logging_level=None)
+        gs.init(backend=gs.cpu, logging_level=None)
 
         # Create scene
         self.scene = gs.Scene(
@@ -56,14 +63,14 @@ class FrankaGenesisSim:
                 camera_pos=(0, -3.5, 2.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=30,
-                res=(960, 640),
+                res=(1280, 800),
                 max_FPS=60,
             ),
             sim_options=gs.options.SimOptions(
                 dt=self.dt,
             ),
             show_viewer=self.enable_vis,
-            show_FPS=False
+            show_FPS=False,
         )
 
         # Add entities
@@ -79,19 +86,20 @@ class FrankaGenesisSim:
         self.scene.build()
 
         # Load Pinocchio model
-        self.model, self.data = self.load_panda_model()
+        # TODO: load pinocchio model
+        # self.model, self.data = self.load_panda_model()
 
         # Joint names and indices
         self.jnt_names = [
-            'joint1',
-            'joint2',
-            'joint3',
-            'joint4',
-            'joint5',
-            'joint6',
-            'joint7',
-            'finger_joint1',
-            'finger_joint2',
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+            "joint7",
+            "finger_joint1",
+            "finger_joint2",
         ]
         self.dofs_idx = [self.franka.get_joint(name).dof_idx_local for name in self.jnt_names]
 
@@ -107,19 +115,16 @@ class FrankaGenesisSim:
         # Set the initial position as the target position for the controller
         with self.joint_position_lock:
             self.latest_joint_positions = initial_q.copy()
-            
+
         for _ in range(100):
-            self.franka.set_dofs_position(
-                np.concatenate([initial_q, [0.04, 0.04]]),
-                self.dofs_idx
-            )
+            self.franka.set_dofs_position(np.concatenate([initial_q, [0.04, 0.04]]), self.dofs_idx)
             self.scene.step()
 
     def set_control_mode(self, mode: ControlMode):
         """Set the control mode for the robot"""
         if not isinstance(mode, ControlMode):
             raise ValueError(f"Mode must be a ControlMode enum, got {type(mode)}")
-        
+
         with self.control_mode_lock:
             logger.info(f"Switching control mode to: {mode.value}")
             self.control_mode = mode
@@ -142,10 +147,10 @@ class FrankaGenesisSim:
     def run_simulation(self):
         """Main simulation loop"""
         logger.info("Starting Genesis simulation loop")
-        
+
         # For numerical differentiation
-        prev_dq_full = np.zeros(9)
-        ddq_filtered = np.zeros(9)
+        self.prev_dq_full = np.zeros(9)
+        self.ddq_filtered = np.zeros(9)
         alpha_acc = 0.95
 
         while self.running:
@@ -154,9 +159,9 @@ class FrankaGenesisSim:
             dq_full = self.franka.get_dofs_velocity(self.dofs_idx).cpu().numpy()
 
             # Calculate acceleration
-            ddq_raw = (dq_full - prev_dq_full) / self.dt
-            ddq_filtered = alpha_acc * ddq_filtered + (1 - alpha_acc) * ddq_raw
-            prev_dq_full = dq_full.copy()
+            ddq_raw = (dq_full - self.prev_dq_full) / self.dt
+            self.ddq_filtered = alpha_acc * self.ddq_filtered + (1 - alpha_acc) * ddq_raw
+            self.prev_dq_full = dq_full.copy()
 
             # Get current control mode
             with self.control_mode_lock:
@@ -168,13 +173,13 @@ class FrankaGenesisSim:
                     q_d = self.latest_joint_positions.copy()
                 q_cmd = np.concatenate([q_d, [0.04, 0.04]])
                 self.franka.control_dofs_position(q_cmd, self.dofs_idx)
-            
+
             elif current_mode == ControlMode.VELOCITY:
                 with self.joint_velocity_lock:
                     dq_d = self.latest_joint_velocities.copy()
                 dq_cmd = np.concatenate([dq_d, [0.0, 0.0]])
                 self.franka.control_dofs_velocity(dq_cmd, self.dofs_idx)
-            
+
             elif current_mode == ControlMode.TORQUE:
                 with self.torque_lock:
                     tau_d = self.latest_torques.copy()
@@ -194,12 +199,16 @@ class FrankaGenesisSim:
         """Start the simulation"""
         if not self.scene:
             self.initialize_simulation()
-            
+
         self.running = True
-        
+
         if self.enable_vis:
             # Run simulation in a separate thread when visualization is enabled
-            gs.tools.run_in_another_thread(fn=self.run_simulation, args=())
+            # if macos, run in a separate thread
+            if platform.system() == "Darwin" and platform.machine() == "arm64":
+                gs.tools.run_in_another_thread(fn=self.run_simulation, args=())
+            else:
+                self.run_simulation()
             # Run viewer in main thread
             self.scene.viewer.start()
         else:
@@ -216,15 +225,50 @@ class FrankaGenesisSim:
 
     def get_robot_state(self):
         """Get current robot state for network transmission"""
+        # q_d is the desired joint positions user sent joint positions
+        q_d = self.latest_joint_positions
+
         q_full = self.franka.get_dofs_position(self.dofs_idx).cpu().numpy()
         dq_full = self.franka.get_dofs_velocity(self.dofs_idx).cpu().numpy()
-        
+        # calculate ddq_full
+        ddq_full = self.ddq_filtered
+
+        # Get end-effector position and orientation
+        hand_link = self.franka.get_link("hand")
+        ee_pos = hand_link.get_pos().cpu().numpy()
+        ee_quat = hand_link.get_quat().cpu().numpy()  # [x, y, z, w]
+
+        # Convert quaternion to rotation matrix
+        # Note: quaternion from Genesis is [x, y, z, w]
+        x, y, z, w = ee_quat
+        R = np.array(
+            [
+                [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * w * z, 2 * x * z + 2 * w * y],
+                [2 * x * y + 2 * w * z, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * w * x],
+                [2 * x * z - 2 * w * y, 2 * y * z + 2 * w * x, 1 - 2 * x * x - 2 * y * y],
+            ]
+        )
+
+        # Construct homogeneous transformation matrix
+        O_T_EE = np.eye(4)
+        O_T_EE[:3, :3] = R
+        O_T_EE[:3, 3] = ee_pos
+
+        # Convert to column-major 16-element array
+        O_T_EE = O_T_EE.T.flatten()
+
         # Return only the first 7 joints (excluding fingers)
         return {
-            'q': q_full[:7],
-            'dq': dq_full[:7],
-            'tau_J': self.latest_torques  # Current commanded torques
+            "q": q_full[:7],
+            "dq": dq_full[:7],
+            "ddq": ddq_full[:7],
+            "q_d": q_d,
+            "dq_d": dq_full[:7],
+            "ddq_d": ddq_full[:7],
+            "tau_J": self.latest_torques,  # Current commanded torques
+            "O_T_EE": O_T_EE,  # End-effector pose in base frame (column-major)
         }
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -240,5 +284,6 @@ def main():
     except KeyboardInterrupt:
         sim.stop()
 
+
 if __name__ == "__main__":
-    main() 
+    main()

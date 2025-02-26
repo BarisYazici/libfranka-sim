@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600">
+    <!-- Background -->
+    <rect width="1000" height="600" fill="#ffffff"/>
+
+    <!-- User Application Section -->
+    <rect x="50" y="50" width="200" height="120" rx="10" fill="#FFF8E1" stroke="#FFB300" stroke-width="1.5"/>
+    <text x="150" y="80" font-family="Arial" font-size="16" text-anchor="middle" font-weight="bold" fill="#424242">User Application</text>
+    <rect x="70" y="100" width="160" height="50" rx="5" fill="#FFFDE7" stroke="#FFB300" stroke-width="1"/>
+    <text x="150" y="130" font-family="Arial" font-size="14" text-anchor="middle" fill="#424242">libfranka</text>
+
+    <!-- Network Protocol Section -->
+    <rect x="350" y="50" width="300" height="120" rx="10" fill="#E8EAF6" stroke="#3949AB" stroke-width="1.5"/>
+    <text x="500" y="80" font-family="Arial" font-size="16" text-anchor="middle" font-weight="bold" fill="#424242">Network Protocol</text>
+    <rect x="370" y="100" width="120" height="50" rx="5" fill="#F3F4FB" stroke="#3949AB" stroke-width="1"/>
+    <text x="430" y="130" font-family="Arial" font-size="12" text-anchor="middle" fill="#424242">TCP Commands</text>
+    <rect x="510" y="100" width="120" height="50" rx="5" fill="#F3F4FB" stroke="#3949AB" stroke-width="1"/>
+    <text x="570" y="130" font-family="Arial" font-size="12" text-anchor="middle" fill="#424242">UDP State</text>
+
+    <!-- Backend Section -->
+    <rect x="50" y="300" width="900" height="250" rx="10" fill="#F3E5F5" stroke="#7B1FA2" stroke-width="1.5"/>
+    <text x="500" y="330" font-family="Arial" font-size="16" text-anchor="middle" font-weight="bold" fill="#424242">Robot Backend</text>
+
+    <!-- Simulation Path -->
+    <rect x="70" y="360" width="400" height="170" rx="10" fill="#F8F0F9" stroke="#7B1FA2" stroke-width="1"/>
+    <text x="270" y="390" font-family="Arial" font-size="14" text-anchor="middle" font-weight="bold" fill="#424242">Simulation Mode</text>
+    <rect x="90" y="410" width="360" height="100" rx="5" fill="#FCF7FD" stroke="#7B1FA2" stroke-width="1"/>
+    <text x="270" y="440" font-family="Arial" font-size="14" text-anchor="middle" fill="#424242">Genesis Simulation</text>
+    <text x="270" y="470" font-family="Arial" font-size="12" text-anchor="middle" fill="#616161">- Physics Engine</text>
+    <text x="270" y="490" font-family="Arial" font-size="12" text-anchor="middle" fill="#616161">- State Management</text>
+
+    <!-- Hardware Path -->
+    <rect x="530" y="360" width="400" height="170" rx="10" fill="#F8F0F9" stroke="#7B1FA2" stroke-width="1"/>
+    <text x="730" y="390" font-family="Arial" font-size="14" text-anchor="middle" font-weight="bold" fill="#424242">Hardware Mode</text>
+    <rect x="550" y="410" width="360" height="100" rx="5" fill="#FCF7FD" stroke="#7B1FA2" stroke-width="1"/>
+    <text x="730" y="440" font-family="Arial" font-size="14" text-anchor="middle" fill="#424242">Real Franka Robot</text>
+    <text x="730" y="470" font-family="Arial" font-size="12" text-anchor="middle" fill="#616161">- Physical Hardware</text>
+    <text x="730" y="490" font-family="Arial" font-size="12" text-anchor="middle" fill="#616161">- FCI Interface</text>
+
+    <!-- Connecting Lines -->
+    <path d="M 250 125 L 350 125" stroke="#9E9E9E" stroke-width="1.5" fill="none"/>
+    <path d="M 500 170 L 500 345" stroke="#9E9E9E" stroke-width="1.5" fill="none"/>
+    <path d="M 500 345 L 270 360" stroke="#9E9E9E" stroke-width="1.5" fill="none"/>
+    <path d="M 500 345 L 730 360" stroke="#9E9E9E" stroke-width="1.5" fill="none"/>
+
+    <!-- Switch Indicator -->
+    <circle cx="500" cy="345" r="8" fill="#81C784" stroke="#4CAF50" stroke-width="1"/>
+    <text x="500" y="315" font-family="Arial" font-size="12" text-anchor="middle" fill="#424242">Switch</text>
+</svg>

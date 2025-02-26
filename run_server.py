@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import logging
 from franka_sim import FrankaSimServer
+
+# Configure logging to silence Numba debug output
+logging.getLogger('numba').setLevel(logging.WARNING)
 
 def main():
     ## get command line arguments visualization
@@ -16,4 +20,4 @@ def main():
         server.stop()
 
 if __name__ == "__main__":
-    main() 
+    main()
