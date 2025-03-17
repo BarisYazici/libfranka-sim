@@ -29,9 +29,6 @@ The Franka Simulation Server provides a drop-in replacement for the real Franka 
 
 ## Architecture
 
-
-![Python shared memory Communication](./assets/python_shared.png)
-
 ![Architecture](./assets/libfranka_sim.svg)
 
 In this repository, we only provide the simulation server backend with Genesis connection.
