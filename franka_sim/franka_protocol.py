@@ -7,21 +7,22 @@ COMMAND_PORT = 1337
 
 
 class Command(enum.IntEnum):
-    """Commands supported by the Franka robot interface protocol"""
+    """Commands supported by the Franka robot interface protocol (libfranka 0.9.2)"""
 
     kConnect = 0
     kMove = 1
     kStopMove = 2
-    kSetCollisionBehavior = 3
-    kSetJointImpedance = 4
-    kSetCartesianImpedance = 5
-    kSetGuidingMode = 6
-    kSetEEToK = 7
-    kSetNEToEE = 8
-    kSetLoad = 9
-    kAutomaticErrorRecovery = 10
-    kLoadModelLibrary = 11
-    kGetRobotModel = 12
+    kGetCartesianLimit = 3  # Added for 0.9.2 compatibility
+    kSetCollisionBehavior = 4
+    kSetJointImpedance = 5
+    kSetCartesianImpedance = 6
+    kSetGuidingMode = 7
+    kSetEEToK = 8
+    kSetNEToEE = 9
+    kSetLoad = 10
+    kSetFilters = 11  # Added for 0.9.2 compatibility
+    kAutomaticErrorRecovery = 12
+    kLoadModelLibrary = 13
 
 
 class ConnectStatus(enum.IntEnum):
@@ -251,3 +252,49 @@ class SetCartesianImpedanceCommand:
         # Total expected size: 6 * 8 = 48 bytes
         K_x = list(struct.unpack("<6d", data[:48]))
         return cls(K_x)
+
+
+class LoadModelLibraryArchitecture(enum.IntEnum):
+    """Architecture types for LoadModelLibrary command"""
+
+    kX64 = 0
+    kX86 = 1
+    kARM = 2
+    kARM64 = 3
+
+
+class LoadModelLibrarySystem(enum.IntEnum):
+    """System types for LoadModelLibrary command"""
+
+    kLinux = 0
+    kWindows = 1
+
+
+class LoadModelLibraryStatus(enum.IntEnum):
+    """Status codes for LoadModelLibrary command"""
+
+    kSuccess = 0
+    kError = 1
+
+
+@dataclass
+class LoadModelLibraryCommand:
+    """Represents a LoadModelLibrary command request"""
+
+    architecture: LoadModelLibraryArchitecture
+    system: LoadModelLibrarySystem
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "LoadModelLibraryCommand":
+        """Parse LoadModelLibrary command from binary data"""
+        # Architecture (uint8) + System (uint8)
+        architecture, system = struct.unpack("<BB", data[:2])
+        return cls(LoadModelLibraryArchitecture(architecture), LoadModelLibrarySystem(system))
+
+
+class GetterSetterStatus(enum.IntEnum):
+    """Status codes for getter/setter commands"""
+
+    kSuccess = 0
+    kCommandNotPossibleRejected = 1
+    kInvalidArgumentRejected = 2

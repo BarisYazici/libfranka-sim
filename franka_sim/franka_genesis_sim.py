@@ -42,6 +42,15 @@ class FrankaGenesisSim:
         self.dt = 0.01  # Simulation timestep
         self.sim_thread = None
         self.ddq_filtered = np.zeros(9)
+        # Damping coefficients for torque control (Nm·s/rad) - helps stabilize torque control
+        # Increased values for better stability in simulation, especially for cartesian impedance
+        self.torque_damping = np.array([15.0, 15.0, 15.0, 8.0, 8.0, 8.0, 8.0])
+        # Torque limits (Nm) - safety limits for each joint
+        self.torque_limits = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
+        # Low-pass filter for torque commands (alpha = 0.8 means 80% old, 20% new)
+        # Higher alpha = more filtering = smoother but slower response
+        self.torque_filter_alpha = 0.8
+        self.torque_filtered = np.zeros(7)
 
         # Get the Genesis assets path instead of our own
         import genesis
@@ -138,7 +147,12 @@ class FrankaGenesisSim:
 
         with self.control_mode_lock:
             logger.info(f"Switching control mode to: {mode.value}")
+            old_mode = self.control_mode
             self.control_mode = mode
+            # Reset torque filter when switching to torque mode to avoid transients
+            if mode == ControlMode.TORQUE and old_mode != ControlMode.TORQUE:
+                with self.torque_lock:
+                    self.torque_filtered = self.latest_torques.copy()
 
     def update_torques(self, torques):
         """Update the latest torques to be applied in simulation"""
@@ -194,7 +208,23 @@ class FrankaGenesisSim:
             elif current_mode == ControlMode.TORQUE:
                 with self.torque_lock:
                     tau_d = self.latest_torques.copy()
-                tau_cmd = np.concatenate([tau_d, [0.0, 0.0]])
+
+                # Apply low-pass filter to smooth torque commands
+                self.torque_filtered = (
+                    self.torque_filter_alpha * self.torque_filtered
+                    + (1.0 - self.torque_filter_alpha) * tau_d
+                )
+                tau_filtered = self.torque_filtered.copy()
+
+                # Add velocity damping to stabilize torque control
+                # This mimics the real robot's built-in damping
+                dq_7 = dq_full[:7]  # Get velocities for 7 joints
+                tau_damped = tau_filtered - self.torque_damping * dq_7
+
+                # Clamp torques to safety limits
+                tau_clamped = np.clip(tau_damped, -self.torque_limits, self.torque_limits)
+
+                tau_cmd = np.concatenate([tau_clamped, [0.0, 0.0]])
                 self.franka.control_dofs_force(tau_cmd, self.dofs_idx)
 
             # Step simulation

@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from franka_sim.franka_genesis_sim import ControlMode, FrankaGenesisSim
@@ -17,8 +18,11 @@ from franka_sim.franka_protocol import (
     Command,
     ConnectStatus,
     ControllerMode,
+    GetterSetterStatus,
     LibfrankaControllerMode,
     LibfrankaMotionGeneratorMode,
+    LoadModelLibraryCommand,
+    LoadModelLibraryStatus,
     MessageHeader,
     MotionGeneratorMode,
     MoveCommand,
@@ -34,6 +38,9 @@ from franka_sim.robot_state import RobotState
 # Configure detailed logging for debugging
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Path to model library files
+MODELS_DIR = Path(__file__).parent / "models"
 
 
 class RobotMode(enum.IntEnum):
@@ -217,115 +224,119 @@ class FrankaSimServer:
                 for fd, event in events:
                     if event & select.POLLIN:
                         expected_size = (
-                            8 + (7 * 8 + 7 * 8 + 16 * 8 + 6 * 8 + 2 * 8 + 1 + 1) + (7 * 8 + 1)
+                            8 + (7 * 8 + 7 * 8 + 16 * 8 + 6 * 8 + 2 * 8 + 1 + 1) + (7 * 8)
                         )
                         command = None
 
-                    try:
-                        data, addr = self.udp_socket.recvfrom(expected_size)
-                        if len(data) != expected_size:
-                            logger.warning(
-                                f"Got a UDP packet with wrong size! Expected {expected_size} \
-                                bytes, got {len(data)} bytes"
-                            )
-                            continue
-                        # Unpack the command data
-                        offset = 0
+                        try:
+                            data, addr = self.udp_socket.recvfrom(expected_size)
+                            if len(data) != expected_size:
+                                logger.warning(
+                                    f"Got a UDP packet with wrong size! Expected {expected_size} \
+                                    bytes, got {len(data)} bytes"
+                                )
+                                continue
+                            # Unpack the command data
+                            offset = 0
 
-                        # Unpack message_id
-                        message_id = struct.unpack("<Q", data[offset : offset + 8])[0]
-                        offset += 8
+                            # Unpack message_id
+                            message_id = struct.unpack("<Q", data[offset : offset + 8])[0]
+                            offset += 8
 
-                        # Unpack MotionGeneratorCommand
-                        q_c = struct.unpack("<7d", data[offset : offset + 56])
-                        offset += 56
+                            # Unpack MotionGeneratorCommand
+                            q_c = struct.unpack("<7d", data[offset : offset + 56])
+                            offset += 56
 
-                        dq_c = struct.unpack("<7d", data[offset : offset + 56])
-                        offset += 56
+                            dq_c = struct.unpack("<7d", data[offset : offset + 56])
+                            offset += 56
 
-                        O_T_EE_c = struct.unpack("<16d", data[offset : offset + 128])
-                        offset += 128
+                            O_T_EE_c = struct.unpack("<16d", data[offset : offset + 128])
+                            offset += 128
 
-                        O_dP_EE_c = struct.unpack("<6d", data[offset : offset + 48])
-                        offset += 48
+                            O_dP_EE_c = struct.unpack("<6d", data[offset : offset + 48])
+                            offset += 48
 
-                        elbow_c = struct.unpack("<2d", data[offset : offset + 16])
-                        offset += 16
+                            elbow_c = struct.unpack("<2d", data[offset : offset + 16])
+                            offset += 16
 
-                        valid_elbow = bool(data[offset])
-                        offset += 1
+                            valid_elbow = bool(data[offset])
+                            offset += 1
 
-                        motion_generation_finished = bool(data[offset])
-                        offset += 1
+                            motion_generation_finished = bool(data[offset])
+                            offset += 1
 
-                        # Unpack ControllerCommand
-                        tau_J_d = struct.unpack("<7d", data[offset : offset + 56])
-                        offset += 56
+                            # Unpack ControllerCommand
+                            tau_J_d = struct.unpack("<7d", data[offset : offset + 56])
+                            offset += 56
 
-                        torque_command_finished = bool(data[offset])
+                            command = {
+                                "message_id": message_id,
+                                "q_c": q_c,
+                                "dq_c": dq_c,
+                                "O_T_EE_c": O_T_EE_c,
+                                "O_dP_EE_c": O_dP_EE_c,
+                                "elbow_c": elbow_c,
+                                "valid_elbow": valid_elbow,
+                                "motion_generation_finished": motion_generation_finished,
+                                "tau_J_d": tau_J_d,
+                            }
 
-                        command = {
-                            "message_id": message_id,
-                            "q_c": q_c,
-                            "dq_c": dq_c,
-                            "O_T_EE_c": O_T_EE_c,
-                            "O_dP_EE_c": O_dP_EE_c,
-                            "elbow_c": elbow_c,
-                            "valid_elbow": valid_elbow,
-                            "motion_generation_finished": motion_generation_finished,
-                            "tau_J_d": tau_J_d,
-                            "torque_command_finished": torque_command_finished,
-                        }
+                        except BlockingIOError:
+                            break
+                        except Exception as e:
+                            # logger.error(f"Error receiving message: {e}")
+                            break
 
-                    except BlockingIOError:
-                        break
-                    except Exception as e:
-                        # logger.error(f"Error receiving message: {e}")
-                        break
+                        # Process newest command if we have one
+                        if command and command["message_id"] > 0:
+                            # Check if motion is finished
+                            if command["motion_generation_finished"]:
+                                # Switch to position control and hold current position
+                                logger.info(
+                                    "Motion finished: Switching to position control mode \
+                                        and holding current position"
+                                )
+                                current_joint_positions = self.genesis_sim.get_robot_state()["q"]
+                                self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                                self.control_mode = ControlMode.POSITION
+                                self.genesis_sim.update_joint_positions(current_joint_positions)
+                                self.genesis_sim.update_torques([0.0] * 7)
+                                # Keep updating position to hold it (important for stability)
+                                self.robot_state.state["q_d"] = list(current_joint_positions)
 
-                # Process newest command if we have one
-                if command and command["message_id"] > 0:
-                    # Check if motion is finished
-                    if command["motion_generation_finished"]:
-                        # Switch to position control and hold current position
-                        if self.control_mode != ControlMode.POSITION:
-                            logger.info(
-                                "Motion finished: Switching to position control mode \
-                                    and holding current position"
-                            )
-                            current_joint_positions = self.genesis_sim.get_robot_state()["q"]
-                            self.genesis_sim.set_control_mode(ControlMode.POSITION)
-                            self.control_mode = ControlMode.POSITION
-                            self.genesis_sim.update_joint_positions(current_joint_positions)
-                            self.genesis_sim.update_torques([0.0] * 7)
+                                # Update state to idle modes
+                                self.robot_state.state["motion_generator_mode"] = 0  # kIdle
+                                self.robot_state.state["controller_mode"] = 3  # kOther
+                                self.robot_state.state["robot_mode"] = RobotMode.kIdle
 
-                        # Update state to idle modes
-                        self.robot_state.state["motion_generator_mode"] = 0  # kIdle
-                        self.robot_state.state["controller_mode"] = 3  # kOther
-                        self.robot_state.state["robot_mode"] = RobotMode.kIdle
+                                # Send state with new message ID
+                                self.robot_state.update()  # This increments message_id
+                                final_state = self.robot_state.pack_state()
+                                if self.udp_socket and not self.udp_socket._closed:
+                                    try:
+                                        self.udp_socket.sendto(
+                                            final_state, (self.client_address, self.client_udp_port)
+                                        )
+                                    except (AttributeError, OSError) as e:
+                                        logger.warning(f"Failed to send final state: {e}")
 
-                        # Send state with new message ID
-                        self.robot_state.update()  # This increments message_id
-                        final_state = self.robot_state.pack_state()
-                        self.udp_socket.sendto(
-                            final_state, (self.client_address, self.client_udp_port)
-                        )
-
-                        # Send TCP success response for the Move command
-                        if self.current_motion_id:
-                            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
-                            response_header = MessageHeader(
-                                Command.kMove, self.current_motion_id, total_size
-                            )
-                            header_bytes = response_header.to_bytes()
-                            response_data = struct.pack("<B3x", MoveStatus.kSuccess.value)
-                            self.client_socket.sendall(header_bytes + response_data)
-                            logger.info(
-                                f"Sent Move success response for motion ID: \
-                                  {self.current_motion_id}"
-                            )
-                            self.current_motion_id = 0  # Reset motion ID after sending response
-                        continue
+                                # Send TCP success response for the Move command
+                                if self.current_motion_id:
+                                    total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+                                    response_header = MessageHeader(
+                                        Command.kMove, self.current_motion_id, total_size
+                                    )
+                                    header_bytes = response_header.to_bytes()
+                                    response_data = struct.pack("<B3x", MoveStatus.kSuccess.value)
+                                    self.client_socket.sendall(header_bytes + response_data)
+                                    logger.info(
+                                        f"Sent Move success response for motion ID: \
+                                          {self.current_motion_id}"
+                                    )
+                                    self.current_motion_id = (
+                                        0  # Reset motion ID after sending response
+                                    )
+                                continue
 
                     # Update Genesis simulator based on control mode
                     if (
@@ -344,6 +355,18 @@ class FrankaSimServer:
                         self.robot_state.state["q_d"] = list(command["q_c"])
                         self.genesis_sim.update_joint_positions(command["q_c"])
                         self.genesis_sim.update_torques([0.0] * 7)
+                    # If robot mode is idle but we're still in torque mode, switch to position to hold
+                    elif (
+                        self.robot_state.state["robot_mode"] == RobotMode.kIdle
+                        and self.control_mode == ControlMode.TORQUE
+                    ):
+                        logger.info("Robot idle but in torque mode, switching to position control")
+                        current_joint_positions = self.genesis_sim.get_robot_state()["q"]
+                        self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                        self.control_mode = ControlMode.POSITION
+                        self.genesis_sim.update_joint_positions(current_joint_positions)
+                        self.genesis_sim.update_torques([0.0] * 7)
+                        self.robot_state.state["q_d"] = list(current_joint_positions)
                     elif (
                         self.robot_state.state["controller_mode"]
                         == LibfrankaControllerMode.kJointImpedance
@@ -362,6 +385,11 @@ class FrankaSimServer:
                         self.robot_state.state["controller_mode"]
                         == LibfrankaControllerMode.kExternalController
                     ):
+                        # Only process torque commands if robot is in Move mode
+                        # If robot is idle (motion finished), ignore torque commands to hold position
+                        if self.robot_state.state["robot_mode"] == RobotMode.kIdle:
+                            # Motion has finished, ignore torque commands to maintain position
+                            continue
                         if self.control_mode is not ControlMode.TORQUE:
                             logger.info("Setting control mode to TORQUE")
                             self.genesis_sim.set_control_mode(ControlMode.TORQUE)
@@ -511,7 +539,13 @@ class FrankaSimServer:
                 # Send state with new message ID
                 self.robot_state.update()  # This increments message_id
                 final_state = self.robot_state.pack_state()
-                self.udp_socket.sendto(final_state, (self.client_address, self.client_udp_port))
+                if self.udp_socket and not self.udp_socket._closed:
+                    try:
+                        self.udp_socket.sendto(
+                            final_state, (self.client_address, self.client_udp_port)
+                        )
+                    except (AttributeError, OSError) as e:
+                        logger.warning(f"Failed to send final state in StopMove: {e}")
                 logger.info(
                     f"Sent final robot state with message_id:\
                           {self.robot_state.state['message_id']}"
@@ -643,6 +677,176 @@ class FrankaSimServer:
             response_data = struct.pack("<B3x", 1)  # Status 1 = Error
             client_socket.sendall(header_bytes + response_data)
 
+    def handle_get_cartesian_limit_command(
+        self, client_socket, header: MessageHeader, payload: bytes
+    ):
+        """Handle GetCartesianLimit command received over TCP"""
+        try:
+            # Parse request - contains int32 id
+            limit_id = struct.unpack("<i", payload[:4])[0]
+            logger.info(f"Received GetCartesianLimit command for id: {limit_id}")
+
+            # Response: status (1) + object_world_size (3*8=24) + object_frame (16*8=128)
+            #           + object_activation (1) = 154 bytes
+            total_size = 12 + 154  # Header + response
+            response_header = MessageHeader(
+                Command.kGetCartesianLimit, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+
+            # Default response with empty/inactive cartesian limit
+            object_world_size = [0.0, 0.0, 0.0]
+            object_frame = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]  # Identity
+            object_activation = False
+
+            response_data = struct.pack(
+                "<B3d16d?",
+                GetterSetterStatus.kSuccess.value,
+                *object_world_size,
+                *object_frame,
+                object_activation,
+            )
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent GetCartesianLimit success response")
+
+        except Exception as e:
+            logger.error(f"Error handling GetCartesianLimit command: {e}")
+            total_size = 12 + 154
+            response_header = MessageHeader(
+                Command.kGetCartesianLimit, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack(
+                "<B3d16d?",
+                GetterSetterStatus.kCommandNotPossibleRejected.value,
+                *([0.0] * 3),
+                *([0.0] * 16),
+                False,
+            )
+            client_socket.sendall(header_bytes + response_data)
+
+    def handle_set_filters_command(self, client_socket, header: MessageHeader, payload: bytes):
+        """Handle SetFilters command received over TCP"""
+        try:
+            # Parse request - 5 doubles for filter frequencies
+            frequencies = struct.unpack("<5d", payload[:40])
+            logger.info(f"Received SetFilters command with frequencies: {frequencies}")
+
+            # Send success response
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(Command.kSetFilters, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", GetterSetterStatus.kSuccess.value)
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent SetFilters success response")
+
+        except Exception as e:
+            logger.error(f"Error handling SetFilters command: {e}")
+            total_size = 12 + 4
+            response_header = MessageHeader(Command.kSetFilters, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack(
+                "<B3x", GetterSetterStatus.kCommandNotPossibleRejected.value
+            )
+            client_socket.sendall(header_bytes + response_data)
+
+    def handle_load_model_library_command(
+        self, client_socket, header: MessageHeader, payload: bytes
+    ):
+        """Handle LoadModelLibrary command received over TCP"""
+        try:
+            # Parse request
+            cmd = LoadModelLibraryCommand.from_bytes(payload)
+            logger.info(
+                f"Received LoadModelLibrary command: arch={cmd.architecture.name}, "
+                f"system={cmd.system.name}"
+            )
+
+            # Determine model file based on architecture and system
+            if cmd.system == cmd.system.kLinux:
+                suffix = ".so"
+            else:
+                suffix = ".dll"
+
+            # Map architecture enum to filename (without 'k' prefix)
+            arch_names = {
+                cmd.architecture.kX64: "x64",
+                cmd.architecture.kX86: "x86",
+                cmd.architecture.kARM: "arm",
+                cmd.architecture.kARM64: "arm64",
+            }
+            arch_name = arch_names.get(cmd.architecture, cmd.architecture.name.lower())
+            model_filename = f"libfcimodels_{arch_name}{suffix}"
+            model_path = MODELS_DIR / model_filename
+
+            if not model_path.exists():
+                logger.error(f"Model library not found: {model_path}")
+                # Send error response (just 1 byte status, no padding)
+                total_size = 12 + 1  # Header + status
+                response_header = MessageHeader(
+                    Command.kLoadModelLibrary, header.command_id, total_size
+                )
+                header_bytes = response_header.to_bytes()
+                response_data = struct.pack("<B", LoadModelLibraryStatus.kError.value)
+                client_socket.sendall(header_bytes + response_data)
+                return
+
+            # Read the model library file
+            with open(model_path, "rb") as f:
+                model_data = f.read()
+
+            logger.info(f"Sending model library: {model_path} ({len(model_data)} bytes)")
+
+            # Send success response with model data
+            # Response format: header (12) + status (1) + model data (no padding!)
+            total_size = 12 + 1 + len(model_data)
+            response_header = MessageHeader(
+                Command.kLoadModelLibrary, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B", LoadModelLibraryStatus.kSuccess.value) + model_data
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent LoadModelLibrary success response with model data")
+
+        except Exception as e:
+            logger.error(f"Error handling LoadModelLibrary command: {e}")
+            total_size = 12 + 1  # Header + status (no padding)
+            response_header = MessageHeader(
+                Command.kLoadModelLibrary, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B", LoadModelLibraryStatus.kError.value)
+            client_socket.sendall(header_bytes + response_data)
+
+    def handle_automatic_error_recovery_command(self, client_socket, header: MessageHeader):
+        """Handle AutomaticErrorRecovery command received over TCP"""
+        try:
+            logger.info("Received AutomaticErrorRecovery command")
+
+            # Send success response
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(
+                Command.kAutomaticErrorRecovery, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 0)  # Status 0 = kSuccess
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent AutomaticErrorRecovery success response")
+
+        except Exception as e:
+            logger.error(f"Error handling AutomaticErrorRecovery command: {e}")
+            total_size = 12 + 4
+            response_header = MessageHeader(
+                Command.kAutomaticErrorRecovery, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 5)  # Status 5 = kAborted
+            client_socket.sendall(header_bytes + response_data)
+
     def handle_tcp_messages(self, client_socket):
         """Handle TCP messages in a separate thread"""
         logger.info("TCP message handler thread started")
@@ -666,6 +870,7 @@ class FrankaSimServer:
 
                 logger.debug("Data available on socket, attempting to receive...")
                 header, payload = self.receive_message(client_socket)
+
                 logger.info(
                     f"Processing command: {Command(header.command).name} (ID: {header.command_id})"
                 )
@@ -677,6 +882,9 @@ class FrankaSimServer:
                 elif header.command == Command.kStopMove:
                     logger.info("Handling StopMove command")
                     self.handle_stop_move_command(client_socket, header)
+                elif header.command == Command.kGetCartesianLimit:
+                    logger.info("Handling GetCartesianLimit command")
+                    self.handle_get_cartesian_limit_command(client_socket, header, payload)
                 elif header.command == Command.kSetCollisionBehavior:
                     logger.info("Handling SetCollisionBehavior command")
                     self.handle_set_collision_behavior_command(client_socket, header, payload)
@@ -686,12 +894,34 @@ class FrankaSimServer:
                 elif header.command == Command.kSetCartesianImpedance:
                     logger.info("Handling SetCartesianImpedance command")
                     self.handle_set_cartesian_impedance_command(client_socket, header, payload)
+                elif header.command == Command.kSetFilters:
+                    logger.info("Handling SetFilters command")
+                    self.handle_set_filters_command(client_socket, header, payload)
+                elif header.command == Command.kAutomaticErrorRecovery:
+                    logger.info("Handling AutomaticErrorRecovery command")
+                    self.handle_automatic_error_recovery_command(client_socket, header)
+                elif header.command == Command.kLoadModelLibrary:
+                    logger.info("Handling LoadModelLibrary command")
+                    self.handle_load_model_library_command(client_socket, header, payload)
                 else:
                     logger.warning(
                         f"Unhandled command in TCP thread: {Command(header.command).name}"
                     )
             except ConnectionError as e:
                 logger.error(f"Connection error in TCP thread: {e}")
+                # Switch to position control to hold current position when client disconnects
+                try:
+                    if self.genesis_sim and self.control_mode != ControlMode.POSITION:
+                        current_joint_positions = self.genesis_sim.get_robot_state()["q"]
+                        self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                        self.control_mode = ControlMode.POSITION
+                        self.genesis_sim.update_joint_positions(current_joint_positions)
+                        self.genesis_sim.update_torques([0.0] * 7)
+                        logger.info(
+                            "Switched to position control to hold position after disconnect"
+                        )
+                except Exception as hold_error:
+                    logger.warning(f"Failed to hold position after disconnect: {hold_error}")
                 # Instead of breaking, reset state and continue
                 self.transmitting_state = False
                 self.connection_running = False
@@ -830,7 +1060,26 @@ class FrankaSimServer:
                     # Pack and send current robot state
                     state = self.robot_state.pack_state()
                     if self.udp_socket and not self.udp_socket._closed:
-                        self.udp_socket.sendto(state, (client_address, client_udp_port))
+                        try:
+                            self.udp_socket.sendto(state, (client_address, client_udp_port))
+                        except (AttributeError, OSError) as e:
+                            logger.warning(f"Failed to send robot state: {e}")
+                            break  # Exit loop if socket is broken
+
+                    # If robot is idle (motion finished), ensure we're in position control and holding position
+                    if self.robot_state.state["robot_mode"] == RobotMode.kIdle:
+                        if self.control_mode != ControlMode.POSITION:
+                            current_joint_positions = self.genesis_sim.get_robot_state()["q"]
+                            self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                            self.control_mode = ControlMode.POSITION
+                            self.genesis_sim.update_joint_positions(current_joint_positions)
+                            self.genesis_sim.update_torques([0.0] * 7)
+                            self.robot_state.state["q_d"] = list(current_joint_positions)
+                        else:
+                            # Continuously update position target to hold current position
+                            current_joint_positions = self.genesis_sim.get_robot_state()["q"]
+                            self.genesis_sim.update_joint_positions(current_joint_positions)
+                            self.robot_state.state["q_d"] = list(current_joint_positions)
 
                     # After first state is sent, send a Move success response
                     if not first_state_sent and self.current_motion_id:
