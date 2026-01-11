@@ -44,7 +44,7 @@ class FrankaGenesisSim:
         self.ddq_filtered = np.zeros(9)
         # Damping coefficients for torque control (Nm·s/rad) - helps stabilize torque control
         # Increased values for better stability in simulation, especially for cartesian impedance
-        self.torque_damping = np.array([15.0, 15.0, 15.0, 8.0, 8.0, 8.0, 8.0])
+        self.torque_damping = np.array([25.0, 25.0, 20.0, 40.0, 8.0, 8.0, 8.0])
         # Torque limits (Nm) - safety limits for each joint
         self.torque_limits = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
         # Low-pass filter for torque commands (alpha = 0.8 means 80% old, 20% new)
