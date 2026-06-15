@@ -1020,10 +1020,16 @@ class FrankaSimServer:
                 logger.info("Starting Genesis simulator with visualization")
                 self.genesis_sim.start()
             else:
-                # Without visualization, run server in main thread
-                logger.info("Starting TCP/UDP server")
-                self.run_server()
-                # Start Genesis simulator without visualization
+                # Without visualization, run the TCP/UDP server in a background
+                # thread and step the Genesis physics loop in the main thread.
+                # (run_server() blocks in its accept loop, so it must not run in
+                # the main thread or the simulation would never step.)
+                server_thread = threading.Thread(target=self.run_server)
+                server_thread.daemon = True
+                server_thread.start()
+                logger.info("Server running in background thread (headless)")
+
+                logger.info("Starting Genesis simulator (headless)")
                 self.genesis_sim.start()
 
         except Exception as e:
