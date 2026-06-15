@@ -11,6 +11,26 @@ The Franka Simulation Server provides a drop-in replacement for the real Franka 
 - Validate error handling and safety features
 - Experiment with different control strategies risk-free
 
+## Compatibility
+
+`franka_sim` implements the **latest libfranka wire protocol — robot server version 10**.
+In this protocol the robot model is built **client-side**: during connection the client
+fetches the robot URDF via the `GetRobotModel` command and builds its own Pinocchio model.
+The server therefore just serves a valid URDF (a hand-less FR3 arm by default) instead of a
+precompiled model library.
+
+You need a libfranka version that speaks **server protocol 10**:
+
+| libfranka Version | Robot System Version | Robot/Gripper Server |
+| ----------------- | -------------------- | -------------------- |
+| **>= 0.18.0**     | **>= 5.9.0**         | **10 / 3** ✅ supported |
+| >= 0.15.0         | >= 5.7.2             | 9 / 3 — not supported |
+
+See the [Franka software compatibility matrix](https://frankarobotics.github.io/docs/compatibility.html)
+for the full list. Older libfranka releases (server version 9 and below) use a different wire
+format — double-based `RobotState` and server-side `LoadModelLibrary` instead of `GetRobotModel` —
+and are **not** compatible with this server.
+
 ## Related Projects
 
 - [libfranka-python](https://github.com/BarisYazici/libfranka-python) - Python bindings for libfranka
@@ -40,7 +60,7 @@ The system consists of several key components:
 1. **libfranka Interface Layer**
    - Implements the standard Franka robot network protocol
    - Handles TCP command interface and UDP state updates
-   - Maintains protocol compatibility all libfranka versions
+   - Targets the latest libfranka wire protocol (robot server version 10)
 
 2. **Genesis Simulation Backend**
    - Physics-based robot simulation using the Genesis engine
@@ -146,11 +166,12 @@ The simulation server currently implements all major features of the Franka robo
 - [x] Visualization support
 - [x] Genesis connection
 - [x] libfranka python bindings
+- [x] v10 wire protocol (Connect, float-based RobotState, GetRobotModel/URDF)
+- [x] Robot model via URDF (client-side Pinocchio through GetRobotModel)
 - [ ] Advanced collision detection (in progress)
 - [ ] Error handling and recovery (planned)
 - [ ] Cartesian interfaces (planned)
-- [ ] Return mass, coriolis, gravity, and inverse dynamics (Robot models) (planned)
-- [ ] Gripper simulation (planned)
+- [ ] Gripper simulation / Franka Hand (planned)
 
 
 
