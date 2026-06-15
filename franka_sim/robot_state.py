@@ -187,62 +187,72 @@ class RobotState:
             ],
             "O_dP_EE_c": [0.0] * 6,
             "O_ddP_EE_c": [0.0] * 6,
+            "accelerometer_top": [0.0] * 18,  # 6 links x 3 axes
+            "accelerometer_bottom": [0.0] * 18,  # 6 links x 3 axes
             "motion_generator_mode": 0,
             "controller_mode": 0,
             "reflex_reason": [False] * 41,
         }
 
     def pack_state(self) -> bytes:
-        """Pack robot state into binary format for UDP transmission"""
+        """Pack robot state into the libfranka_new (v10) binary RobotState.
+
+        The v10 RobotState is float-based and 1377 bytes (research_interface
+        rbk_types.h, ``#pragma pack(push, 1)``): ``message_id`` is uint64, the
+        mode/error fields are uint8, and every floatarray is packed as 4-byte
+        floats (v9 used 8-byte doubles, which is the old 2373-byte format).
+        """
         state = bytearray()
 
-        # Pack state in libfranka-expected order
+        # Pack state in libfranka v10 RobotState field order
         state.extend(struct.pack("<Q", self.state["message_id"]))
-        state.extend(struct.pack("<16d", *self.state["O_T_EE"]))
-        state.extend(struct.pack("<16d", *self.state["O_T_EE_d"]))
-        state.extend(struct.pack("<16d", *self.state["F_T_EE"]))
-        state.extend(struct.pack("<16d", *self.state["EE_T_K"]))
-        state.extend(struct.pack("<16d", *self.state["F_T_NE"]))
-        state.extend(struct.pack("<16d", *self.state["NE_T_EE"]))
-        state.extend(struct.pack("<d", self.state["m_ee"]))
-        state.extend(struct.pack("<9d", *self.state["I_ee"]))
-        state.extend(struct.pack("<3d", *self.state["F_x_Cee"][:3]))
-        state.extend(struct.pack("<d", self.state["m_load"]))
-        state.extend(struct.pack("<9d", *self.state["I_load"]))
-        state.extend(struct.pack("<3d", *self.state["F_x_Cload"][:3]))
-        state.extend(struct.pack("<2d", *self.state["elbow"]))
-        state.extend(struct.pack("<2d", *self.state["elbow_d"]))
-        state.extend(struct.pack("<7d", *self.state["tau_J"]))
-        state.extend(struct.pack("<7d", *self.state["tau_J_d"]))
-        state.extend(struct.pack("<7d", *self.state["dtau_J"]))
-        state.extend(struct.pack("<7d", *self.state["q"]))
-        state.extend(struct.pack("<7d", *self.state["q_d"]))
-        state.extend(struct.pack("<7d", *self.state["dq"]))
-        state.extend(struct.pack("<7d", *self.state["dq_d"]))
-        state.extend(struct.pack("<7d", *self.state["ddq_d"]))
-        state.extend(struct.pack("<7d", *self.state["joint_contact"]))
-        state.extend(struct.pack("<6d", *self.state["cartesian_contact"]))
-        state.extend(struct.pack("<7d", *self.state["joint_collision"]))
-        state.extend(struct.pack("<6d", *self.state["cartesian_collision"]))
-        state.extend(struct.pack("<7d", *self.state["tau_ext_hat_filtered"]))
-        state.extend(struct.pack("<6d", *self.state["O_F_ext_hat_K"]))
-        state.extend(struct.pack("<6d", *self.state["K_F_ext_hat_K"]))
-        state.extend(struct.pack("<6d", *self.state["O_dP_EE_d"]))
-        state.extend(struct.pack("<3d", *self.state["O_ddP_O"][:3]))
-        state.extend(struct.pack("<2d", *self.state["elbow_c"]))
-        state.extend(struct.pack("<2d", *self.state["delbow_c"]))
-        state.extend(struct.pack("<2d", *self.state["ddelbow_c"]))
-        state.extend(struct.pack("<16d", *self.state["O_T_EE_c"]))
-        state.extend(struct.pack("<6d", *self.state["O_dP_EE_c"]))
-        state.extend(struct.pack("<6d", *self.state["O_ddP_EE_c"]))
-        state.extend(struct.pack("<7d", *self.state["theta"]))
-        state.extend(struct.pack("<7d", *self.state["dtheta"]))
+        state.extend(struct.pack("<16f", *self.state["O_T_EE"]))
+        state.extend(struct.pack("<16f", *self.state["O_T_EE_d"]))
+        state.extend(struct.pack("<16f", *self.state["F_T_EE"]))
+        state.extend(struct.pack("<16f", *self.state["EE_T_K"]))
+        state.extend(struct.pack("<16f", *self.state["F_T_NE"]))
+        state.extend(struct.pack("<16f", *self.state["NE_T_EE"]))
+        state.extend(struct.pack("<f", self.state["m_ee"]))
+        state.extend(struct.pack("<9f", *self.state["I_ee"]))
+        state.extend(struct.pack("<3f", *self.state["F_x_Cee"][:3]))
+        state.extend(struct.pack("<f", self.state["m_load"]))
+        state.extend(struct.pack("<9f", *self.state["I_load"]))
+        state.extend(struct.pack("<3f", *self.state["F_x_Cload"][:3]))
+        state.extend(struct.pack("<2f", *self.state["elbow"]))
+        state.extend(struct.pack("<2f", *self.state["elbow_d"]))
+        state.extend(struct.pack("<7f", *self.state["tau_J"]))
+        state.extend(struct.pack("<7f", *self.state["tau_J_d"]))
+        state.extend(struct.pack("<7f", *self.state["dtau_J"]))
+        state.extend(struct.pack("<7f", *self.state["q"]))
+        state.extend(struct.pack("<7f", *self.state["q_d"]))
+        state.extend(struct.pack("<7f", *self.state["dq"]))
+        state.extend(struct.pack("<7f", *self.state["dq_d"]))
+        state.extend(struct.pack("<7f", *self.state["ddq_d"]))
+        state.extend(struct.pack("<7f", *self.state["joint_contact"]))
+        state.extend(struct.pack("<6f", *self.state["cartesian_contact"]))
+        state.extend(struct.pack("<7f", *self.state["joint_collision"]))
+        state.extend(struct.pack("<6f", *self.state["cartesian_collision"]))
+        state.extend(struct.pack("<7f", *self.state["tau_ext_hat_filtered"]))
+        state.extend(struct.pack("<6f", *self.state["O_F_ext_hat_K"]))
+        state.extend(struct.pack("<6f", *self.state["K_F_ext_hat_K"]))
+        state.extend(struct.pack("<6f", *self.state["O_dP_EE_d"]))
+        state.extend(struct.pack("<3f", *self.state["O_ddP_O"][:3]))
+        state.extend(struct.pack("<2f", *self.state["elbow_c"]))
+        state.extend(struct.pack("<2f", *self.state["delbow_c"]))
+        state.extend(struct.pack("<2f", *self.state["ddelbow_c"]))
+        state.extend(struct.pack("<16f", *self.state["O_T_EE_c"]))
+        state.extend(struct.pack("<6f", *self.state["O_dP_EE_c"]))
+        state.extend(struct.pack("<6f", *self.state["O_ddP_EE_c"]))
+        state.extend(struct.pack("<7f", *self.state["theta"]))
+        state.extend(struct.pack("<7f", *self.state["dtheta"]))
+        state.extend(struct.pack("<18f", *self.state["accelerometer_top"]))
+        state.extend(struct.pack("<18f", *self.state["accelerometer_bottom"]))
         state.extend(struct.pack("<B", self.state["motion_generator_mode"]))
         state.extend(struct.pack("<B", self.state["controller_mode"]))
         state.extend(struct.pack("<41B", *(1 if e else 0 for e in self.state["errors"])))
         state.extend(struct.pack("<41B", *(1 if r else 0 for r in self.state["reflex_reason"])))
         state.extend(struct.pack("<B", self.state["robot_mode"]))
-        state.extend(struct.pack("<d", self.state["control_command_success_rate"]))
+        state.extend(struct.pack("<f", self.state["control_command_success_rate"]))
 
         return bytes(state)
 

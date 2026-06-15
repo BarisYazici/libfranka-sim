@@ -7,6 +7,12 @@ import pytest
 
 from franka_sim.franka_genesis_sim import ControlMode, FrankaGenesisSim
 
+# These tests exercise the real Genesis physics engine. When Genesis is not
+# installed it is stubbed with a mock (see tests/conftest.py), which has no real
+# module file -- in that case skip the whole module rather than erroring.
+if not isinstance(getattr(gs, "__file__", None), str):
+    pytest.skip("Genesis is not installed; skipping simulator tests.", allow_module_level=True)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def genesis_init():

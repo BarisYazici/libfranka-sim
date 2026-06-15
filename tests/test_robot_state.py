@@ -6,6 +6,43 @@ import pytest
 from franka_sim.franka_protocol import ControllerMode, MotionGeneratorMode, RobotMode
 from franka_sim.robot_state import RobotState
 
+# Canonical libfranka_new (v10) RobotState wire layout, transcribed independently
+# from research_interface/robot/rbk_types.h (#pragma pack(push, 1)). It is
+# float-based and 1377 bytes total. This serves as the spec the packer must match.
+ROBOT_STATE_V10_FMT = (
+    "<"
+    "Q"  # message_id (uint64)
+    + "16f" * 6  # O_T_EE, O_T_EE_d, F_T_EE, EE_T_K, F_T_NE, NE_T_EE
+    + "f"  # m_ee
+    + "9f"  # I_ee
+    + "3f"  # F_x_Cee
+    + "f"  # m_load
+    + "9f"  # I_load
+    + "3f"  # F_x_Cload
+    + "2f" * 2  # elbow, elbow_d
+    + "7f" * 8  # tau_J, tau_J_d, dtau_J, q, q_d, dq, dq_d, ddq_d
+    + "7f"  # joint_contact
+    + "6f"  # cartesian_contact
+    + "7f"  # joint_collision
+    + "6f"  # cartesian_collision
+    + "7f"  # tau_ext_hat_filtered
+    + "6f" * 2  # O_F_ext_hat_K, K_F_ext_hat_K
+    + "6f"  # O_dP_EE_d
+    + "3f"  # O_ddP_O
+    + "2f" * 3  # elbow_c, delbow_c, ddelbow_c
+    + "16f"  # O_T_EE_c
+    + "6f" * 2  # O_dP_EE_c, O_ddP_EE_c
+    + "7f" * 2  # theta, dtheta
+    + "18f" * 2  # accelerometer_top, accelerometer_bottom (each 6x3 floats)
+    + "BB"  # motion_generator_mode, controller_mode
+    + "41B" * 2  # errors, reflex_reason
+    + "B"  # robot_mode
+    + "f"  # control_command_success_rate
+)
+
+# Byte offset of the `q` field (used to verify float encoding at the right place).
+_FMT_BEFORE_Q = "<" + "Q" + "16f" * 6 + "f9f3f" + "f9f3f" + "2f2f" + "7f7f7f"
+
 
 def test_robot_state_initialization():
     """Test robot state initialization with default values"""
@@ -54,22 +91,10 @@ def test_robot_state_packing():
     message_id = struct.unpack("<Q", packed_state[:8])[0]
     assert message_id == state.state["message_id"]
 
-    # Unpack joint positions (after several transformation matrices)
-    offset = 8 + (16 * 8 * 6)  # Skip message_id and transformation matrices
-    offset += 8  # Skip m_ee
-    offset += 9 * 8  # Skip I_ee
-    offset += 3 * 8  # Skip F_x_Cee
-    offset += 8  # Skip m_load
-    offset += 9 * 8  # Skip I_load
-    offset += 3 * 8  # Skip F_x_Cload
-    offset += 2 * 8  # Skip elbow
-    offset += 2 * 8  # Skip elbow_d
-    offset += 7 * 8  # Skip tau_J
-    offset += 7 * 8  # Skip tau_J_d
-    offset += 7 * 8  # Skip dtau_J
-
-    q = struct.unpack("<7d", packed_state[offset : offset + 56])
-    assert list(q) == state.state["q"]
+    # Unpack joint positions: float-encoded at the v10 offset of `q`.
+    offset = struct.calcsize(_FMT_BEFORE_Q)
+    q = struct.unpack("<7f", packed_state[offset : offset + 28])
+    assert list(q) == pytest.approx(state.state["q"])
 
 
 def test_robot_state_mode_changes():
@@ -98,21 +123,14 @@ def test_robot_state_mode_changes():
     # - errors (41 bytes)
     # - reflex_reason (41 bytes)
     # - robot_mode (1 byte)
-    # - control_command_success_rate (8 bytes)
+    # - control_command_success_rate (4 bytes, float)
 
     # Calculate offsets from the end
-    success_rate_offset = total_size - 8
+    success_rate_offset = total_size - 4
     robot_mode_offset = success_rate_offset - 1
     reflex_reason_offset = robot_mode_offset - 41
     errors_offset = reflex_reason_offset - 41
     controller_mode_offset = errors_offset - 2
-
-    print("Offsets from end:")
-    print("success_rate: -8")
-    print("robot_mode: -9")
-    print("reflex_reason: -50")
-    print("errors: -91")
-    print("controller_mode: -93")
 
     # Extract and verify each field
     motion_mode, controller_mode = struct.unpack(
@@ -123,7 +141,7 @@ def test_robot_state_mode_changes():
         "<41B", packed_state[reflex_reason_offset : reflex_reason_offset + 41]
     )
     robot_mode = struct.unpack("<B", packed_state[robot_mode_offset : robot_mode_offset + 1])[0]
-    success_rate = struct.unpack("<d", packed_state[success_rate_offset:])[0]
+    success_rate = struct.unpack("<f", packed_state[success_rate_offset:])[0]
 
     print("\nExtracted values:")
     print(f"motion_mode: {motion_mode}")
@@ -165,6 +183,34 @@ def test_robot_state_transformation_matrices():
 
     packed_state = state.pack_state()
 
-    # Unpack the O_T_EE matrix (starts after message_id)
-    matrix = struct.unpack("<16d", packed_state[8 : 8 + 128])
-    assert list(matrix) == test_matrix
+    # Unpack the O_T_EE matrix (float-encoded, starts after message_id)
+    matrix = struct.unpack("<16f", packed_state[8 : 8 + 64])
+    assert list(matrix) == pytest.approx(test_matrix)
+
+
+def test_robot_state_packs_to_v10_size():
+    """Verify the packed state matches the libfranka_new v10 size (1377 bytes)."""
+    # Sanity check: the independently-written format matches the C++ struct size.
+    assert struct.calcsize(ROBOT_STATE_V10_FMT) == 1377
+    assert len(RobotState().pack_state()) == 1377
+
+
+def test_robot_state_v10_float_roundtrip():
+    """Joint positions must round-trip through the v10 (float) layout."""
+    state = RobotState()
+    state.state["message_id"] = 42
+    state.state["q"] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    state.set_robot_mode(RobotMode.kMove)
+
+    packed = state.pack_state()
+
+    # message_id sits at the very front.
+    assert struct.unpack("<Q", packed[:8])[0] == 42
+
+    # q must be float-encoded at its v10 offset.
+    offset = struct.calcsize(_FMT_BEFORE_Q)
+    q = struct.unpack("<7f", packed[offset : offset + 28])
+    assert q == pytest.approx(state.state["q"])
+
+    # robot_mode is the second-to-last byte (before the float success rate).
+    assert packed[-5] == RobotMode.kMove.value

@@ -55,6 +55,9 @@ dev = [
 [tool.setuptools]
 packages = ["franka_sim"]
 
+[tool.setuptools.package-data]
+franka_sim = ["models/*.urdf"]
+
 [tool.black]
 line-length = 100
 target-version = ['py38']

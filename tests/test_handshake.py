@@ -13,7 +13,7 @@ def test_successful_handshake(tcp_client, sim_server, mock_genesis_sim):
     tcp_client.connect(("localhost", COMMAND_PORT))
 
     # Create connect message
-    version = 9  # Current libfranka version
+    version = 10  # libfranka_new protocol version
     udp_port = 1338  # Test UDP port
     payload = struct.pack("<HH", version, udp_port)
 
@@ -35,8 +35,8 @@ def test_successful_handshake(tcp_client, sim_server, mock_genesis_sim):
     assert response_header.command == Command.kConnect
     assert response_header.command_id == 1
 
-    response_data = tcp_client.recv(8)  # Status (2) + version (2) + padding (4)
-    status, server_version = struct.unpack("<HH4x", response_data)
+    response_data = tcp_client.recv(3)  # status (uint8) + version (uint16)
+    status, server_version = struct.unpack("<BH", response_data)
 
     assert status == ConnectStatus.kSuccess
     assert server_version == version
