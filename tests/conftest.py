@@ -1,13 +1,20 @@
 import logging
 import socket
+import sys
 import threading
 import time
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
 
-from franka_sim.franka_protocol import COMMAND_PORT
+# Genesis is a heavy native dependency that is only required to actually run
+# the physics simulation. The protocol/handshake tests inject a mocked
+# simulator instead, so we stub the `genesis` module here to allow importing
+# franka_sim_server without Genesis installed. (No-op if Genesis is present.)
+sys.modules.setdefault("genesis", MagicMock())
+
+from franka_sim.franka_protocol import COMMAND_PORT  # noqa: E402
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

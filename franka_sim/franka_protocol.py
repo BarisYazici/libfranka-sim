@@ -7,7 +7,12 @@ COMMAND_PORT = 1337
 
 
 class Command(enum.IntEnum):
-    """Commands supported by the Franka robot interface protocol"""
+    """Commands supported by the Franka robot interface protocol.
+
+    Values must match research_interface::robot::Command in libfranka_new
+    (protocol v10) exactly. Note that v10 removed kLoadModelLibrary (the model
+    is now built client-side from the URDF returned by kGetRobotModel).
+    """
 
     kConnect = 0
     kMove = 1
@@ -20,8 +25,7 @@ class Command(enum.IntEnum):
     kSetNEToEE = 8
     kSetLoad = 9
     kAutomaticErrorRecovery = 10
-    kLoadModelLibrary = 11
-    kGetRobotModel = 12
+    kGetRobotModel = 11
 
 
 class ConnectStatus(enum.IntEnum):

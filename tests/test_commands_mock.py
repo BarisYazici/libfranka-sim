@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 def perform_handshake(tcp_client):
-    """Helper function to perform initial handshake"""
+    """Helper function to perform initial handshake (libfranka_new v10)."""
     tcp_client.connect(("localhost", COMMAND_PORT))
 
     # Send connect message
-    version = 9
+    version = 10
     udp_port = 1338
     payload = struct.pack("<HH", version, udp_port)
 
@@ -39,10 +39,10 @@ def perform_handshake(tcp_client):
 
     tcp_client.sendall(header.to_bytes() + payload)
 
-    # Receive and verify response
-    response_header_data = tcp_client.recv(12)
-    response_data = tcp_client.recv(8)
-    status, _ = struct.unpack("<HH4x", response_data)
+    # Receive and verify response: header(12) + status(uint8) + version(uint16)
+    tcp_client.recv(12)
+    response_data = tcp_client.recv(3)
+    status, _ = struct.unpack("<BH", response_data)
 
     return status == ConnectStatus.kSuccess
 

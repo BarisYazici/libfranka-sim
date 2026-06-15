@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from franka_sim.franka_genesis_sim import ControlMode, FrankaGenesisSim
@@ -54,7 +55,19 @@ class FrankaSimServer:
     Handles both TCP command communication and UDP state updates.
     """
 
-    def __init__(self, host="0.0.0.0", port=COMMAND_PORT, enable_vis=False, genesis_sim=None):
+    # Default arm model served via GetRobotModel: the hand-less FR3 URDF that
+    # libfranka_new ships as its own test fixture, so a stock client can always
+    # build its Pinocchio model from it.
+    DEFAULT_ARM_URDF = Path(__file__).resolve().parent / "models" / "fr3.urdf"
+
+    def __init__(
+        self,
+        host="0.0.0.0",
+        port=COMMAND_PORT,
+        enable_vis=False,
+        genesis_sim=None,
+        urdf_path=None,
+    ):
         """
         Initialize the Franka simulation server.
 
@@ -63,13 +76,15 @@ class FrankaSimServer:
             port: TCP port for command interface
             enable_vis: Enable visualization of the Genesis simulator
             genesis_sim: Optional pre-configured Genesis simulator instance for testing
+            urdf_path: URDF served to the client via GetRobotModel. Defaults to the
+                bundled hand-less FR3 arm model.
         """
         self.host = host
         self.port = port
         self.server_socket = None
         self.running = False
         self.transmitting_state = False
-        self.library_version = 9  # Current libfranka version
+        self.library_version = 10  # Matches research_interface kVersion in libfranka_new
         self.command_socket = None  # UDP socket for receiving commands
         self.current_motion_id = 0
         self.client_socket = None
@@ -89,6 +104,16 @@ class FrankaSimServer:
             self.genesis_sim = genesis_sim
 
         self.robot_state = RobotState()
+
+        # Robot model (URDF) served to the client via GetRobotModel. In
+        # libfranka_new the client builds its own Pinocchio model from this.
+        self.urdf_string = self._load_robot_model(urdf_path)
+
+    def _load_robot_model(self, urdf_path):
+        """Read the URDF served via GetRobotModel (defaults to the bundled FR3)."""
+        path = Path(urdf_path) if urdf_path is not None else self.DEFAULT_ARM_URDF
+        with open(path, "r", encoding="utf-8") as urdf_file:
+            return urdf_file.read()
 
     def reset_state(self):
         """Reset all connection-specific state variables for a new connection"""
@@ -167,17 +192,20 @@ class FrankaSimServer:
         self, client_socket, command: int, command_id: int, status: ConnectStatus, version: int
     ):
         """
-        Send a response message following the libfranka protocol.
+        Send a Connect response following the libfranka_new (v10) protocol.
+
+        Connect::Response is ``ResponseBase::status`` (uint8) + ``version``
+        (uint16) under ``#pragma pack(push, 1)``, i.e. 3 bytes with no padding.
         """
-        # Total message size includes header (12 bytes) + response data (status + version + padding)
-        total_size = 12 + 8  # 8 = 2(status) + 2(version) + 4(padding)
+        # Total message size includes header (12 bytes) + response data (3 bytes)
+        total_size = 12 + 3  # 3 = 1(status, uint8) + 2(version, uint16)
 
         # Construct and send header
         header = MessageHeader(command, command_id, total_size)
         header_bytes = header.to_bytes()
 
-        # Construct response data (status + version + 4 bytes padding)
-        response_data = struct.pack("<HH4x", status.value, version)
+        # Construct response data (status: uint8, version: uint16)
+        response_data = struct.pack("<BH", status.value, version)
 
         # Send complete message
         client_socket.sendall(header_bytes + response_data)
@@ -185,6 +213,22 @@ class FrankaSimServer:
             f"Sent response: command={Command(command).name}, "
             f"command_id={command_id}, status={status.name}"
         )
+
+    def handle_get_robot_model(self, client_socket, header):
+        """Handle GetRobotModel: return the robot URDF for client-side model building.
+
+        In libfranka_new the client builds its own Pinocchio model from this
+        URDF. The response payload (a DynamicSizedCommandMessage) is the status
+        byte (uint8, 0 = success) followed by the URDF as UTF-8 bytes.
+        """
+        urdf_bytes = self.urdf_string.encode("utf-8")
+        payload = struct.pack("<B", 0) + urdf_bytes  # status kSuccess + URDF
+
+        response_header = MessageHeader(
+            Command.kGetRobotModel, header.command_id, 12 + len(payload)
+        )
+        client_socket.sendall(response_header.to_bytes() + payload)
+        logger.info(f"Sent GetRobotModel response ({len(urdf_bytes)} URDF bytes)")
 
     def start_command_receiver(self):
         """Start UDP command receiver on specified port"""
@@ -289,10 +333,8 @@ class FrankaSimServer:
                     if command["motion_generation_finished"]:
                         # Switch to position control and hold current position
                         if self.control_mode != ControlMode.POSITION:
-                            logger.info(
-                                "Motion finished: Switching to position control mode \
-                                    and holding current position"
-                            )
+                            logger.info("Motion finished: Switching to position control mode \
+                                    and holding current position")
                             current_joint_positions = self.genesis_sim.get_robot_state()["q"]
                             self.genesis_sim.set_control_mode(ControlMode.POSITION)
                             self.control_mode = ControlMode.POSITION
@@ -320,10 +362,8 @@ class FrankaSimServer:
                             header_bytes = response_header.to_bytes()
                             response_data = struct.pack("<B3x", MoveStatus.kSuccess.value)
                             self.client_socket.sendall(header_bytes + response_data)
-                            logger.info(
-                                f"Sent Move success response for motion ID: \
-                                  {self.current_motion_id}"
-                            )
+                            logger.info(f"Sent Move success response for motion ID: \
+                                  {self.current_motion_id}")
                             self.current_motion_id = 0  # Reset motion ID after sending response
                         continue
 
@@ -397,10 +437,8 @@ class FrankaSimServer:
             try:
                 ControllerMode(move_cmd.controller_mode)
             except ValueError:
-                logger.error(
-                    f"Error handling Move command:\
-                          {move_cmd.controller_mode} is not a valid ControllerMode"
-                )
+                logger.error(f"Error handling Move command:\
+                          {move_cmd.controller_mode} is not a valid ControllerMode")
                 self.send_move_response(
                     client_socket,
                     command_id=header.command_id,
@@ -512,10 +550,8 @@ class FrankaSimServer:
                 self.robot_state.update()  # This increments message_id
                 final_state = self.robot_state.pack_state()
                 self.udp_socket.sendto(final_state, (self.client_address, self.client_udp_port))
-                logger.info(
-                    f"Sent final robot state with message_id:\
-                          {self.robot_state.state['message_id']}"
-                )
+                logger.info(f"Sent final robot state with message_id:\
+                          {self.robot_state.state['message_id']}")
 
             # Stop robot state transmission
             self.transmitting_state = False
@@ -686,6 +722,9 @@ class FrankaSimServer:
                 elif header.command == Command.kSetCartesianImpedance:
                     logger.info("Handling SetCartesianImpedance command")
                     self.handle_set_cartesian_impedance_command(client_socket, header, payload)
+                elif header.command == Command.kGetRobotModel:
+                    logger.info("Handling GetRobotModel command")
+                    self.handle_get_robot_model(client_socket, header)
                 else:
                     logger.warning(
                         f"Unhandled command in TCP thread: {Command(header.command).name}"
