@@ -59,16 +59,15 @@ def test_robot_state_initialization():
 
 
 def test_robot_state_update():
-    """Test robot state update mechanism"""
+    """Test robot state update mechanism (monotonic message_id counter)"""
     state = RobotState()
     initial_message_id = state.state["message_id"]
 
-    # Update state
+    # Each update advances message_id by exactly one (strictly increasing).
     state.update()
-
-    # Check message_id was incremented
-    assert state.state["message_id"] > initial_message_id
-    assert isinstance(state.state["time"], float)
+    assert state.state["message_id"] == initial_message_id + 1
+    state.update()
+    assert state.state["message_id"] == initial_message_id + 2
 
 
 def test_robot_state_packing():

@@ -2,6 +2,7 @@
 
 import argparse
 import enum
+import errno
 import logging
 import select
 import socket
@@ -562,7 +563,7 @@ class FrankaSimServer:
                 # Create a Move response header
                 move_response_header = MessageHeader(Command.kMove, self.current_motion_id, 16)
                 move_header_bytes = move_response_header.to_bytes()
-                move_response_data = struct.pack("<B3x", MoveStatus.kSuccess)
+                move_response_data = struct.pack("<B3x", MoveStatus.kSuccess.value)
                 client_socket.sendall(move_header_bytes + move_response_data)
                 logger.info(f"Sent Move success response for motion ID: {self.current_motion_id}")
                 self.current_motion_id = 0
@@ -941,7 +942,7 @@ class FrankaSimServer:
                 self.server_socket.bind((self.host, self.port))
                 logger.info("Successfully bound to address")
             except OSError as e:
-                if e.errno == 48:  # Address already in use
+                if e.errno == errno.EADDRINUSE:  # Address already in use
                     logger.warning(
                         f"Port {self.port} is in use, attempting to force close and rebind..."
                     )
