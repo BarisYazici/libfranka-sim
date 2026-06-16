@@ -852,6 +852,12 @@ class FrankaSimServer:
             self.transmitting_state = True
             first_state_sent = False
 
+            # Pace the broadcast to a ~1 kHz deadline schedule. State reads are now
+            # cheap (the physics thread publishes snapshots), so without a pacer
+            # this loop would spin well above 1 kHz and burn a whole CPU core.
+            period = 0.001  # 1 kHz target broadcast rate
+            next_deadline = time.perf_counter()
+
             while self.running and self.connection_running and self.transmitting_state:
                 try:
                     cycle_start = time.time()
@@ -883,10 +889,19 @@ class FrankaSimServer:
 
                     # Update state for next iteration
                     self.robot_state.update()
-                    # Calculate cycle statistics
+                    # Calculate cycle statistics (work time, before pacing sleep)
                     cycle_time = time.time() - cycle_start
                     total_cycle_time += cycle_time
                     total_cycles += 1
+
+                    # Sleep until the next 1 kHz deadline (soft real-time).
+                    next_deadline += period
+                    remaining = next_deadline - time.perf_counter()
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    elif remaining < -period:
+                        # Fell a full cycle behind; resync to avoid a catch-up burst.
+                        next_deadline = time.perf_counter()
 
                     # Log statistics every second
                     if time.time() - last_stats_time >= 1.0:
