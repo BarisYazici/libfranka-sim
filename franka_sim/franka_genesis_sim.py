@@ -15,6 +15,23 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def default_fr3_mjcf():
+    """Resolve the FR3 MJCF physics model (MuJoCo Menagerie ``franka_fr3``).
+
+    The real robot is an FR3 (not a Panda); this model carries the FR3
+    kinematics/inertia and built-in joint damping/armature. Resolution order:
+    the ``$FR3_MJCF`` override, otherwise ``robot_descriptions``, which downloads
+    and caches the model on first use -- so a ``pip install`` of this package
+    works out of the box (no vendored ~57 MB of meshes, just a small dependency).
+    """
+    override = os.environ.get("FR3_MJCF")
+    if override:
+        return Path(override)
+    from robot_descriptions import fr3_mj_description
+
+    return Path(fr3_mj_description.MJCF_PATH)
+
+
 class ControlMode(Enum):
     POSITION = "position"
     VELOCITY = "velocity"
@@ -23,7 +40,7 @@ class ControlMode(Enum):
 
 
 class FrankaGenesisSim:
-    def __init__(self, enable_vis=False):
+    def __init__(self, enable_vis=False, model_path=None):
         self.enable_vis = enable_vis
         self.scene = None
         self.franka = None
@@ -38,13 +55,22 @@ class FrankaGenesisSim:
         self.latest_joint_positions = np.zeros(7)
         self.latest_joint_velocities = np.zeros(7)
         self.control_mode = ControlMode.POSITION  # Default to position control
-        self.dt = 0.01  # Simulation timestep
+        # Physics timestep. run_simulation paces the loop to wall-clock realtime
+        # so a controller tuned for the real 1 kHz FCI sees the same wall-time
+        # dynamics (not physics that free-runs several times faster). dt is
+        # bounded below by how fast one step + state read runs on this host: at
+        # 1 ms the loop only sustained ~0.6x realtime (slow-motion), so ~2.5 ms
+        # is the finest step that still holds true 1x here. Lower it once the
+        # per-step Genesis read is cheaper (throttle the snapshot below the step
+        # rate) or calibrate it against logged real-robot trajectories.
+        self.dt = 0.0025  # ~400 Hz physics, paced to realtime (see run_simulation)
         self.sim_thread = None
         self.hand_link = None  # cached end-effector link handle (set on build)
 
         # Numerical-differentiation state for joint acceleration (physics thread).
-        self.prev_dq_full = np.zeros(9)
-        self.ddq_filtered = np.zeros(9)
+        # 7 DOF: the FR3 model is hand-less (no finger joints).
+        self.prev_dq_full = np.zeros(7)
+        self.ddq_filtered = np.zeros(7)
         self._alpha_acc = 0.95  # acceleration low-pass factor
 
         # Latest robot-state snapshot published by the physics thread and read by
@@ -62,19 +88,11 @@ class FrankaGenesisSim:
             "O_T_EE": np.eye(4).T.flatten(),
         }
 
-        # Get the Genesis assets path instead of our own
-        import genesis
-
-        genesis_path = Path(genesis.__file__).parent
-        self.xml_path = genesis_path / "assets/xml/franka_emika_panda/panda.xml"
-
-        # Keep URDF path for future use if needed (for Pinocchio)
-        # This is currently unused, but kept for reference
-        current_dir = Path(__file__).parent
-        assets_dir = current_dir.parent / "assets"
-        self.urdf_path = assets_dir / "urdf/panda_bullet/panda.urdf"
-
-        logger.info(f"Using Genesis XML path: {self.xml_path}")
+        # FR3 physics model (MJCF). The real robot is an FR3; this model matches
+        # its kinematics/inertia and brings the joint damping/friction the old
+        # frictionless Panda model lacked.
+        self.xml_path = Path(model_path) if model_path is not None else default_fr3_mjcf()
+        logger.info(f"Using Genesis FR3 MJCF: {self.xml_path}")
 
     def load_panda_model(self):
         pass
@@ -93,7 +111,10 @@ class FrankaGenesisSim:
                 camera_pos=(0, -3.5, 2.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=30,
-                res=(1280, 800),
+                # Lower render resolution so drawing each viewer frame is cheap
+                # enough to leave the single (Linux) main thread time to keep the
+                # physics loop at realtime (rendering and physics share it).
+                res=(640, 480),
                 max_FPS=60,
             ),
             sim_options=gs.options.SimOptions(
@@ -119,30 +140,34 @@ class FrankaGenesisSim:
         # TODO: load pinocchio model
         # self.model, self.data = self.load_panda_model()
 
-        # Joint names and indices
-        self.jnt_names = [
-            "joint1",
-            "joint2",
-            "joint3",
-            "joint4",
-            "joint5",
-            "joint6",
-            "joint7",
-            "finger_joint1",
-            "finger_joint2",
-        ]
+        # Joint names and indices (FR3, 7-DOF, hand-less -> no finger joints).
+        self.jnt_names = [f"fr3_joint{i}" for i in range(1, 8)]
         self.dofs_idx = [self.franka.get_joint(name).dof_idx_local for name in self.jnt_names]
 
-        # Set force range for safety
+        # Set force range for safety (FR3 actuator limits: J1-4 +/-87, J5-7 +/-12).
         self.franka.set_dofs_force_range(
-            lower=np.array([-87, -87, -87, -87, -12, -12, -12, -100, -100]),
-            upper=np.array([87, 87, 87, 87, 12, 12, 12, 100, 100]),
+            lower=np.array([-87, -87, -87, -87, -12, -12, -12]),
+            upper=np.array([87, 87, 87, 87, 12, 12, 12]),
             dofs_idx_local=self.dofs_idx,
         )
 
-        # Cache the end-effector link handle so the hot path never resolves it
-        # by name (get_link("hand") costs ~6.5 us per call otherwise).
-        self.hand_link = self.franka.get_link("hand")
+        # Joint viscous damping -- the calibration knob for matching the real
+        # arm's effective joint friction. Genesis only supports viscous damping
+        # (no Coulomb frictionloss), and the MJCF's 0.21 is far too small next to
+        # the impedance controller's own damping, so the frictionless model
+        # over-travels vs the real FR3. Override per-joint via $FR3_JOINT_DAMPING
+        # (comma-separated 7 values, or a single scalar) when fitting to logged
+        # real-robot trajectories.
+        damping_env = os.environ.get("FR3_JOINT_DAMPING")
+        if damping_env:
+            vals = [float(x) for x in damping_env.split(",")]
+            damping = np.array(vals * 7 if len(vals) == 1 else vals, dtype=float)
+            self.franka.set_dofs_damping(damping, self.dofs_idx)
+            logger.info(f"Override joint damping: {damping}")
+
+        # Cache the end-effector link handle so the hot path never resolves it by
+        # name. FR3 is hand-less; link7 is the flange (attachment frame).
+        self.hand_link = self.franka.get_link("fr3_link7")
 
         # Initialize to default position
         initial_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.785])
@@ -150,7 +175,7 @@ class FrankaGenesisSim:
         self.latest_joint_positions = initial_q.copy()
 
         for _ in range(100):
-            self.franka.set_dofs_position(np.concatenate([initial_q, [0.04, 0.04]]), self.dofs_idx)
+            self.franka.set_dofs_position(initial_q, self.dofs_idx)
             self.scene.step()
 
         # Seed the published snapshot so get_robot_state() is valid before the
@@ -232,9 +257,21 @@ class FrankaGenesisSim:
         }
 
     def run_simulation(self):
-        """Main simulation loop (physics thread): read state, apply control, step."""
+        """Main simulation loop (physics thread): read state, apply control, step.
+
+        Paced to wall-clock realtime (dt of sim-time per dt of wall-time) so the
+        physics advances in lockstep with the 1 kHz control loop rather than
+        free-running several times faster than realtime.
+        """
         logger.info("Starting Genesis simulation loop")
 
+        next_step = time.perf_counter()
+        next_render = next_step
+        # Viewer refresh rate, decoupled from the physics rate. Each pyrender
+        # frame costs ~15-20 ms on the shared (Linux) main thread regardless of
+        # resolution, so 60 FPS alone would exceed a full core and starve the
+        # physics loop; 30 FPS leaves enough budget for realtime physics.
+        render_period = 1.0 / 30.0
         while self.running:
             # Read Genesis once and publish the snapshot for the network thread.
             self._read_and_publish_state()
@@ -242,20 +279,33 @@ class FrankaGenesisSim:
             # Apply control for the current mode (atomic reads, no lock).
             current_mode = self.control_mode
             if current_mode == ControlMode.POSITION:
-                q_cmd = np.concatenate([self.latest_joint_positions, [0.04, 0.04]])
-                self.franka.control_dofs_position(q_cmd, self.dofs_idx)
+                self.franka.control_dofs_position(self.latest_joint_positions, self.dofs_idx)
             elif current_mode == ControlMode.VELOCITY:
-                dq_cmd = np.concatenate([self.latest_joint_velocities, [0.0, 0.0]])
-                self.franka.control_dofs_velocity(dq_cmd, self.dofs_idx)
+                self.franka.control_dofs_velocity(self.latest_joint_velocities, self.dofs_idx)
             elif current_mode == ControlMode.TORQUE:
-                tau_cmd = np.concatenate([self.latest_torques, [0.0, 0.0]])
-                self.franka.control_dofs_force(tau_cmd, self.dofs_idx)
+                self.franka.control_dofs_force(self.latest_torques, self.dofs_idx)
 
-            # Step simulation.
-            self.scene.step()
+            # Step physics. scene.step(update_visualizer=True) refreshes the
+            # viewer AND sleeps to cap it at max_FPS, which would otherwise
+            # throttle the whole realtime physics loop down to ~60 Hz
+            # (slow-motion / under-driven arm). So refresh the viewer only on a
+            # ~60 FPS schedule and step physics without it the rest of the time.
+            now = time.perf_counter()
+            do_render = self.enable_vis and now >= next_render
+            self.scene.step(update_visualizer=do_render)
+            if do_render:
+                next_render += render_period
+                if next_render < now:
+                    next_render = now + render_period
 
-            # Yield a slice so the loop does not busy-spin a core.
-            time.sleep(0.001)
+            # Pace to realtime: advance one dt of sim-time per dt of wall-time.
+            # If a step takes longer than dt, run flat out (no catch-up burst).
+            next_step += self.dt
+            slack = next_step - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            elif slack < -self.dt:
+                next_step = time.perf_counter()
 
         if self.enable_vis:
             self.scene.viewer.stop()
