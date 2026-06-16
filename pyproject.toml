@@ -12,6 +12,7 @@ dependencies = [
     "genesis-world==0.2.1",
     "numba==0.60.0",
     "torch>=2.0.0",
+    "robot_descriptions>=1.12",
     "pytest"
 ]
 readme = "README.md"
