@@ -148,13 +148,15 @@ class FrankaSimServer:
                 logger.debug(f"Waiting to receive {remaining} bytes...")
                 chunk = sock.recv(remaining)
                 if not chunk:
-                    logger.error("Connection closed while receiving data")
+                    # Clean close by the client (end of session) -- not an error.
+                    logger.debug("Connection closed by client while receiving data")
                     return None
                 logger.debug(f"Received chunk of {len(chunk)} bytes")
                 data.extend(chunk)
                 remaining -= len(chunk)
             except socket.error as e:
-                logger.error(f"Socket error while receiving: {e}")
+                # Reset-by-peer etc. when the client goes away -- expected, not an error.
+                logger.debug(f"Socket error while receiving (client disconnected): {e}")
                 return None
 
         logger.debug(f"Successfully received all {size} bytes")
@@ -703,7 +705,7 @@ class FrankaSimServer:
                 try:
                     client_socket.getpeername()
                 except socket.error as e:
-                    logger.error("Socket disconnected")
+                    logger.info("Client socket disconnected")
                     # Instead of breaking, reset state and continue
                     self.transmitting_state = False
                     self.connection_running = False
@@ -745,7 +747,7 @@ class FrankaSimServer:
                         f"Unhandled command in TCP thread: {Command(header.command).name}"
                     )
             except ConnectionError as e:
-                logger.error(f"Connection error in TCP thread: {e}")
+                logger.info(f"Client disconnected (end of session): {e}")
                 # Instead of breaking, reset state and continue
                 self.transmitting_state = False
                 self.connection_running = False
