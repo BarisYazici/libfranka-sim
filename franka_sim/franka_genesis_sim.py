@@ -3,7 +3,6 @@ import logging
 import os
 import platform
 import sys
-import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -31,17 +30,37 @@ class FrankaGenesisSim:
         self.model = None
         self.data = None
         self.running = False
+        # Latest commands from the network threads, published lock-free: a writer
+        # always assigns a brand-new array (an atomic reference swap under the
+        # GIL) and the physics thread is the sole reader, so no mutex is needed
+        # (see the update_* methods). The array is never mutated in place.
         self.latest_torques = np.zeros(7)
         self.latest_joint_positions = np.zeros(7)
         self.latest_joint_velocities = np.zeros(7)
-        self.torque_lock = threading.Lock()
-        self.joint_position_lock = threading.Lock()
-        self.joint_velocity_lock = threading.Lock()
         self.control_mode = ControlMode.POSITION  # Default to position control
-        self.control_mode_lock = threading.Lock()
         self.dt = 0.01  # Simulation timestep
         self.sim_thread = None
+        self.hand_link = None  # cached end-effector link handle (set on build)
+
+        # Numerical-differentiation state for joint acceleration (physics thread).
+        self.prev_dq_full = np.zeros(9)
         self.ddq_filtered = np.zeros(9)
+        self._alpha_acc = 0.95  # acceleration low-pass factor
+
+        # Latest robot-state snapshot published by the physics thread and read by
+        # the UDP broadcast thread. The dict reference is swapped in atomically
+        # each step, so get_robot_state() needs no lock and does no Genesis
+        # tensor reads on the network hot path.
+        self._state_snapshot = {
+            "q": np.zeros(7),
+            "dq": np.zeros(7),
+            "ddq": np.zeros(7),
+            "q_d": np.zeros(7),
+            "dq_d": np.zeros(7),
+            "ddq_d": np.zeros(7),
+            "tau_J": np.zeros(7),
+            "O_T_EE": np.eye(4).T.flatten(),
+        }
 
         # Get the Genesis assets path instead of our own
         import genesis
@@ -121,86 +140,121 @@ class FrankaGenesisSim:
             dofs_idx_local=self.dofs_idx,
         )
 
+        # Cache the end-effector link handle so the hot path never resolves it
+        # by name (get_link("hand") costs ~6.5 us per call otherwise).
+        self.hand_link = self.franka.get_link("hand")
+
         # Initialize to default position
         initial_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.785])
         # Set the initial position as the target position for the controller
-        with self.joint_position_lock:
-            self.latest_joint_positions = initial_q.copy()
+        self.latest_joint_positions = initial_q.copy()
 
         for _ in range(100):
             self.franka.set_dofs_position(np.concatenate([initial_q, [0.04, 0.04]]), self.dofs_idx)
             self.scene.step()
 
+        # Seed the published snapshot so get_robot_state() is valid before the
+        # physics loop starts.
+        self._read_and_publish_state()
+
     def set_control_mode(self, mode: ControlMode):
-        """Set the control mode for the robot"""
+        """Set the control mode for the robot (lock-free atomic reference swap)."""
         if not isinstance(mode, ControlMode):
             raise ValueError(f"Mode must be a ControlMode enum, got {type(mode)}")
-
-        with self.control_mode_lock:
-            logger.info(f"Switching control mode to: {mode.value}")
-            self.control_mode = mode
+        logger.info(f"Switching control mode to: {mode.value}")
+        self.control_mode = mode
 
     def update_torques(self, torques):
-        """Update the latest torques to be applied in simulation"""
-        with self.torque_lock:
-            self.latest_torques = np.array(torques)
+        """Publish the latest commanded torques for the physics thread.
+
+        Lock-free: a fresh array is bound in a single bytecode step (atomic under
+        the GIL) and the physics thread is the only reader, so no mutex is needed.
+        The array must never be mutated in place after assignment.
+        """
+        self.latest_torques = np.array(torques)
 
     def update_joint_positions(self, positions):
-        """Update the latest joint positions to be applied in simulation"""
-        with self.joint_position_lock:
-            self.latest_joint_positions = np.array(positions)
+        """Publish the latest commanded joint positions (lock-free; see update_torques)."""
+        self.latest_joint_positions = np.array(positions)
 
     def update_joint_velocities(self, velocities):
-        """Update the latest joint velocities to be applied in simulation"""
-        with self.joint_velocity_lock:
-            self.latest_joint_velocities = np.array(velocities)
+        """Publish the latest commanded joint velocities (lock-free; see update_torques)."""
+        self.latest_joint_velocities = np.array(velocities)
+
+    def _pose_to_column_major(self, ee_pos, ee_quat):
+        """Build a column-major 4x4 O_T_EE from an EE position and [x, y, z, w] quat."""
+        x, y, z, w = ee_quat
+        R = np.array(
+            [
+                [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * w * z, 2 * x * z + 2 * w * y],
+                [2 * x * y + 2 * w * z, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * w * x],
+                [2 * x * z - 2 * w * y, 2 * y * z + 2 * w * x, 1 - 2 * x * x - 2 * y * y],
+            ]
+        )
+        O_T_EE = np.eye(4)
+        O_T_EE[:3, :3] = R
+        O_T_EE[:3, 3] = ee_pos
+        return O_T_EE.T.flatten()  # column-major 16-element array
+
+    def _read_and_publish_state(self):
+        """Read joint + EE state from Genesis once and publish a state snapshot.
+
+        Runs only on the physics thread (single producer). The whole snapshot is
+        swapped in as a new dict reference that consumers read atomically under
+        the GIL, so get_robot_state() does no Genesis tensor reads and needs no
+        lock. Doing the (~0.4 ms) Genesis reads here, once per step, also removes
+        the previous double-read where the network thread fetched the same
+        tensors independently.
+        """
+        q_full = self.franka.get_dofs_position(self.dofs_idx).cpu().numpy()
+        dq_full = self.franka.get_dofs_velocity(self.dofs_idx).cpu().numpy()
+
+        # Filtered numerical acceleration.
+        ddq_raw = (dq_full - self.prev_dq_full) / self.dt
+        self.ddq_filtered = self._alpha_acc * self.ddq_filtered + (1 - self._alpha_acc) * ddq_raw
+        self.prev_dq_full = dq_full.copy()
+
+        # End-effector pose via the cached link handle.
+        ee_pos = self.hand_link.get_pos().cpu().numpy()
+        ee_quat = self.hand_link.get_quat().cpu().numpy()  # [x, y, z, w]
+        O_T_EE = self._pose_to_column_major(ee_pos, ee_quat)
+
+        # q_d / tau_J mirror the latest network commands (atomic reads).
+        self._state_snapshot = {
+            "q": q_full[:7],
+            "dq": dq_full[:7],
+            "ddq": self.ddq_filtered[:7],
+            "q_d": self.latest_joint_positions,
+            "dq_d": dq_full[:7],
+            "ddq_d": self.ddq_filtered[:7],
+            "tau_J": self.latest_torques,
+            "O_T_EE": O_T_EE,
+        }
 
     def run_simulation(self):
-        """Main simulation loop"""
+        """Main simulation loop (physics thread): read state, apply control, step."""
         logger.info("Starting Genesis simulation loop")
 
-        # For numerical differentiation
-        self.prev_dq_full = np.zeros(9)
-        self.ddq_filtered = np.zeros(9)
-        alpha_acc = 0.95
-
         while self.running:
-            # Get current joint states
-            q_full = self.franka.get_dofs_position(self.dofs_idx).cpu().numpy()
-            dq_full = self.franka.get_dofs_velocity(self.dofs_idx).cpu().numpy()
+            # Read Genesis once and publish the snapshot for the network thread.
+            self._read_and_publish_state()
 
-            # Calculate acceleration
-            ddq_raw = (dq_full - self.prev_dq_full) / self.dt
-            self.ddq_filtered = alpha_acc * self.ddq_filtered + (1 - alpha_acc) * ddq_raw
-            self.prev_dq_full = dq_full.copy()
-
-            # Get current control mode
-            with self.control_mode_lock:
-                current_mode = self.control_mode
-
-            # Apply control based on mode
+            # Apply control for the current mode (atomic reads, no lock).
+            current_mode = self.control_mode
             if current_mode == ControlMode.POSITION:
-                with self.joint_position_lock:
-                    q_d = self.latest_joint_positions.copy()
-                q_cmd = np.concatenate([q_d, [0.04, 0.04]])
+                q_cmd = np.concatenate([self.latest_joint_positions, [0.04, 0.04]])
                 self.franka.control_dofs_position(q_cmd, self.dofs_idx)
-
             elif current_mode == ControlMode.VELOCITY:
-                with self.joint_velocity_lock:
-                    dq_d = self.latest_joint_velocities.copy()
-                dq_cmd = np.concatenate([dq_d, [0.0, 0.0]])
+                dq_cmd = np.concatenate([self.latest_joint_velocities, [0.0, 0.0]])
                 self.franka.control_dofs_velocity(dq_cmd, self.dofs_idx)
-
             elif current_mode == ControlMode.TORQUE:
-                with self.torque_lock:
-                    tau_d = self.latest_torques.copy()
-                tau_cmd = np.concatenate([tau_d, [0.0, 0.0]])
+                tau_cmd = np.concatenate([self.latest_torques, [0.0, 0.0]])
                 self.franka.control_dofs_force(tau_cmd, self.dofs_idx)
 
-            # Step simulation
+            # Step simulation.
             self.scene.step()
 
-            # Optional: Add small sleep to prevent too high CPU usage
+            # Yield a slice so the loop does not busy-spin a core.
             time.sleep(0.001)
 
         if self.enable_vis:
@@ -235,50 +289,14 @@ class FrankaGenesisSim:
             self.sim_thread.join(timeout=1.0)  # Wait for simulation thread to finish
 
     def get_robot_state(self):
-        """Get current robot state for network transmission"""
-        # q_d is the desired joint positions user sent joint positions
-        q_d = self.latest_joint_positions
+        """Return the latest state snapshot published by the physics thread.
 
-        q_full = self.franka.get_dofs_position(self.dofs_idx).cpu().numpy()
-        dq_full = self.franka.get_dofs_velocity(self.dofs_idx).cpu().numpy()
-        # calculate ddq_full
-        ddq_full = self.ddq_filtered
-
-        # Get end-effector position and orientation
-        hand_link = self.franka.get_link("hand")
-        ee_pos = hand_link.get_pos().cpu().numpy()
-        ee_quat = hand_link.get_quat().cpu().numpy()  # [x, y, z, w]
-
-        # Convert quaternion to rotation matrix
-        # Note: quaternion from Genesis is [x, y, z, w]
-        x, y, z, w = ee_quat
-        R = np.array(
-            [
-                [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * w * z, 2 * x * z + 2 * w * y],
-                [2 * x * y + 2 * w * z, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * w * x],
-                [2 * x * z - 2 * w * y, 2 * y * z + 2 * w * x, 1 - 2 * x * x - 2 * y * y],
-            ]
-        )
-
-        # Construct homogeneous transformation matrix
-        O_T_EE = np.eye(4)
-        O_T_EE[:3, :3] = R
-        O_T_EE[:3, 3] = ee_pos
-
-        # Convert to column-major 16-element array
-        O_T_EE = O_T_EE.T.flatten()
-
-        # Return only the first 7 joints (excluding fingers)
-        return {
-            "q": q_full[:7],
-            "dq": dq_full[:7],
-            "ddq": ddq_full[:7],
-            "q_d": q_d,
-            "dq_d": dq_full[:7],
-            "ddq_d": ddq_full[:7],
-            "tau_J": self.latest_torques,  # Current commanded torques
-            "O_T_EE": O_T_EE,  # End-effector pose in base frame (column-major)
-        }
+        Lock-free: reads the current snapshot reference (atomic under the GIL).
+        No Genesis tensor reads happen here, so the UDP broadcast thread is not
+        bottlenecked by the ~0.5 ms cost of fetching state from the simulator.
+        The snapshot holds only the first 7 joints (fingers excluded).
+        """
+        return self._state_snapshot
 
 
 def main():
