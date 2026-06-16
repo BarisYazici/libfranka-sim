@@ -32,6 +32,13 @@ def default_fr3_mjcf():
     return Path(fr3_mj_description.MJCF_PATH)
 
 
+# Default joint viscous damping (Nm*s/rad), applied to all 7 joints unless
+# overridden via $FR3_JOINT_DAMPING. Calibrated against a logged real-robot
+# joint_impedance run so the sim's joint excursions match the real FR3 to within
+# ~5% (the bare MJCF value of 0.21 is far too small and the sim over-travels).
+DEFAULT_FR3_DAMPING = 5.0
+
+
 class ControlMode(Enum):
     POSITION = "position"
     VELOCITY = "velocity"
@@ -151,19 +158,21 @@ class FrankaGenesisSim:
             dofs_idx_local=self.dofs_idx,
         )
 
-        # Joint viscous damping -- the calibration knob for matching the real
-        # arm's effective joint friction. Genesis only supports viscous damping
-        # (no Coulomb frictionloss), and the MJCF's 0.21 is far too small next to
-        # the impedance controller's own damping, so the frictionless model
-        # over-travels vs the real FR3. Override per-joint via $FR3_JOINT_DAMPING
-        # (comma-separated 7 values, or a single scalar) when fitting to logged
-        # real-robot trajectories.
+        # Joint viscous damping, applied by default so the sim matches the real
+        # FR3 out of the box (no env var needed). Genesis only supports viscous
+        # damping (no Coulomb frictionloss), and the MJCF's 0.21 is far too small
+        # next to the impedance controller's own damping, so the frictionless
+        # model over-travels vs the real arm; DEFAULT_FR3_DAMPING was fit to a
+        # logged real-robot joint_impedance run (~5% match). Override per-joint
+        # via $FR3_JOINT_DAMPING (a scalar or 7 comma-separated values).
         damping_env = os.environ.get("FR3_JOINT_DAMPING")
         if damping_env:
             vals = [float(x) for x in damping_env.split(",")]
             damping = np.array(vals * 7 if len(vals) == 1 else vals, dtype=float)
-            self.franka.set_dofs_damping(damping, self.dofs_idx)
-            logger.info(f"Override joint damping: {damping}")
+        else:
+            damping = np.full(7, DEFAULT_FR3_DAMPING)
+        self.franka.set_dofs_damping(damping, self.dofs_idx)
+        logger.info(f"Joint damping: {damping}")
 
         # Cache the end-effector link handle so the hot path never resolves it by
         # name. FR3 is hand-less; link7 is the flange (attachment frame).
