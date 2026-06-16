@@ -27,9 +27,16 @@ def default_fr3_mjcf():
     override = os.environ.get("FR3_MJCF")
     if override:
         return Path(override)
-    from robot_descriptions import fr3_mj_description
+    try:
+        from robot_descriptions import fr3_mj_description
 
-    return Path(fr3_mj_description.MJCF_PATH)
+        return Path(fr3_mj_description.MJCF_PATH)
+    except Exception as exc:  # offline / proxy / fetch failure on first use
+        raise RuntimeError(
+            f"Could not obtain the FR3 model via robot_descriptions ({type(exc).__name__}: "
+            f"{exc}). It is downloaded and cached on first use, so the first run needs "
+            "network access; set $FR3_MJCF to a local MJCF path to run fully offline."
+        ) from exc
 
 
 # Default joint viscous damping (Nm*s/rad), applied to all 7 joints unless
@@ -168,6 +175,11 @@ class FrankaGenesisSim:
         damping_env = os.environ.get("FR3_JOINT_DAMPING")
         if damping_env:
             vals = [float(x) for x in damping_env.split(",")]
+            if len(vals) not in (1, 7):
+                raise ValueError(
+                    f"FR3_JOINT_DAMPING must be 1 (scalar) or 7 comma-separated "
+                    f"values, got {len(vals)}"
+                )
             damping = np.array(vals * 7 if len(vals) == 1 else vals, dtype=float)
         else:
             damping = np.full(7, DEFAULT_FR3_DAMPING)
@@ -314,7 +326,10 @@ class FrankaGenesisSim:
             if slack > 0:
                 time.sleep(slack)
             elif slack < -self.dt:
+                # Fell a full step behind; resync both schedules so we don't burst
+                # a run of catch-up steps or renders.
                 next_step = time.perf_counter()
+                next_render = max(next_render, next_step)
 
         if self.enable_vis:
             self.scene.viewer.stop()
