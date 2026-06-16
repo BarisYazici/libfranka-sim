@@ -79,7 +79,10 @@ class RobotState:
             "theta": [0.0] * 7,  # Motor positions
             "dtheta": [0.0] * 7,  # Motor velocities
             "robot_mode": RobotMode.kIdle.value,  # Store as integer value
-            "control_command_success_rate": 0.0,
+            # The sim applies every received command, so report a perfect command
+            # success rate (libfranka's communication_test / controllers read this;
+            # 0.0 would look like the controller is dropping every command).
+            "control_command_success_rate": 1.0,
             # Transformation matrices (4x4 column-major)
             "O_T_EE": list(_IDENTITY_4X4),
             "O_T_EE_d": list(_IDENTITY_4X4),
