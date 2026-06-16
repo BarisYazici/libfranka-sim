@@ -63,14 +63,15 @@ def genesis_sim():
                 "finger_joint2",
             ]
             sim.dofs_idx = [sim.franka.get_joint(name).dof_idx_local for name in sim.jnt_names]
+            sim.hand_link = sim.franka.get_link("hand")
             initial_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.785])
-            with sim.joint_position_lock:
-                sim.latest_joint_positions = initial_q.copy()
+            sim.latest_joint_positions = initial_q.copy()
             for _ in range(100):
                 sim.franka.set_dofs_position(
                     np.concatenate([initial_q, [0.04, 0.04]]), sim.dofs_idx
                 )
                 sim.scene.step()
+            sim._read_and_publish_state()
         else:
             raise e
     yield sim
