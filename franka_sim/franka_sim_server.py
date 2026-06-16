@@ -254,20 +254,29 @@ class FrankaSimServer:
             logger.debug(f"Poller: {poller}")
             timeout = 1  # 1ms timeout
 
-            while self.running:
+            # RobotCommand packet size (matches the client's RobotCommand struct).
+            expected_size = 8 + (7 * 8 + 7 * 8 + 16 * 8 + 6 * 8 + 2 * 8 + 1 + 1) + (7 * 8 + 1)
+
+            # Bound this thread to the current connection (connection_running),
+            # not the server lifetime, so stale command threads do not pile up
+            # across connections and race on self.udp_socket.
+            while self.running and self.connection_running:
+                udp_socket = self.udp_socket
+                if udp_socket is None:
+                    break
                 events = poller.poll(timeout)
                 if not events:
                     continue
 
+                command = None
                 for fd, event in events:
-                    if event & select.POLLIN:
-                        expected_size = (
-                            8 + (7 * 8 + 7 * 8 + 16 * 8 + 6 * 8 + 2 * 8 + 1 + 1) + (7 * 8 + 1)
-                        )
-                        command = None
+                    if not (event & select.POLLIN):
+                        # Socket hung up / errored -> the connection is gone.
+                        self.connection_running = False
+                        break
 
                     try:
-                        data, addr = self.udp_socket.recvfrom(expected_size)
+                        data, addr = udp_socket.recvfrom(expected_size)
                         if len(data) != expected_size:
                             logger.warning(
                                 f"Got a UDP packet with wrong size! Expected {expected_size} \
@@ -330,8 +339,12 @@ class FrankaSimServer:
 
                 # Process newest command if we have one
                 if command and command["message_id"] > 0:
-                    # Check if motion is finished
-                    if command["motion_generation_finished"]:
+                    # End of control: a motion generator signals via
+                    # motion_generation_finished, a pure-torque controller
+                    # (startTorqueControl) via torque_command_finished. Handle
+                    # both -- otherwise the client hangs waiting for the stop to
+                    # be acknowledged.
+                    if command["motion_generation_finished"] or command["torque_command_finished"]:
                         # Switch to position control and hold current position
                         if self.control_mode != ControlMode.POSITION:
                             logger.info("Motion finished: Switching to position control mode \
@@ -350,12 +363,13 @@ class FrankaSimServer:
                         # Send state with new message ID
                         self.robot_state.update()  # This increments message_id
                         final_state = self.robot_state.pack_state()
-                        self.udp_socket.sendto(
-                            final_state, (self.client_address, self.client_udp_port)
-                        )
+                        if self.udp_socket is not None:
+                            self.udp_socket.sendto(
+                                final_state, (self.client_address, self.client_udp_port)
+                            )
 
                         # Send TCP success response for the Move command
-                        if self.current_motion_id:
+                        if self.current_motion_id and self.client_socket is not None:
                             total_size = 12 + 4  # Header (12) + status (1) + padding (3)
                             response_header = MessageHeader(
                                 Command.kMove, self.current_motion_id, total_size
