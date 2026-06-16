@@ -37,7 +37,7 @@ jobs:
 
     - name: Install package dependencies
       run: |
-        python -m pip install numpy==1.26.4 genesis-world==0.2.1 numba==0.60.0 pytest pytest-cov
+        python -m pip install numpy==1.26.4 genesis-world==0.2.1 numba==0.60.0 'robot_descriptions>=1.12' pytest pytest-cov
         # Install PyTorch based on OS
         if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
           # For Linux, use CPU-only PyTorch from specific URL

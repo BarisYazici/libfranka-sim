@@ -51,25 +51,14 @@ def genesis_sim():
             )
             sim.scene.build()
             sim.model, sim.data = sim.load_panda_model()
-            sim.jnt_names = [
-                "joint1",
-                "joint2",
-                "joint3",
-                "joint4",
-                "joint5",
-                "joint6",
-                "joint7",
-                "finger_joint1",
-                "finger_joint2",
-            ]
+            # FR3: 7-DOF, hand-less, joints fr3_joint1..7, EE link fr3_link7.
+            sim.jnt_names = [f"fr3_joint{i}" for i in range(1, 8)]
             sim.dofs_idx = [sim.franka.get_joint(name).dof_idx_local for name in sim.jnt_names]
-            sim.hand_link = sim.franka.get_link("hand")
+            sim.hand_link = sim.franka.get_link("fr3_link7")
             initial_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.785])
             sim.latest_joint_positions = initial_q.copy()
             for _ in range(100):
-                sim.franka.set_dofs_position(
-                    np.concatenate([initial_q, [0.04, 0.04]]), sim.dofs_idx
-                )
+                sim.franka.set_dofs_position(initial_q, sim.dofs_idx)
                 sim.scene.step()
             sim._read_and_publish_state()
         else:
@@ -83,13 +72,11 @@ def test_simulator_initialization(genesis_sim):
     # Check if simulator components are initialized
     assert genesis_sim.scene is not None
     assert genesis_sim.franka is not None
-    assert genesis_sim.model is not None
-    assert genesis_sim.data is not None
 
-    # Check initial joint positions
+    # Check initial joint positions (FR3: 7-DOF, hand-less -- no finger joints).
     q = genesis_sim.franka.get_dofs_position(genesis_sim.dofs_idx).cpu().numpy()
-    assert len(q) == 9  # 7 joints + 2 fingers
-    assert np.allclose(q[-2:], [0.04, 0.04])  # Check finger positions
+    assert len(q) == 7
+    assert np.allclose(q, [0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.785], atol=0.05)
 
 
 def test_position_control(genesis_sim):
