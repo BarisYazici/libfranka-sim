@@ -175,3 +175,33 @@ def cleanup_sockets():
     yield
     # Clean up any lingering sockets in TIME_WAIT state
     time.sleep(0.2)  # Increased delay to allow socket cleanup
+
+
+@pytest.fixture
+def gripper_backend():
+    """A fresh kinematic Franka Hand backend for gripper tests."""
+    from franka_sim.gripper_backend import FrankaHandSim
+
+    return FrankaHandSim()
+
+
+@pytest.fixture
+def gripper_server(gripper_backend):
+    """A started gripper server (port 1338) with an injected backend."""
+    from franka_sim.gripper_protocol import GRIPPER_COMMAND_PORT
+    from franka_sim.gripper_server import FrankaGripperServer
+
+    server = FrankaGripperServer(backend=gripper_backend)
+    server_thread = threading.Thread(target=server.run_server, daemon=True)
+    server_thread.start()
+
+    if not wait_for_server(GRIPPER_COMMAND_PORT):
+        server.stop()
+        server_thread.join(timeout=1.0)
+        raise RuntimeError("Gripper server failed to start")
+
+    yield server
+
+    server.stop()
+    server_thread.join(timeout=2.0)
+    time.sleep(0.2)

@@ -458,6 +458,33 @@ def test_set_collision_behavior(tcp_client, udp_client, sim_server, mock_genesis
     assert status == 0  # Success
 
 
+def test_automatic_error_recovery(tcp_client, udp_client, sim_server, mock_genesis_sim):
+    """Test AutomaticErrorRecovery command handling.
+
+    Regression: without a response, libfranka (and franka_hardware, which calls
+    automaticErrorRecovery() on activation) blocks forever, stalling the whole
+    control stack. The command has an empty request and a single uint8 status.
+    """
+    assert perform_handshake(tcp_client)
+
+    # AutomaticErrorRecovery has an empty request payload.
+    command_id = 1
+    header = MessageHeader(Command.kAutomaticErrorRecovery, command_id, 12)
+    tcp_client.sendall(header.to_bytes())
+
+    # Receive and verify response. A timeout makes a regression (no reply ->
+    # libfranka blocks forever) surface as a fast failure, not a hung suite.
+    tcp_client.settimeout(2.0)
+    response_header = MessageHeader.from_bytes(tcp_client.recv(12))
+    assert response_header.command == Command.kAutomaticErrorRecovery
+    assert response_header.command_id == command_id
+    assert response_header.size == 16  # Header (12) + status (1) + padding (3)
+
+    # Get response status
+    status = struct.unpack("<B3x", tcp_client.recv(4))[0]
+    assert status == 0  # Success
+
+
 def test_set_joint_impedance(tcp_client, udp_client, sim_server, mock_genesis_sim):
     """Test SetJointImpedance command handling"""
     assert perform_handshake(tcp_client)

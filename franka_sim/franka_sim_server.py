@@ -31,6 +31,7 @@ from franka_sim.franka_protocol import (
     convert_to_libfranka_controller_mode,
     convert_to_libfranka_motion_mode,
 )
+from franka_sim.gripper_server import FrankaGripperServer
 from franka_sim.robot_state import RobotState
 
 # Configure detailed logging for debugging
@@ -68,6 +69,9 @@ class FrankaSimServer:
         enable_vis=False,
         genesis_sim=None,
         urdf_path=None,
+        enable_gripper=True,
+        gripper_backend=None,
+        gripper_physics: bool = False,
     ):
         """
         Initialize the Franka simulation server.
@@ -99,7 +103,9 @@ class FrankaSimServer:
         # Initialize Genesis simulator
         if genesis_sim is None:
             logger.info("Initializing simulation")
-            self.genesis_sim = FrankaGenesisSim(enable_vis=enable_vis)
+            self.genesis_sim = FrankaGenesisSim(
+                enable_vis=enable_vis, enable_hand=(gripper_physics and enable_gripper)
+            )
             logger.info("Simulation initialized")
         else:
             self.genesis_sim = genesis_sim
@@ -109,6 +115,21 @@ class FrankaSimServer:
         # Robot model (URDF) served to the client via GetRobotModel. In
         # libfranka_new the client builds its own Pinocchio model from this.
         self.urdf_string = self._load_robot_model(urdf_path)
+
+        # Co-located gripper server (libfranka gripper protocol, port 1338).
+        # Self-contained: its own backend and sockets, independent of the arm's
+        # Genesis loop. Launched from start() as a daemon thread.
+        self.gripper_thread = None
+        if enable_gripper:
+            if gripper_physics:
+                from franka_sim.gripper_physics import GenesisFrankaHand
+
+                backend = GenesisFrankaHand(self.genesis_sim)
+            else:
+                backend = gripper_backend
+            self.gripper_server = FrankaGripperServer(host=host, backend=backend)
+        else:
+            self.gripper_server = None
 
     def _load_robot_model(self, urdf_path):
         """Read the URDF served via GetRobotModel (defaults to the bundled FR3)."""
@@ -696,6 +717,43 @@ class FrankaSimServer:
             response_data = struct.pack("<B3x", 1)  # Status 1 = Error
             client_socket.sendall(header_bytes + response_data)
 
+    def handle_automatic_error_recovery_command(
+        self, client_socket, header: MessageHeader, payload: bytes
+    ):
+        """Handle AutomaticErrorRecovery command received over TCP.
+
+        The real robot clears any latched reflex/error and returns to Idle.
+        Without a response here, libfranka (and franka_hardware, which calls
+        automaticErrorRecovery() on activation) blocks forever waiting on the
+        TCP reply, stalling the whole control stack.
+        """
+        try:
+            # AutomaticErrorRecovery has an empty request; nothing to parse.
+            # Clear any error/reflex state and return the arm to Idle.
+            self.robot_state.state["robot_mode"] = RobotMode.kIdle
+
+            # Response is ResponseBase: a single uint8 status (kSuccess = 0).
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(
+                Command.kAutomaticErrorRecovery, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 0)  # 1 byte status + 3 bytes padding
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent AutomaticErrorRecovery success response")
+
+        except Exception as e:
+            logger.error(f"Error handling AutomaticErrorRecovery command: {e}")
+            # Send error response (status = 1)
+            total_size = 12 + 4
+            response_header = MessageHeader(
+                Command.kAutomaticErrorRecovery, header.command_id, total_size
+            )
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 1)  # Status 1 = Error
+            client_socket.sendall(header_bytes + response_data)
+
     def handle_tcp_messages(self, client_socket):
         """Handle TCP messages in a separate thread"""
         logger.info("TCP message handler thread started")
@@ -742,6 +800,9 @@ class FrankaSimServer:
                 elif header.command == Command.kGetRobotModel:
                     logger.info("Handling GetRobotModel command")
                     self.handle_get_robot_model(client_socket, header)
+                elif header.command == Command.kAutomaticErrorRecovery:
+                    logger.info("Handling AutomaticErrorRecovery command")
+                    self.handle_automatic_error_recovery_command(client_socket, header, payload)
                 else:
                     logger.warning(
                         f"Unhandled command in TCP thread: {Command(header.command).name}"
@@ -1030,6 +1091,14 @@ class FrankaSimServer:
         finally:
             self.cleanup()
 
+    def start_gripper_server(self):
+        """Launch the co-located gripper server's accept loop in a daemon thread."""
+        if self.gripper_server is None:
+            return
+        self.gripper_thread = threading.Thread(target=self.gripper_server.run_server, daemon=True)
+        self.gripper_thread.start()
+        logger.info("Gripper server running in background thread")
+
     def start(self):
         """Start the TCP server and Genesis simulator"""
         try:
@@ -1039,6 +1108,9 @@ class FrankaSimServer:
             # Initialize Genesis simulator first
             self.genesis_sim.initialize_simulation()
             logger.info("Genesis simulation initialized")
+
+            # Bring up the gripper server alongside the arm (port 1338).
+            self.start_gripper_server()
 
             if self.genesis_sim.enable_vis:
                 # Run server in a background thread when visualization is enabled
@@ -1135,6 +1207,10 @@ class FrankaSimServer:
         self.connection_running = False
         self.transmitting_state = False
         self.cleanup()
+        if self.gripper_server is not None:
+            self.gripper_server.stop()
+            if self.gripper_thread is not None:
+                self.gripper_thread.join(timeout=2.0)
         # Stop Genesis simulator
         self.genesis_sim.stop()
 

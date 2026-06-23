@@ -134,6 +134,30 @@ python -m franka_sim.run_server -v
 
 In your application, use standard libfranka commands. The simulation will respond exactly like the real robot.
 
+### Gripper (Franka Hand)
+
+The gripper server (libfranka gripper protocol, **TCP port 1338**) runs **by default** alongside
+the arm. Drive it with the standard `franka::Gripper` client (`homing` / `move` / `grasp` / `stop`).
+
+```bash
+# Arm + gripper, kinematic hand (no mesh; width tracked analytically, CI-friendly)
+python -m franka_sim.run_server -v
+
+# Arm + gripper, physics-backed Franka Hand: the hand mesh is loaded and the
+# finger DOFs are simulated, so homing/move/grasp visibly move the fingers in
+# the viewer (grasp succeeds on a finger-position stall against an object)
+python -m franka_sim.run_server -v --gripper-physics
+
+# Disable the gripper server entirely
+python -m franka_sim.run_server -v --no-gripper
+```
+
+| Flag | Gripper backend | Hand in viewer |
+| ---- | --------------- | -------------- |
+| *(default)* | `FrankaHandSim` (kinematic) | no |
+| `--gripper-physics` | `GenesisFrankaHand` (physics) | yes, fingers move |
+| `--no-gripper` | none (arm only) | no |
+
 ### Troubleshooting
 
 If you encounter issues related to missing asset files, make sure you have the correct version of `genesis-world` installed:
@@ -168,10 +192,10 @@ The simulation server currently implements all major features of the Franka robo
 - [x] libfranka python bindings
 - [x] v10 wire protocol (Connect, float-based RobotState, GetRobotModel/URDF)
 - [x] Robot model via URDF (client-side Pinocchio through GetRobotModel)
+- [x] Gripper simulation / Franka Hand (kinematic + Genesis physics, `--gripper-physics`)
+- [x] Automatic error recovery (so `franka_hardware` / franka_ros2 can activate)
 - [ ] Advanced collision detection (in progress)
-- [ ] Error handling and recovery (planned)
 - [ ] Cartesian interfaces (planned)
-- [ ] Gripper simulation / Franka Hand (planned)
 
 
 
