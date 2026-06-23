@@ -26,13 +26,29 @@ def main():
         help="URDF served to the client via GetRobotModel "
         "(defaults to the bundled hand-less FR3 arm model)",
     )
+    parser.add_argument(
+        "--no-gripper",
+        action="store_true",
+        default=False,
+        help="Disable the co-located gripper server (port 1338)",
+    )
+    parser.add_argument(
+        "--gripper-physics",
+        action="store_true",
+        help="Use the Genesis physics gripper (9-DOF, fingers move in the viewer)",
+    )
     args = parser.parse_args()
 
     print(f"Starting Franka Simulation Server {'with' if args.vis else 'without'} visualization")
     print("Connect to the server using 'localhost' or '127.0.0.1' as the robot IP address")
     print("Press Ctrl+C to stop the server")
 
-    server = FrankaSimServer(enable_vis=args.vis, urdf_path=args.urdf)
+    server = FrankaSimServer(
+        enable_vis=args.vis,
+        urdf_path=args.urdf,
+        enable_gripper=not args.no_gripper,
+        gripper_physics=args.gripper_physics,
+    )
     try:
         server.start()
     except KeyboardInterrupt:

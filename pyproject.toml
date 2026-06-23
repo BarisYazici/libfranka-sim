@@ -54,10 +54,11 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["franka_sim"]
+packages = ["franka_sim", "franka_sim.assets"]
 
 [tool.setuptools.package-data]
 franka_sim = ["models/*.urdf"]
+"franka_sim.assets" = ["franka_hand/*.obj", "franka_hand/*.stl"]
 
 [tool.black]
 line-length = 100

@@ -54,7 +54,7 @@ class ControlMode(Enum):
 
 
 class FrankaGenesisSim:
-    def __init__(self, enable_vis=False, model_path=None):
+    def __init__(self, enable_vis=False, model_path=None, enable_hand=False, extra_morphs=None):
         self.enable_vis = enable_vis
         self.scene = None
         self.franka = None
@@ -81,6 +81,20 @@ class FrankaGenesisSim:
         self.sim_thread = None
         self.hand_link = None  # cached end-effector link handle (set on build)
 
+        # Optional physics gripper (9-DOF: 7 arm + 2 fingers). When enabled, the
+        # combined FR3+hand model is generated at init and the fingers are driven
+        # from latest_finger_positions (lock-free, like the arm command arrays).
+        self.enable_hand = enable_hand
+        # Optional scene entities added before scene.build() (e.g. graspable objects).
+        # Default empty → zero behavior change for existing callers.
+        self.extra_morphs = extra_morphs or []
+        self.finger_dofs_idx = None
+        self.max_finger_width = 0.08  # total opening; 0.04 per finger
+        self._hand_model_tmp = None  # temp MJCF path to clean up in stop()
+        # Per-finger targets (m), each 0..0.04. Start fully open.
+        self.latest_finger_positions = np.array([0.04, 0.04])
+        self._finger_snapshot = {"q": np.zeros(2), "dq": np.zeros(2)}
+
         # Numerical-differentiation state for joint acceleration (physics thread).
         # 7 DOF: the FR3 model is hand-less (no finger joints).
         self.prev_dq_full = np.zeros(7)
@@ -105,7 +119,15 @@ class FrankaGenesisSim:
         # FR3 physics model (MJCF). The real robot is an FR3; this model matches
         # its kinematics/inertia and brings the joint damping/friction the old
         # frictionless Panda model lacked.
-        self.xml_path = Path(model_path) if model_path is not None else default_fr3_mjcf()
+        if model_path is not None:
+            self.xml_path = Path(model_path)
+        elif enable_hand:
+            from franka_sim.assets import build_fr3_with_hand_mjcf
+
+            self._hand_model_tmp = build_fr3_with_hand_mjcf()
+            self.xml_path = self._hand_model_tmp
+        else:
+            self.xml_path = default_fr3_mjcf()
         logger.info(f"Using Genesis FR3 MJCF: {self.xml_path}")
 
     def load_panda_model(self):
@@ -116,8 +138,13 @@ class FrankaGenesisSim:
         # return model, data
 
     def initialize_simulation(self):
-        # Initialize Genesis with CPU backend
-        gs.init(backend=gs.cpu, logging_level=None)
+        # Initialize Genesis with CPU backend (idempotent: ignore "already initialized").
+        if not getattr(gs, "_initialized", False):
+            try:
+                gs.init(backend=gs.cpu, logging_level=None)
+            except Exception as exc:
+                if "already initialized" not in str(exc).lower():
+                    raise
 
         # Create scene
         self.scene = gs.Scene(
@@ -146,6 +173,10 @@ class FrankaGenesisSim:
             ),
             material=gs.materials.Rigid(gravity_compensation=1.0),
         )
+
+        # Optional extra entities (e.g. graspable boxes) injected before build.
+        for morph in self.extra_morphs:
+            self.scene.add_entity(morph)
 
         # Build scene
         self.scene.build()
@@ -190,6 +221,19 @@ class FrankaGenesisSim:
         # name. FR3 is hand-less; link7 is the flange (attachment frame).
         self.hand_link = self.franka.get_link("fr3_link7")
 
+        if self.enable_hand:
+            self.finger_dofs_idx = [
+                self.franka.get_joint(n).dof_idx_local
+                for n in ("fr3_finger_joint1", "fr3_finger_joint2")
+            ]
+            # Finger actuator force range (Franka Hand ~70 N grip; cap for safety).
+            self.franka.set_dofs_force_range(
+                lower=np.array([-100, -100]),
+                upper=np.array([100, 100]),
+                dofs_idx_local=self.finger_dofs_idx,
+            )
+            self.franka.set_dofs_position(self.latest_finger_positions, self.finger_dofs_idx)
+
         # Initialize to default position
         initial_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.785])
         # Set the initial position as the target position for the controller
@@ -226,6 +270,18 @@ class FrankaGenesisSim:
     def update_joint_velocities(self, velocities):
         """Publish the latest commanded joint velocities (lock-free; see update_torques)."""
         self.latest_joint_velocities = np.array(velocities)
+
+    def update_finger_positions(self, positions):
+        """Publish per-finger position targets (length-2, each 0..0.04 m).
+
+        Lock-free (see update_torques): a fresh array is bound atomically and the
+        physics thread is the only reader.
+        """
+        self.latest_finger_positions = np.array(positions)
+
+    def get_finger_state(self):
+        """Return the latest finger snapshot {'q': (2,), 'dq': (2,)} (atomic read)."""
+        return self._finger_snapshot
 
     def _pose_to_column_major(self, ee_pos, ee_quat):
         """Build a column-major 4x4 O_T_EE from an EE position and [x, y, z, w] quat."""
@@ -264,6 +320,11 @@ class FrankaGenesisSim:
         ee_pos = self.hand_link.get_pos().cpu().numpy()
         ee_quat = self.hand_link.get_quat().cpu().numpy()  # [x, y, z, w]
         O_T_EE = self._pose_to_column_major(ee_pos, ee_quat)
+
+        if self.enable_hand and self.finger_dofs_idx is not None:
+            fq = self.franka.get_dofs_position(self.finger_dofs_idx).cpu().numpy()
+            fdq = self.franka.get_dofs_velocity(self.finger_dofs_idx).cpu().numpy()
+            self._finger_snapshot = {"q": fq, "dq": fdq}
 
         # q_d / tau_J mirror the latest network commands (atomic reads).
         self._state_snapshot = {
@@ -305,6 +366,11 @@ class FrankaGenesisSim:
                 self.franka.control_dofs_velocity(self.latest_joint_velocities, self.dofs_idx)
             elif current_mode == ControlMode.TORQUE:
                 self.franka.control_dofs_force(self.latest_torques, self.dofs_idx)
+
+            if self.enable_hand and self.finger_dofs_idx is not None:
+                self.franka.control_dofs_position(
+                    self.latest_finger_positions, self.finger_dofs_idx
+                )
 
             # Step physics. scene.step(update_visualizer=True) refreshes the
             # viewer AND sleeps to cap it at max_FPS, which would otherwise
@@ -361,6 +427,12 @@ class FrankaGenesisSim:
             self.scene.viewer.stop()
         if self.sim_thread:
             self.sim_thread.join(timeout=1.0)  # Wait for simulation thread to finish
+        if self._hand_model_tmp is not None:
+            try:
+                Path(self._hand_model_tmp).unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._hand_model_tmp = None
 
     def get_robot_state(self):
         """Return the latest state snapshot published by the physics thread.

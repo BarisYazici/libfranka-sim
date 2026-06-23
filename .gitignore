@@ -2,3 +2,6 @@ franka_sim.egg-info/
 __pycache__/
 .pytest_cache/
 .coverage
+
+# Local-only documentation (kept on disk, not tracked/pushed)
+docs/
