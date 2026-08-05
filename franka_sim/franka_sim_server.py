@@ -72,6 +72,7 @@ class FrankaSimServer:
         enable_gripper=True,
         gripper_backend=None,
         gripper_physics: bool = False,
+        mobile_base: bool = False,
     ):
         """
         Initialize the Franka simulation server.
@@ -83,6 +84,9 @@ class FrankaSimServer:
             genesis_sim: Optional pre-configured Genesis simulator instance for testing
             urdf_path: URDF served to the client via GetRobotModel. Defaults to the
                 bundled hand-less FR3 arm model.
+            mobile_base: Serve a swerve mobile base instead of an arm. The
+                simulator must implement ``update_base_twist`` and the client
+                drives it with the kCartesianVelocity motion generator.
         """
         self.host = host
         self.port = port
@@ -99,6 +103,7 @@ class FrankaSimServer:
         self.client_udp_port = None
         self.control_mode = ControlMode.NONE
         self.connection_running = False  # New flag for per-connection state
+        self.mobile_base = mobile_base
 
         # Initialize Genesis simulator
         if genesis_sim is None:
@@ -368,15 +373,8 @@ class FrankaSimServer:
                     # both -- otherwise the client hangs waiting for the stop to
                     # be acknowledged.
                     if command["motion_generation_finished"] or command["torque_command_finished"]:
-                        # Switch to position control and hold current position
                         if self.control_mode != ControlMode.POSITION:
-                            logger.info("Motion finished: Switching to position control mode \
-                                    and holding current position")
-                            current_joint_positions = self.genesis_sim.get_robot_state()["q"]
-                            self.genesis_sim.set_control_mode(ControlMode.POSITION)
-                            self.control_mode = ControlMode.POSITION
-                            self.genesis_sim.update_joint_positions(current_joint_positions)
-                            self.genesis_sim.update_torques([0.0] * 7)
+                            self._switch_to_hold_position()
 
                         # Update state to idle modes
                         self.robot_state.state["motion_generator_mode"] = 0  # kIdle
@@ -436,6 +434,14 @@ class FrankaSimServer:
                         self.robot_state.state["dq_d"] = list(command["dq_c"])
                         self.genesis_sim.update_joint_velocities(command["dq_c"])
                         self.genesis_sim.update_torques([0.0] * 7)
+                    elif (
+                        self.mobile_base
+                        and self.robot_state.state["motion_generator_mode"]
+                        == LibfrankaMotionGeneratorMode.kCartesianVelocity
+                        and self.robot_state.state["controller_mode"]
+                        != LibfrankaControllerMode.kExternalController
+                    ):
+                        self._handle_cartesian_velocity(command)
                     elif (
                         self.robot_state.state["controller_mode"]
                         == LibfrankaControllerMode.kExternalController
@@ -509,6 +515,14 @@ class FrankaSimServer:
                 logger.info("Setting control mode to VELOCITY")
                 self.genesis_sim.set_control_mode(ControlMode.VELOCITY)
                 self.control_mode = ControlMode.VELOCITY
+            elif (
+                self.mobile_base
+                and move_cmd.motion_generator_mode == MotionGeneratorMode.kCartesianVelocity
+                and move_cmd.controller_mode != ControllerMode.kExternalController
+            ):
+                logger.info("Setting control mode to STEERING_DRIVE")
+                self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
+                self.control_mode = ControlMode.STEERING_DRIVE
             elif move_cmd.controller_mode == ControllerMode.kExternalController:
                 logger.info("Setting control mode to TORQUE")
                 self.genesis_sim.set_control_mode(ControlMode.TORQUE)
@@ -552,6 +566,49 @@ class FrankaSimServer:
         except Exception as e:
             logger.error(f"Error sending Move response: {e}", exc_info=True)
 
+    def _switch_to_hold_position(self):
+        """Freeze the simulator when a motion finishes or StopMove arrives.
+
+        A mobile base has no joint-space hold: the correct "stop" is a zero
+        body twist. An arm holds its current joint positions with zero torque.
+        """
+        if self.mobile_base:
+            logger.info("Motion finished: commanding zero base twist")
+            self.genesis_sim.update_base_twist([0.0] * 6)
+            self.control_mode = ControlMode.STEERING_DRIVE
+            return
+
+        logger.info("Motion finished: switching to position control and holding position")
+        current_joint_positions = self.genesis_sim.get_robot_state()["q"]
+        self.genesis_sim.set_control_mode(ControlMode.POSITION)
+        self.control_mode = ControlMode.POSITION
+        self.genesis_sim.update_joint_positions(current_joint_positions)
+        self.genesis_sim.update_torques([0.0] * 7)
+
+    def _handle_cartesian_velocity(self, command):
+        """Route a cartesian-velocity command to the mobile base.
+
+        The TMR master accepts only a body-frame twist; libfranka carries it in
+        ``O_dP_EE_c`` = ``[vx, vy, vz, wx, wy, wz]``. Swerve inverse kinematics
+        and the wheel targets live in the simulator, mirroring the real robot
+        where the master does the IK onboard.
+
+        Only reached on a ``mobile_base`` server: the dispatcher branch below
+        carries that guard, so there is no ``mobile_base`` test here -- and no
+        log statement either, since this runs once per UDP datagram (~1 kHz).
+        """
+        twist = list(command["O_dP_EE_c"])
+        self.robot_state.state["O_dP_EE_c"] = twist
+        self.robot_state.state["O_dP_EE_d"] = twist
+
+        if self.control_mode is not ControlMode.STEERING_DRIVE:
+            # Logged only on the transition, never per datagram.
+            logger.info("Setting control mode to STEERING_DRIVE")
+            self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
+            self.control_mode = ControlMode.STEERING_DRIVE
+
+        self.genesis_sim.update_base_twist(twist)
+
     def handle_stop_move_command(self, client_socket, header: MessageHeader):
         """Handle StopMove command received over TCP"""
         try:
@@ -568,14 +625,8 @@ class FrankaSimServer:
             client_socket.sendall(header_bytes + response_data)
             logger.info("Sent StopMove success response")
 
-            # Switch to position control and hold current position
             if self.control_mode != ControlMode.POSITION:
-                logger.info("Switching to position control mode and holding current position")
-                current_joint_positions = self.genesis_sim.get_robot_state()["q"]
-                self.genesis_sim.set_control_mode(ControlMode.POSITION)
-                self.control_mode = ControlMode.POSITION
-                self.genesis_sim.update_joint_positions(current_joint_positions)
-                self.genesis_sim.update_torques([0.0] * 7)
+                self._switch_to_hold_position()
 
             # Send one final state with both modes set to idle
             if hasattr(self, "udp_socket") and self.udp_socket:

@@ -178,6 +178,50 @@ def cleanup_sockets():
 
 
 @pytest.fixture
+def mock_base_sim():
+    """A mocked mobile-base simulator: 7-element state plus update_base_twist."""
+    from franka_sim.tmr_genesis_sim import TMRGenesisSim
+
+    mock_sim = Mock(spec=TMRGenesisSim)
+    mock_sim.enable_vis = False
+    mock_sim.get_robot_state.return_value = {
+        "q": np.zeros(7),
+        "dq": np.zeros(7),
+        "tau_J": np.zeros(7),
+    }
+    return mock_sim
+
+
+@pytest.fixture
+def base_sim_server(mock_base_sim):
+    """A started FrankaSimServer in mobile-base mode on the standard port."""
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(
+        enable_vis=False,
+        genesis_sim=mock_base_sim,
+        enable_gripper=False,
+        mobile_base=True,
+    )
+    server_thread = threading.Thread(target=server.run_server, daemon=True)
+    server_thread.start()
+
+    if not wait_for_server(COMMAND_PORT):
+        server.stop()
+        server_thread.join(timeout=1.0)
+        raise RuntimeError("Mobile-base server failed to start")
+
+    yield server
+
+    server.running = False
+    server.connection_running = False
+    server.transmitting_state = False
+    server.stop()
+    server_thread.join(timeout=3.0)
+    time.sleep(0.5)
+
+
+@pytest.fixture
 def gripper_backend():
     """A fresh kinematic Franka Hand backend for gripper tests."""
     from franka_sim.gripper_backend import FrankaHandSim
