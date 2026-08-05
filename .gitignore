@@ -6,3 +6,4 @@ __pycache__/
 # Local-only documentation (kept on disk, not tracked/pushed)
 docs/
 libfranka_new
+assets/mobile_duo/
