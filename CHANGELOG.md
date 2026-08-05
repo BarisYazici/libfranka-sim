@@ -5,6 +5,59 @@ All notable changes to **franka-sim** are documented here. The format is based o
 so per [Semantic Versioning](https://semver.org/) a minor (`0.x`) bump may include
 breaking changes — these are called out explicitly.
 
+## [Unreleased]
+
+### Added
+
+- **Mobile FR3 duo simulation** (`--mobile-duo`): one Genesis scene combining
+  the TMR mobile base and two FR3 arms (rigidly mounted, so base motion
+  carries both arms), served over **three** FCI bridges — one per role
+  (`left`, `right`, `base`) — separated by loopback host IP since libfranka
+  clients cannot be told to use a port other than 1337. New flags
+  `--scene-urdf`, `--mesh-root`, repeated `--bind ROLE=HOST`; see the README
+  for the three-IP loopback convention (base `127.0.0.10`, left `.11`, right
+  `.12`, spine `.13`) and `scripts/generate_mobile_duo_urdf.sh` for building
+  the combined URDF.
+- **Swerve kinematics** for the TMR base, ported from
+  `franka_mobile::SwerveKinematics`: body-frame twist -> per-module steering
+  angle and wheel speed, with pi-ambiguity resolution that minimises steering
+  travel from the previous command.
+- **TMR platform emulation** (`TMRGenesisSim`, `SwerveBase`): the base pose is
+  advanced kinematically from the commanded twist and written to the entity
+  every physics step, while the wheel joints are driven so they look and
+  report correctly — mirroring how the real TMR master does swerve IK onboard
+  and treats the wheel joints as state-report-only. Currently a
+  programmatic/manual bring-up target with no CLI entry point;
+  `MobileDuoRunner` is the shipped path.
+- **`kCartesianVelocity` protocol mode**: the TMR base has no joint interface,
+  so it is driven by libfranka's cartesian-velocity motion generator — the
+  commanded body-frame twist (`O_dP_EE_c`) is routed straight to the base's
+  swerve inverse kinematics.
+- **Fake spine REST device** (`franka_sim.spine_stub`, `--spine` /
+  `run-franka-spine-stub`): serves the same HTTPS routes as upstream's real
+  spine device from a constant-velocity motion model, so
+  `franka_spine_server` can run unmodified against the simulator and a REST
+  move visibly raises the prismatic lift (and everything mounted on it) in
+  the viewer. New flags `--spine-host`, `--spine-port`, `--spine-cert`,
+  `--spine-key`; `FRANKA_SIM_SPINE_PORT` for pointing the end-to-end test
+  suite at an unprivileged redirected port instead of the real device's
+  port 443.
+
+### Fixed
+
+- **Socket-teardown race in `FrankaSimServer.cleanup()`.** Socket attributes
+  (`client_socket`, `server_socket`, `command_socket`, `udp_socket`) were
+  re-read between their `shutdown()` and `close()` calls, racing a
+  concurrent per-connection teardown that can null those attributes. When it
+  did, `None.close()` raised `AttributeError` — not caught by the narrow
+  `except socket.error` — aborting the rest of cleanup and leaking listeners
+  that coexist via `SO_REUSEPORT` and keep receiving traffic bound to a dead
+  scene. Each socket is now cached into a local before use.
+  `MobileDuoRunner.stop()` had the same fragility one level up: one bridge's
+  `stop()` raising skipped the remaining bridges and the shared scene's
+  teardown. Each bridge (and the spine stub) now stops in its own isolated
+  `try`/`except`, and the shared scene always stops regardless.
+
 ## [0.2.0] - 2026-06-16
 
 ### ⚠ Breaking

@@ -158,6 +158,99 @@ python -m franka_sim.run_server -v --no-gripper
 | `--gripper-physics` | `GenesisFrankaHand` (physics) | yes, fingers move |
 | `--no-gripper` | none (arm only) | no |
 
+### Mobile duo (two arms + TMR base on one scene)
+
+`--mobile-duo` serves the mobile FR3 duo: one Genesis scene (both arms and the
+TMR mobile base, physically rigid to each other) driven by **three** FCI
+bridges, one per role. libfranka clients cannot be told to use a port other
+than 1337, so the bridges are separated by **host IP** instead — each is
+bound to its own loopback alias with `--bind ROLE=HOST`, repeated once per
+role (`left`, `right`, `base`):
+
+```bash
+# Bring up the loopback aliases once per boot (Linux; 127.0.0.0/8 is all loopback)
+sudo ip addr add 127.0.0.11/8 dev lo 2>/dev/null
+sudo ip addr add 127.0.0.12/8 dev lo 2>/dev/null
+sudo ip addr add 127.0.0.13/8 dev lo 2>/dev/null  # only needed with --spine
+
+python -m franka_sim.run_server --mobile-duo \
+  --scene-urdf /path/to/mobile_fr3_duo.urdf \
+  --mesh-root  /path/to/franka_description \
+  --bind left=127.0.0.11 \
+  --bind right=127.0.0.12 \
+  --bind base=127.0.0.10
+```
+
+| Flag | Meaning |
+| ---- | ------- |
+| `--mobile-duo` | Serve the mobile duo instead of the classic single-arm server |
+| `--scene-urdf PATH` | The combined `mobile_fr3_duo` URDF loaded into the one Genesis scene (required with `--mobile-duo`; see below for generating it) |
+| `--mesh-root PATH` | Package root used to resolve `package://` mesh URIs in the URDF — a `franka_description` checkout; defaults to the URDF's own directory |
+| `--bind ROLE=HOST` | Bind one bridge to a host address; repeat for `left`, `right` and `base` (all three are required) |
+
+By convention this repo uses three loopback aliases on `127.0.0.0/8`, one per
+role, plus a fourth for the spine device:
+
+| Role | Address |
+| ---- | ------- |
+| base | `127.0.0.10` |
+| left arm | `127.0.0.11` |
+| right arm | `127.0.0.12` |
+| spine | `127.0.0.13` |
+
+Every bridge still listens on the standard libfranka command port (1337);
+override it for all three at once with `--port`.
+
+**Generating `--scene-urdf`.** `scripts/generate_mobile_duo_urdf.sh
+<franka_description_dir> <output.urdf>` runs the upstream xacro with the
+options this server expects (`hand:=false`, explicit `robot_types`, no
+ROS 2 control/Gazebo) from a sourced ROS 2 Jazzy environment. It asserts the
+`franka_description` checkout is pinned to the exact sha the mesh paths and
+joint names were generated against, and refuses to run otherwise — a
+different checkout can silently rename meshes or joints out from under the
+sim.
+
+**The fake spine device.** The duo's prismatic lift
+(`franka_spine_vertical_joint`) is driven by a separate REST device on real
+hardware, not by libfranka. `--spine` runs a fake version of that device
+in-process (`franka_sim.spine_stub`) and shares its motion model with the
+scene, so a REST move visibly raises the lift (and everything mounted on
+it — the head and both arms) in the viewer:
+
+```bash
+python -m franka_sim.run_server --mobile-duo \
+  --scene-urdf /path/to/mobile_fr3_duo.urdf --mesh-root /path/to/franka_description \
+  --bind left=127.0.0.11 --bind right=127.0.0.12 --bind base=127.0.0.10 \
+  --spine
+```
+
+| Flag | Meaning |
+| ---- | ------- |
+| `--spine` | Also run the spine stub in-process (requires `--mobile-duo`) |
+| `--spine-host` | Address the spine stub binds (default: `127.0.0.13`) |
+| `--spine-port` | Port the spine stub binds; `SpineApiClient` hardcodes 443 with no port, so leave this at the default unless you know why you're changing it (default: `443`) |
+| `--spine-cert` / `--spine-key` | TLS certificate/key for the stub; a throwaway self-signed pair is generated automatically when omitted |
+
+The spine stub also runs standalone via the `run-franka-spine-stub` console
+script (installed with the package), useful for exercising just the REST
+device without a Genesis scene:
+
+```bash
+run-franka-spine-stub --host 127.0.0.13 --port 443
+```
+
+**Cartesian-velocity protocol mode.** The TMR base has no joint interface, so
+it is driven by libfranka's `kCartesianVelocity` motion generator: the
+client's commanded body-frame twist (`O_dP_EE_c`) is routed straight to the
+base's swerve inverse kinematics instead of to a joint position/velocity/
+torque path.
+
+**Environment variables.**
+
+| Variable | Meaning |
+| -------- | ------- |
+| `FRANKA_SIM_SPINE_PORT` | Test-suite only. `SpineApiClient` hardcodes port 443, which needs root to bind; set this to point the mobile-duo end-to-end tests at an unprivileged port instead (e.g. via an `iptables` `REDIRECT 443 -> 8443`) |
+
 ### Troubleshooting
 
 If you encounter issues related to missing asset files, make sure you have the correct version of `genesis-world` installed:
