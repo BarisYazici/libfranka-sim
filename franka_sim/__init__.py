@@ -5,6 +5,9 @@ from franka_sim.gripper_physics import GenesisFrankaHand
 from franka_sim.gripper_server import FrankaGripperServer
 from franka_sim.robot_state import RobotState
 from franka_sim.run_server import main as run_server_main
+from franka_sim.swerve_base import SwerveBase
+from franka_sim.swerve_kinematics import SwerveKinematics
+from franka_sim.tmr_genesis_sim import TMRGenesisSim
 
 __all__ = [
     "Command",
@@ -18,4 +21,7 @@ __all__ = [
     "FrankaHandSim",
     "GenesisFrankaHand",
     "FrankaGripperServer",
+    "SwerveBase",
+    "SwerveKinematics",
+    "TMRGenesisSim",
 ]

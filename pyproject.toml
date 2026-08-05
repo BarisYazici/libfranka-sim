@@ -52,6 +52,9 @@ dev = [
     "pytest-cov>=4.1.0",
 
 ]
+mobile = [
+    "trimesh>=4.0",
+]
 
 [tool.setuptools]
 packages = ["franka_sim", "franka_sim.assets"]
