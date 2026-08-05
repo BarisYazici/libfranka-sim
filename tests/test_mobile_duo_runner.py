@@ -174,3 +174,88 @@ def test_cli_defaults_leave_the_single_arm_path_untouched():
     assert args.no_gripper is False
     assert args.gripper_physics is False
     run_server.validate_args(args)
+
+
+class StubSpineServer:
+    """Stands in for SpineStubServer: exposes .model, .start() and .stop()."""
+
+    def __init__(self, position_m=0.0):
+        from franka_sim.spine_stub import SpineModel
+
+        self.model = SpineModel(position_m=position_m)
+        self.port = 4430
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_runner_shares_the_spine_model_with_the_scene(bound_scene):
+    spine = StubSpineServer()
+    runner = MobileDuoRunner(bound_scene, LOOPBACK, spine_server=spine)
+    assert bound_scene.spine_model is spine.model
+
+
+def test_runner_leaves_the_spine_unset_without_a_stub(bound_scene):
+    MobileDuoRunner(bound_scene, LOOPBACK)
+    assert bound_scene.spine_model is None
+
+
+def test_runner_starts_and_stops_the_spine_stub(bound_scene):
+    spine = StubSpineServer()
+    runner = MobileDuoRunner(bound_scene, LOOPBACK, spine_server=spine)
+    runner.start_servers()
+    try:
+        assert spine.started is True
+    finally:
+        runner.stop()
+    assert spine.stopped is True
+    assert bound_scene.spine_model is None
+
+
+def test_a_rest_move_raises_the_spine_joint_in_the_scene(bound_scene):
+    """The whole point of --spine: a REST command moves the lift in the viewer."""
+    spine = StubSpineServer()
+    MobileDuoRunner(bound_scene, LOOPBACK, spine_server=spine)
+
+    spine.model.switch_on()
+    spine.model.start_motion(0.5, 1.0)
+    time.sleep(0.3)
+    bound_scene._apply_control()
+
+    values, dofs = bound_scene.robot.set_position_calls[-1]
+    assert dofs == [bound_scene.spine_dof_idx]
+    assert 0.0 < float(values[0]) <= 0.5
+
+
+def test_cli_parses_the_spine_flags():
+    args = run_server.build_parser().parse_args(
+        [
+            "--mobile-duo",
+            "--scene-urdf",
+            "/tmp/duo.urdf",
+            "--bind",
+            "left=127.0.0.11",
+            "--bind",
+            "right=127.0.0.12",
+            "--bind",
+            "base=127.0.0.10",
+            "--spine",
+        ]
+    )
+    assert args.spine is True
+    assert args.spine_host == "127.0.0.13"
+    assert args.spine_port == 443
+    assert args.spine_cert is None
+    assert args.spine_key is None
+    run_server.validate_args(args)
+
+
+def test_cli_rejects_spine_without_mobile_duo():
+    args = run_server.build_parser().parse_args(["--spine"])
+    with pytest.raises(ValueError, match="--mobile-duo"):
+        run_server.validate_args(args)

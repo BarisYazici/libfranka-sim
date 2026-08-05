@@ -50,11 +50,19 @@ class MobileDuoRunner:
         binds: Dict[str, str],
         port: int = COMMAND_PORT,
         arm_urdf: Optional[str] = None,
+        spine_server=None,
     ):
         self.scene = scene
         self.binds = dict(binds)
         self.port = port
+        self.spine_server = spine_server
         self.threads: Dict[str, threading.Thread] = {}
+
+        # The scene reads the stub's SpineModel every physics step, so the lift
+        # (and the arms it carries) moves in the viewer. Sharing the object
+        # in-process avoids any IPC or clock skew between the two.
+        if spine_server is not None:
+            scene.spine_model = spine_server.model
 
         # enable_gripper=False: Robotiq is not emulated in this milestone, so no
         # FCI gripper server (port 1338) is served on any of the three bridges.
@@ -71,7 +79,11 @@ class MobileDuoRunner:
         }
 
     def start_servers(self) -> None:
-        """Start each bridge's accept loop in a daemon thread."""
+        """Start the spine stub (if any) and each bridge's accept loop."""
+        if self.spine_server is not None:
+            self.spine_server.start()
+            logger.info("Spine stub listening on port %s", self.spine_server.port)
+
         for role, server in self.servers.items():
             thread = threading.Thread(
                 target=server.run_server, name=f"fci-bridge-{role}", daemon=True
@@ -94,4 +106,7 @@ class MobileDuoRunner:
             if thread is not None:
                 thread.join(timeout=3.0)
         self.threads.clear()
+        if self.spine_server is not None:
+            self.spine_server.stop()
+            self.scene.spine_model = None
         self.scene.stop()

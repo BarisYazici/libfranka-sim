@@ -70,6 +70,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=COMMAND_PORT,
         help=f"TCP command port for every bridge (default: {COMMAND_PORT})",
     )
+    parser.add_argument(
+        "--spine",
+        action="store_true",
+        default=False,
+        help="Also run the fake spine REST device in-process and drive the "
+        "franka_spine_vertical_joint from it (requires --mobile-duo)",
+    )
+    parser.add_argument(
+        "--spine-host",
+        default="127.0.0.13",
+        help="Address the spine stub binds (default: 127.0.0.13)",
+    )
+    parser.add_argument(
+        "--spine-port",
+        type=int,
+        default=443,
+        help="Port the spine stub binds; SpineApiClient hardcodes 443 (default: 443)",
+    )
+    parser.add_argument("--spine-cert", default=None, help="TLS certificate for the spine stub")
+    parser.add_argument("--spine-key", default=None, help="TLS private key for the spine stub")
     return parser
 
 
@@ -78,6 +98,8 @@ def validate_args(args) -> None:
     if not args.mobile_duo:
         if args.scene_urdf or args.bind:
             raise ValueError("--scene-urdf and --bind require --mobile-duo")
+        if args.spine or args.spine_cert or args.spine_key:
+            raise ValueError("--spine and the --spine-* options require --mobile-duo")
         return
 
     if not args.scene_urdf:
@@ -99,10 +121,33 @@ def run_mobile_duo(args) -> None:
         mesh_root=args.mesh_root,
         enable_vis=args.vis,
     )
-    runner = MobileDuoRunner(scene, binds, port=args.port, arm_urdf=args.urdf)
+    spine_server = None
+    if args.spine:
+        from franka_sim.spine_stub import (
+            SPINE_CERT_DIR,
+            SpineStubServer,
+            make_self_signed_cert,
+        )
+
+        certfile = args.spine_cert
+        keyfile = args.spine_key
+        if certfile is None:
+            certfile, keyfile = make_self_signed_cert(SPINE_CERT_DIR)
+        spine_server = SpineStubServer(
+            host=args.spine_host,
+            port=args.spine_port,
+            certfile=certfile,
+            keyfile=keyfile,
+        )
+
+    runner = MobileDuoRunner(
+        scene, binds, port=args.port, arm_urdf=args.urdf, spine_server=spine_server
+    )
 
     for role, host in binds.items():
         print(f"  {role:>5} bridge -> {host}:{args.port}")
+    if spine_server is not None:
+        print(f"  spine device -> https://{args.spine_host}:{args.spine_port}/spine/api")
     print("Press Ctrl+C to stop the server")
 
     try:

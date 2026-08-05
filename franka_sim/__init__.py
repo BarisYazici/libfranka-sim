@@ -7,6 +7,7 @@ from franka_sim.mobile_duo_runner import MobileDuoRunner, parse_bind_specs
 from franka_sim.mobile_duo_sim import MobileDuoScene, SceneView
 from franka_sim.robot_state import RobotState
 from franka_sim.run_server import main as run_server_main
+from franka_sim.spine_stub import SpineModel, SpineStubServer
 from franka_sim.swerve_base import SwerveBase
 from franka_sim.swerve_kinematics import SwerveKinematics
 from franka_sim.tmr_genesis_sim import TMRGenesisSim
@@ -30,4 +31,6 @@ __all__ = [
     "SceneView",
     "MobileDuoRunner",
     "parse_bind_specs",
+    "SpineModel",
+    "SpineStubServer",
 ]
