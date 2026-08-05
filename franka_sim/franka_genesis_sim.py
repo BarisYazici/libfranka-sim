@@ -50,6 +50,7 @@ class ControlMode(Enum):
     POSITION = "position"
     VELOCITY = "velocity"
     TORQUE = "torque"
+    STEERING_DRIVE = "steering_drive"  # mobile base: steering=position, drive=velocity
     NONE = "none"
 
 
