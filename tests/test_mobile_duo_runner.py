@@ -259,3 +259,85 @@ def test_cli_rejects_spine_without_mobile_duo():
     args = run_server.build_parser().parse_args(["--spine"])
     with pytest.raises(ValueError, match="--mobile-duo"):
         run_server.validate_args(args)
+
+
+# --- stop() per-server error isolation --------------------------------------
+
+
+class RecordingBridge:
+    """A FrankaSimServer stand-in that just records stop()."""
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+
+
+class ExplodingBridge:
+    """A FrankaSimServer stand-in whose stop() always raises."""
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+        raise RuntimeError("bridge teardown boom")
+
+
+def test_stop_isolates_a_failing_bridge_and_still_stops_the_scene(bound_scene, caplog):
+    """One bridge's stop() raising must not skip the others or the shared scene."""
+    runner = MobileDuoRunner(bound_scene, LOOPBACK)
+    exploding = ExplodingBridge()
+    right = RecordingBridge()
+    base = RecordingBridge()
+    runner.servers = {ROLE_LEFT: exploding, ROLE_RIGHT: right, ROLE_BASE: base}
+
+    scene_stop_calls = []
+    bound_scene.stop = lambda: scene_stop_calls.append(True)
+
+    with caplog.at_level("ERROR", logger="franka_sim.mobile_duo_runner"):
+        runner.stop()
+
+    assert exploding.stopped is True
+    assert right.stopped is True
+    assert base.stopped is True
+    assert scene_stop_calls == [True]
+    assert any(record.levelname == "ERROR" for record in caplog.records)
+
+
+def test_stop_isolates_a_failing_spine_stub_and_still_stops_the_scene(bound_scene, caplog):
+    """A spine stub stop() failure must not skip the shared scene either."""
+
+    class ExplodingSpine:
+        def __init__(self):
+            from franka_sim.spine_stub import SpineModel
+
+            self.model = SpineModel()
+            self.stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+            raise RuntimeError("spine teardown boom")
+
+    spine = ExplodingSpine()
+    runner = MobileDuoRunner(bound_scene, LOOPBACK, spine_server=spine)
+    runner.servers = {
+        ROLE_LEFT: RecordingBridge(),
+        ROLE_RIGHT: RecordingBridge(),
+        ROLE_BASE: RecordingBridge(),
+    }
+
+    scene_stop_calls = []
+    bound_scene.stop = lambda: scene_stop_calls.append(True)
+
+    with caplog.at_level("ERROR", logger="franka_sim.mobile_duo_runner"):
+        runner.stop()
+
+    assert spine.stopped is True
+    assert scene_stop_calls == [True]
+    assert bound_scene.spine_model is None
+    assert any(record.levelname == "ERROR" for record in caplog.records)

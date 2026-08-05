@@ -99,14 +99,27 @@ class MobileDuoRunner:
         self.scene.start()
 
     def stop(self) -> None:
-        """Stop every bridge and then the shared scene."""
+        """Stop every bridge and then the shared scene.
+
+        Each bridge's stop() is isolated with its own try/except: a failure
+        tearing one bridge down must not prevent the others from being asked
+        to stop, and must never skip stopping the shared scene (and the spine
+        stub) -- otherwise a single crashed bridge would leak the whole
+        scene's Genesis process.
+        """
         for role, server in self.servers.items():
-            server.stop()
+            try:
+                server.stop()
+            except Exception:
+                logger.exception("Error stopping bridge %s", role)
             thread = self.threads.get(role)
             if thread is not None:
                 thread.join(timeout=3.0)
         self.threads.clear()
         if self.spine_server is not None:
-            self.spine_server.stop()
+            try:
+                self.spine_server.stop()
+            except Exception:
+                logger.exception("Error stopping spine stub")
             self.scene.spine_model = None
         self.scene.stop()

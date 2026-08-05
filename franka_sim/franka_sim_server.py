@@ -1192,7 +1192,18 @@ class FrankaSimServer:
             raise
 
     def cleanup(self):
-        """Clean up all resources"""
+        """Clean up all resources.
+
+        Every socket attribute is cached into a local before use: another
+        thread (the per-client connection's teardown, via reset_state()) can
+        null these attributes concurrently. Re-reading ``self.<attr>`` between
+        the shutdown() and close() calls risks the attribute having gone to
+        None in between -- ``None.close()`` raises AttributeError, which is
+        not a socket.error/OSError and therefore escapes the except clauses,
+        aborting the rest of cleanup() and leaking the SO_REUSEPORT listener.
+        Binding the reference once up front makes both calls operate on the
+        same object regardless of what happens to the attribute afterwards.
+        """
         logger.info("Cleaning up server resources...")
 
         # Stop all running operations
@@ -1201,48 +1212,49 @@ class FrankaSimServer:
         self.connection_running = False
 
         # Clean up client socket
-        if hasattr(self, "client_socket") and self.client_socket:
+        sock, self.client_socket = self.client_socket, None
+        if sock is not None:
             try:
-                self.client_socket.shutdown(socket.SHUT_RDWR)
-            except socket.error:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
             try:
-                self.client_socket.close()
-            except socket.error:
+                sock.close()
+            except OSError:
                 pass
-            self.client_socket = None
 
         # Clean up server socket
-        if hasattr(self, "server_socket") and self.server_socket:
+        sock, self.server_socket = self.server_socket, None
+        if sock is not None:
             try:
-                self.server_socket.shutdown(socket.SHUT_RDWR)
-            except socket.error:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
             try:
-                self.server_socket.close()
-            except socket.error:
+                sock.close()
+            except OSError:
                 pass
-            self.server_socket = None
 
         # Clean up command socket
-        if hasattr(self, "command_socket") and self.command_socket:
+        sock, self.command_socket = self.command_socket, None
+        if sock is not None:
             try:
-                self.command_socket.shutdown(socket.SHUT_RDWR)
-            except socket.error:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
             try:
-                self.command_socket.close()
-            except socket.error:
+                sock.close()
+            except OSError:
                 pass
-            self.command_socket = None
 
-        # Clean up UDP socket
-        if hasattr(self, "udp_socket") and self.udp_socket:
+        # Clean up UDP socket. No shutdown(): a connectionless socket has
+        # nothing to shut down and shutdown() would raise ENOTCONN.
+        sock, self.udp_socket = self.udp_socket, None
+        if sock is not None:
             try:
-                self.udp_socket.close()
-            except socket.error:
+                sock.close()
+            except OSError:
                 pass
-            self.udp_socket = None
 
         # Wait for any remaining operations to complete
         time.sleep(0.1)
