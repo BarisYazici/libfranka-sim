@@ -30,7 +30,13 @@ WHEEL_FORCE_LIMIT = 500.0
 
 
 class TMRGenesisSim:
-    """Simulator backend for a TMR-only scene, speaking the FrankaSimServer contract."""
+    """Simulator backend for a TMR-only scene, speaking the FrankaSimServer contract.
+
+    Has no CLI entry point today: it is a programmatic/manual bring-up target
+    (e.g. for standalone base testing), not something ``run_server.py`` wires
+    up. :class:`~franka_sim.mobile_duo_runner.MobileDuoRunner` (via
+    :class:`~franka_sim.mobile_duo_sim.MobileDuoScene`) is the shipped path.
+    """
 
     def __init__(
         self,
@@ -49,7 +55,6 @@ class TMRGenesisSim:
         self.scene = None
         self.tmr = None
         self.running = False
-        self.sim_thread = None
         self.control_mode = ControlMode.STEERING_DRIVE
         self.swerve: Optional[SwerveBase] = None
 
@@ -95,27 +100,36 @@ class TMRGenesisSim:
         self.scene.add_entity(gs.morphs.Plane())
 
         self._resolved_urdf = resolve_urdf_meshes(self.urdf_path, mesh_root=self.mesh_root)
-        self.tmr = self.scene.add_entity(
-            gs.morphs.URDF(
-                file=str(self._resolved_urdf),
-                pos=(0.0, 0.0, self.base_height),
-                fixed=False,
-                merge_fixed_links=False,
-            ),
-            material=gs.materials.Rigid(gravity_compensation=1.0),
-        )
-        self.scene.build()
+        # If anything from here on raises, the resolved-URDF temp file (and
+        # its dae->obj conversion cache) would otherwise leak: stop() is never
+        # reached, so its unlink never runs. Mirror that cleanup here on the
+        # failure path, then re-raise.
+        try:
+            self.tmr = self.scene.add_entity(
+                gs.morphs.URDF(
+                    file=str(self._resolved_urdf),
+                    pos=(0.0, 0.0, self.base_height),
+                    fixed=False,
+                    merge_fixed_links=False,
+                ),
+                material=gs.materials.Rigid(gravity_compensation=1.0),
+            )
+            self.scene.build()
 
-        self._bind_entity()
-        self.tmr.set_dofs_force_range(
-            lower=np.full(4, -WHEEL_FORCE_LIMIT),
-            upper=np.full(4, WHEEL_FORCE_LIMIT),
-            dofs_idx_local=self.swerve.steer_dofs_idx + self.swerve.drive_dofs_idx,
-        )
+            self._bind_entity()
+            self.tmr.set_dofs_force_range(
+                lower=np.full(4, -WHEEL_FORCE_LIMIT),
+                upper=np.full(4, WHEEL_FORCE_LIMIT),
+                dofs_idx_local=self.swerve.steer_dofs_idx + self.swerve.drive_dofs_idx,
+            )
 
-        for _ in range(100):
-            self.scene.step()
-        self._read_and_publish_state()
+            for _ in range(100):
+                self.scene.step()
+            self._read_and_publish_state()
+        except Exception:
+            Path(self._resolved_urdf).unlink(missing_ok=True)
+            self._resolved_urdf = None
+            raise
 
     def _bind_entity(self) -> None:
         """Attach the swerve controller to the built entity."""
@@ -235,8 +249,6 @@ class TMRGenesisSim:
         self.running = False
         if self.enable_vis and self.scene is not None:
             self.scene.viewer.stop()
-        if self.sim_thread:
-            self.sim_thread.join(timeout=1.0)
         if self._resolved_urdf is not None:
             Path(self._resolved_urdf).unlink(missing_ok=True)
             self._resolved_urdf = None

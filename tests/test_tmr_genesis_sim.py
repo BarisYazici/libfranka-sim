@@ -1,3 +1,5 @@
+import types
+
 import numpy as np
 import pytest
 from fakes import FakeEntity
@@ -84,3 +86,49 @@ def test_joint_space_updates_are_accepted_and_ignored(tmr_sim):
 def test_set_control_mode_rejects_non_enum(tmr_sim):
     with pytest.raises(ValueError):
         tmr_sim.set_control_mode("steering_drive")
+
+
+def test_stop_has_no_vestigial_sim_thread_attribute(tmr_sim):
+    """sim_thread was never assigned anywhere; stop() must not reference it."""
+    assert not hasattr(tmr_sim, "sim_thread")
+    tmr_sim.stop()  # must not raise
+
+
+# --- resolved-URDF cleanup on a failed build --------------------------------
+
+
+def _fake_gs():
+    """A minimal genesis stand-in whose Scene.build() the caller can break."""
+    fake_scene = types.SimpleNamespace(add_entity=lambda *a, **kw: object())
+    return (
+        types.SimpleNamespace(
+            _initialized=True,
+            Scene=lambda **kw: fake_scene,
+            morphs=types.SimpleNamespace(Plane=lambda: object(), URDF=lambda **kw: object()),
+            materials=types.SimpleNamespace(Rigid=lambda **kw: object()),
+            options=types.SimpleNamespace(
+                ViewerOptions=lambda **kw: object(), SimOptions=lambda **kw: object()
+            ),
+        ),
+        fake_scene,
+    )
+
+
+def test_initialize_simulation_unlinks_the_resolved_urdf_when_build_raises(tmp_path, monkeypatch):
+    urdf_path = tmp_path / "tmr.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="tmr"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    fake_gs, fake_scene = _fake_gs()
+    fake_scene.build = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+
+    sim = TMRGenesisSim(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.tmr_genesis_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.tmr_genesis_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        sim.initialize_simulation()
+
+    assert not resolved.exists()
+    assert sim._resolved_urdf is None

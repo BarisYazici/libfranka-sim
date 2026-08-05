@@ -1,5 +1,6 @@
 import struct
 import time
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -171,3 +172,58 @@ def test_external_controller_keeps_torque_even_with_a_cartesian_motion_generator
     assert base_sim_server.control_mode is ControlMode.TORQUE
     assert np.allclose(base_sim_server.robot_state.state["tau_J_d"], torques)
     mock_base_sim.update_base_twist.assert_not_called()
+
+
+# --- motion-finished hold-log latch (mobile path) ---------------------------
+
+
+def _move_request(command_id, controller_mode=ControllerMode.kJointImpedance):
+    """A ready-to-use (header, payload) pair for handle_move_command()."""
+    payload = struct.pack(
+        "<II3d3d",
+        controller_mode.value,
+        MotionGeneratorMode.kCartesianVelocity.value,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+    )
+    header = MessageHeader(command=Command.kMove, command_id=command_id, size=12 + len(payload))
+    return header, payload
+
+
+def test_repeated_motion_finished_holds_log_the_hold_once(base_sim_server, mock_base_sim, caplog):
+    """1 kHz hot path: libfranka's finishMotion burst calls this once per
+    datagram, but the "commanding zero base twist" log must latch.
+    """
+    with caplog.at_level("INFO", logger="franka_sim.franka_sim_server"):
+        for _ in range(5):
+            base_sim_server._switch_to_hold_position()
+
+    hold_logs = [r for r in caplog.records if "commanding zero base twist" in r.message]
+    assert len(hold_logs) == 1
+    # The actual hold command still goes out on every call -- only the log latches.
+    assert mock_base_sim.update_base_twist.call_count == 5
+
+
+def test_a_new_move_rearms_the_hold_log_latch(base_sim_server, mock_base_sim, caplog):
+    header, payload = _move_request(command_id=42)
+    client_socket = MagicMock()
+
+    with caplog.at_level("INFO", logger="franka_sim.franka_sim_server"):
+        base_sim_server._switch_to_hold_position()
+        base_sim_server._switch_to_hold_position()
+        base_sim_server.handle_move_command(client_socket, header, payload)
+        base_sim_server._switch_to_hold_position()
+
+    hold_logs = [r for r in caplog.records if "commanding zero base twist" in r.message]
+    assert len(hold_logs) == 2
+
+
+def test_hold_position_keeps_the_simulator_mode_in_lockstep(base_sim_server, mock_base_sim):
+    """Server and simulator must not disagree about control mode after a hold."""
+    base_sim_server._switch_to_hold_position()
+    mock_base_sim.set_control_mode.assert_called_with(ControlMode.STEERING_DRIVE)
+    assert base_sim_server.control_mode is ControlMode.STEERING_DRIVE

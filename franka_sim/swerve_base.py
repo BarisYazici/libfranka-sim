@@ -148,6 +148,11 @@ class SwerveBase:
 
         solution = self.kinematics.inverse_kinematics(vx, vy, wz)
         if solution is None:
+            # Unreachable by construction today: set_twist() already drops any
+            # non-finite command before it reaches self._twist, and
+            # SwerveKinematics.inverse_kinematics only returns None for
+            # non-finite vx/vy/wz. Kept as defence-in-depth in case either
+            # invariant changes.
             if not self._ik_rejected:
                 logger.warning("Swerve IK rejected twist (%s, %s, %s); holding", vx, vy, wz)
                 self._ik_rejected = True

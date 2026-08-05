@@ -4,6 +4,7 @@ import logging
 import sys
 
 from franka_sim.franka_protocol import COMMAND_PORT
+from franka_sim.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
 
 # Configure logging to silence Numba debug output
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -79,14 +80,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--spine-host",
-        default="127.0.0.13",
-        help="Address the spine stub binds (default: 127.0.0.13)",
+        default=SPINE_DEFAULT_HOST,
+        help=f"Address the spine stub binds (default: {SPINE_DEFAULT_HOST})",
     )
     parser.add_argument(
         "--spine-port",
         type=int,
-        default=443,
-        help="Port the spine stub binds; SpineApiClient hardcodes 443 (default: 443)",
+        default=SPINE_DEFAULT_PORT,
+        help="Port the spine stub binds; SpineApiClient hardcodes "
+        f"{SPINE_DEFAULT_PORT} (default: {SPINE_DEFAULT_PORT})",
     )
     parser.add_argument("--spine-cert", default=None, help="TLS certificate for the spine stub")
     parser.add_argument("--spine-key", default=None, help="TLS private key for the spine stub")

@@ -104,6 +104,13 @@ class FrankaSimServer:
         self.control_mode = ControlMode.NONE
         self.connection_running = False  # New flag for per-connection state
         self.mobile_base = mobile_base
+        # Latch so the mobile "motion finished" hold log fires once per
+        # transition, not once per datagram: unlike the arm path, the mobile
+        # branch's control_mode stays STEERING_DRIVE (never becomes POSITION),
+        # so the `if self.control_mode != ControlMode.POSITION` guard around
+        # _switch_to_hold_position() never latches on its own. Mirrors
+        # SwerveBase._twist_rejected.
+        self._mobile_hold_logged = False
 
         # Initialize Genesis simulator
         if genesis_sim is None:
@@ -153,6 +160,7 @@ class FrankaSimServer:
         self.client_udp_port = None
         self.control_mode = ControlMode.NONE
         self.connection_running = False
+        self._mobile_hold_logged = False
         self.robot_state = RobotState()  # Create fresh robot state for new connection
 
     def receive_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
@@ -499,6 +507,9 @@ class FrankaSimServer:
             )
             self.robot_state.state["robot_mode"] = RobotMode.kMove
             self.current_motion_id = header.command_id
+            # A new Move is a new motion: rearm the mobile hold-log latch so
+            # the next time it finishes logs again.
+            self._mobile_hold_logged = False
 
             # Set appropriate control mode in Genesis simulator
             if (
@@ -573,8 +584,15 @@ class FrankaSimServer:
         body twist. An arm holds its current joint positions with zero torque.
         """
         if self.mobile_base:
-            logger.info("Motion finished: commanding zero base twist")
+            if not self._mobile_hold_logged:
+                logger.info("Motion finished: commanding zero base twist")
+                self._mobile_hold_logged = True
             self.genesis_sim.update_base_twist([0.0] * 6)
+            # Keep the simulator's mode in lockstep with the server's: without
+            # this, a client that never re-Moves leaves genesis_sim's own
+            # control_mode wherever it was (e.g. still mid-transition), so
+            # server and simulator could disagree about mode after a hold.
+            self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
             self.control_mode = ControlMode.STEERING_DRIVE
             return
 

@@ -154,30 +154,39 @@ class MobileDuoScene:
         self.scene.add_entity(gs.morphs.Plane())
 
         self._resolved_urdf = resolve_urdf_meshes(self.urdf_path, mesh_root=self.mesh_root)
-        self.robot = self.scene.add_entity(
-            gs.morphs.URDF(
-                file=str(self._resolved_urdf),
-                pos=(0.0, 0.0, self.base_height),
-                fixed=False,
-                merge_fixed_links=False,
-            ),
-            material=gs.materials.Rigid(gravity_compensation=1.0),
-        )
-        self.scene.build()
-
-        self._bind_entity()
-
-        for role in ARM_ROLES:
-            dofs = self.arm_dofs_idx[role]
-            self.robot.set_dofs_force_range(
-                lower=-FR3_FORCE_LIMITS, upper=FR3_FORCE_LIMITS, dofs_idx_local=dofs
+        # If anything from here on raises, the resolved-URDF temp file (and
+        # its dae->obj conversion cache) would otherwise leak: stop() is never
+        # reached, so its unlink never runs. Mirror that cleanup here on the
+        # failure path, then re-raise.
+        try:
+            self.robot = self.scene.add_entity(
+                gs.morphs.URDF(
+                    file=str(self._resolved_urdf),
+                    pos=(0.0, 0.0, self.base_height),
+                    fixed=False,
+                    merge_fixed_links=False,
+                ),
+                material=gs.materials.Rigid(gravity_compensation=1.0),
             )
-            self.robot.set_dofs_damping(np.full(7, DEFAULT_FR3_DAMPING), dofs)
-            self.robot.set_dofs_position(ARM_INITIAL_Q, dofs)
+            self.scene.build()
 
-        for _ in range(100):
-            self.scene.step()
-        self._read_and_publish_state()
+            self._bind_entity()
+
+            for role in ARM_ROLES:
+                dofs = self.arm_dofs_idx[role]
+                self.robot.set_dofs_force_range(
+                    lower=-FR3_FORCE_LIMITS, upper=FR3_FORCE_LIMITS, dofs_idx_local=dofs
+                )
+                self.robot.set_dofs_damping(np.full(7, DEFAULT_FR3_DAMPING), dofs)
+                self.robot.set_dofs_position(ARM_INITIAL_Q, dofs)
+
+            for _ in range(100):
+                self.scene.step()
+            self._read_and_publish_state()
+        except Exception:
+            Path(self._resolved_urdf).unlink(missing_ok=True)
+            self._resolved_urdf = None
+            raise
 
     def _bind_entity(self) -> None:
         """Resolve joint/link handles once the entity exists."""

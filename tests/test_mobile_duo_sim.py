@@ -1,4 +1,5 @@
 import math
+import types
 
 import numpy as np
 import pytest
@@ -85,6 +86,25 @@ def test_arm_torque_control_writes_only_that_arms_dofs(scene):
     values, dofs = scene.robot.force_commands[-1]
     right_dofs = [scene.robot.joints[name].dof_idx_local for name in ARM_JOINT_NAMES[ROLE_RIGHT]]
     assert dofs == right_dofs
+    assert values == pytest.approx(torques)
+
+
+def test_left_arm_torque_control_writes_only_that_arms_dofs(scene):
+    """Mirrors test_arm_torque_control_writes_only_that_arms_dofs above,
+    pinned to the left arm instead, so both arms' write-routing is checked.
+    Uses TORQUE (the right arm stays at its default POSITION mode and never
+    touches force_commands), so the write is unambiguously the left arm's.
+    """
+    torques = np.arange(7, dtype=float) * -1.0
+    scene.set_arm_control_mode(ROLE_LEFT, ControlMode.TORQUE)
+    scene.update_arm_torques(ROLE_LEFT, torques)
+    scene._apply_control()
+
+    values, dofs = scene.robot.force_commands[-1]
+    left_dofs = [scene.robot.joints[name].dof_idx_local for name in ARM_JOINT_NAMES[ROLE_LEFT]]
+    right_dofs = [scene.robot.joints[name].dof_idx_local for name in ARM_JOINT_NAMES[ROLE_RIGHT]]
+    assert dofs == left_dofs
+    assert dofs != right_dofs
     assert values == pytest.approx(torques)
 
 
@@ -183,6 +203,17 @@ def test_arm_view_ignores_a_twist(scene):
     assert drive == pytest.approx([0.0, 0.0], abs=1e-12)
 
 
+def test_repeated_misrouted_twists_log_once(scene, caplog):
+    """update_base_twist can be reached from the ~1 kHz UDP thread on a
+    misconfigured bridge, so the misroute warning must latch, not flood.
+    """
+    view = scene.view(ROLE_LEFT)
+    with caplog.at_level("WARNING", logger="franka_sim.mobile_duo_sim"):
+        for _ in range(50):
+            view.update_base_twist([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert len(caplog.records) == 1
+
+
 def test_view_rejects_an_unknown_role(scene):
     with pytest.raises(ValueError):
         scene.view("middle")
@@ -190,3 +221,43 @@ def test_view_rejects_an_unknown_role(scene):
 
 def test_view_reports_the_scene_visualisation_flag(scene):
     assert SceneView(scene, ROLE_LEFT).enable_vis is False
+
+
+# --- resolved-URDF cleanup on a failed build --------------------------------
+
+
+def _fake_gs():
+    """A minimal genesis stand-in whose Scene.build() the caller can break."""
+    fake_scene = types.SimpleNamespace(add_entity=lambda *a, **kw: object())
+    return (
+        types.SimpleNamespace(
+            _initialized=True,
+            Scene=lambda **kw: fake_scene,
+            morphs=types.SimpleNamespace(Plane=lambda: object(), URDF=lambda **kw: object()),
+            materials=types.SimpleNamespace(Rigid=lambda **kw: object()),
+            options=types.SimpleNamespace(
+                ViewerOptions=lambda **kw: object(), SimOptions=lambda **kw: object()
+            ),
+        ),
+        fake_scene,
+    )
+
+
+def test_initialize_simulation_unlinks_the_resolved_urdf_when_build_raises(tmp_path, monkeypatch):
+    urdf_path = tmp_path / "duo.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="duo"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    fake_gs, fake_scene = _fake_gs()
+    fake_scene.build = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+
+    duo = MobileDuoScene(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        duo.initialize_simulation()
+
+    assert not resolved.exists()
+    assert duo._resolved_urdf is None

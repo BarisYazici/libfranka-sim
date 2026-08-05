@@ -16,6 +16,15 @@ set -euo pipefail
 DESCRIPTION_DIR="${1:?usage: generate_mobile_duo_urdf.sh <franka_description_dir> <output.urdf>}"
 OUTPUT="${2:?usage: generate_mobile_duo_urdf.sh <franka_description_dir> <output.urdf>}"
 
+# The generated URDF and meshes MUST come from the pinned sha (see the
+# robot_types note below): a different checkout can silently change mesh
+# paths or joint names out from under the sim.
+git -C "${DESCRIPTION_DIR}" rev-parse --verify HEAD | grep -q ^72baf5b || {
+  echo "wrong franka_description sha: expected HEAD at 72baf5b..., got \
+$(git -C "${DESCRIPTION_DIR}" rev-parse --short HEAD 2>/dev/null || echo 'unknown')" >&2
+  exit 1
+}
+
 command -v xacro >/dev/null || {
   echo "xacro not found: source a ROS 2 Jazzy environment first" >&2
   exit 1
