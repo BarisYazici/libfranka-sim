@@ -53,7 +53,8 @@ class RecordingSocket:
 
 def test_cleanup_survives_client_socket_nulled_between_shutdown_and_close(mock_genesis_sim):
     """The exact race from the review: client_socket races cleanup(); server_socket
-    (a stand-in for the still-listening SO_REUSEPORT socket) must still get closed."""
+    (a stand-in for the still-listening SO_REUSEPORT socket) must still get closed.
+    """
     server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
     client_sock = RacyCloseSocket(server, "client_socket")
     server_sock = RecordingSocket()
@@ -100,7 +101,8 @@ def test_cleanup_survives_command_socket_nulled_between_shutdown_and_close(mock_
 
 def test_cleanup_survives_udp_socket_nulled_between_check_and_close(mock_genesis_sim):
     """udp_socket has no shutdown() call, but the same check-then-act race applies
-    between the truthiness check and close() -- cache-before-use covers it too."""
+    between the truthiness check and close() -- cache-before-use covers it too.
+    """
     server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
 
     class RacyUdpSocket:
