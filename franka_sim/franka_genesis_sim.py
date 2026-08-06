@@ -46,6 +46,26 @@ def default_fr3_mjcf():
 DEFAULT_FR3_DAMPING = 5.0
 
 
+def resolve_fr3_joint_damping(default: float = DEFAULT_FR3_DAMPING) -> np.ndarray:
+    """Resolve per-joint FR3 viscous damping (Nm*s/rad) from $FR3_JOINT_DAMPING.
+
+    A scalar broadcasts to all 7 joints; 7 comma-separated values set each
+    joint individually; unset (or empty) falls back to ``default``. Shared by
+    the single-arm sim and the mobile-duo scene so every FR3 arm in the
+    process honors the same override with identical parsing/validation.
+    """
+    damping_env = os.environ.get("FR3_JOINT_DAMPING")
+    if damping_env:
+        vals = [float(x) for x in damping_env.split(",")]
+        if len(vals) not in (1, 7):
+            raise ValueError(
+                f"FR3_JOINT_DAMPING must be 1 (scalar) or 7 comma-separated "
+                f"values, got {len(vals)}"
+            )
+        return np.array(vals * 7 if len(vals) == 1 else vals, dtype=float)
+    return np.full(7, default, dtype=float)
+
+
 class ControlMode(Enum):
     POSITION = "position"
     VELOCITY = "velocity"
@@ -204,17 +224,7 @@ class FrankaGenesisSim:
         # model over-travels vs the real arm; DEFAULT_FR3_DAMPING was fit to a
         # logged real-robot joint_impedance run (~5% match). Override per-joint
         # via $FR3_JOINT_DAMPING (a scalar or 7 comma-separated values).
-        damping_env = os.environ.get("FR3_JOINT_DAMPING")
-        if damping_env:
-            vals = [float(x) for x in damping_env.split(",")]
-            if len(vals) not in (1, 7):
-                raise ValueError(
-                    f"FR3_JOINT_DAMPING must be 1 (scalar) or 7 comma-separated "
-                    f"values, got {len(vals)}"
-                )
-            damping = np.array(vals * 7 if len(vals) == 1 else vals, dtype=float)
-        else:
-            damping = np.full(7, DEFAULT_FR3_DAMPING)
+        damping = resolve_fr3_joint_damping()
         self.franka.set_dofs_damping(damping, self.dofs_idx)
         logger.info(f"Joint damping: {damping}")
 

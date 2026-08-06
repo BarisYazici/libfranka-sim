@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 from fakes import FakeDuoEntity
 
-from franka_sim.franka_genesis_sim import ControlMode
+from franka_sim.franka_genesis_sim import (
+    DEFAULT_FR3_DAMPING,
+    ControlMode,
+    resolve_fr3_joint_damping,
+)
 from franka_sim.mobile_duo_sim import (
     ARM_EE_LINKS,
     ARM_INITIAL_Q,
@@ -244,9 +248,24 @@ def test_view_reports_the_scene_visualisation_flag(scene):
 # --- resolved-URDF cleanup on a failed build --------------------------------
 
 
-def _fake_gs():
-    """A minimal genesis stand-in whose Scene.build() the caller can break."""
-    fake_scene = types.SimpleNamespace(add_entity=lambda *a, **kw: object())
+def _fake_gs(robot_entity=None):
+    """A minimal genesis stand-in whose Scene.build() the caller can break.
+
+    ``scene.add_entity`` is called twice by ``initialize_simulation``: once for
+    the ground plane, once for the combined URDF robot. When ``robot_entity``
+    is given, the second call returns it (so post-build calls -- force range,
+    damping, initial pose -- land on an inspectable fake); otherwise both
+    calls return a bare ``object()``, matching the previous behavior.
+    """
+    calls = {"count": 0}
+
+    def add_entity(*args, **kwargs):
+        calls["count"] += 1
+        if robot_entity is not None and calls["count"] == 2:
+            return robot_entity
+        return object()
+
+    fake_scene = types.SimpleNamespace(add_entity=add_entity, build=lambda: None, step=lambda: None)
     return (
         types.SimpleNamespace(
             _initialized=True,
@@ -277,5 +296,125 @@ def test_initialize_simulation_unlinks_the_resolved_urdf_when_build_raises(tmp_p
     with pytest.raises(RuntimeError, match="boom"):
         duo.initialize_simulation()
 
+    assert not resolved.exists()
+    assert duo._resolved_urdf is None
+
+
+# --- arm joint damping (FR3_JOINT_DAMPING) ----------------------------------
+#
+# mobile_duo_sim shares franka_genesis_sim.resolve_fr3_joint_damping with the
+# single-arm sim, so both the pure-function contract and its wiring into both
+# arms of the duo scene are covered here.
+
+
+def test_resolve_fr3_joint_damping_defaults_when_unset(monkeypatch):
+    monkeypatch.delenv("FR3_JOINT_DAMPING", raising=False)
+    damping = resolve_fr3_joint_damping()
+    assert damping == pytest.approx([DEFAULT_FR3_DAMPING] * 7)
+
+
+def test_resolve_fr3_joint_damping_scalar_override_broadcasts(monkeypatch):
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "1.5")
+    damping = resolve_fr3_joint_damping()
+    assert damping == pytest.approx([1.5] * 7)
+
+
+def test_resolve_fr3_joint_damping_seven_value_override_is_per_joint(monkeypatch):
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "1,2,3,4,5,6,7")
+    damping = resolve_fr3_joint_damping()
+    assert damping == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+
+
+def test_resolve_fr3_joint_damping_rejects_wrong_count(monkeypatch):
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "1,2,3")
+    with pytest.raises(ValueError, match="1 \\(scalar\\) or 7 comma-separated"):
+        resolve_fr3_joint_damping()
+
+
+def test_resolve_fr3_joint_damping_rejects_non_numeric_values(monkeypatch):
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "not-a-number")
+    with pytest.raises(ValueError):
+        resolve_fr3_joint_damping()
+
+
+def test_resolve_fr3_joint_damping_treats_empty_string_as_unset(monkeypatch):
+    """An exported-but-empty $FR3_JOINT_DAMPING (e.g. ``export FOO=`` in a
+    sourced script) must not be parsed as zero values; it falls back to the
+    default like an unset var, matching the single-arm path's truthiness
+    check (``if damping_env:``).
+    """
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "")
+    damping = resolve_fr3_joint_damping()
+    assert damping == pytest.approx([DEFAULT_FR3_DAMPING] * 7)
+
+
+def test_initialize_simulation_applies_default_damping_to_both_arms(tmp_path, monkeypatch):
+    """Both arms get DEFAULT_FR3_DAMPING when $FR3_JOINT_DAMPING is unset --
+    the pre-fix mobile-duo behavior, now routed through the shared resolver.
+    """
+    urdf_path = tmp_path / "duo.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="duo"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    duo_entity = FakeDuoEntity()
+    fake_gs, _ = _fake_gs(robot_entity=duo_entity)
+
+    duo = MobileDuoScene(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.delenv("FR3_JOINT_DAMPING", raising=False)
+
+    duo.initialize_simulation()
+
+    assert len(duo_entity.damping_calls) == 2
+    left_dofs = [duo_entity.joints[name].dof_idx_local for name in ARM_JOINT_NAMES[ROLE_LEFT]]
+    right_dofs = [duo_entity.joints[name].dof_idx_local for name in ARM_JOINT_NAMES[ROLE_RIGHT]]
+    (left_damping, left_call_dofs), (right_damping, right_call_dofs) = duo_entity.damping_calls
+    assert left_call_dofs == left_dofs
+    assert right_call_dofs == right_dofs
+    assert left_damping == pytest.approx([DEFAULT_FR3_DAMPING] * 7)
+    assert right_damping == pytest.approx([DEFAULT_FR3_DAMPING] * 7)
+
+
+def test_initialize_simulation_applies_env_override_identically_to_both_arms(tmp_path, monkeypatch):
+    urdf_path = tmp_path / "duo.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="duo"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    duo_entity = FakeDuoEntity()
+    fake_gs, _ = _fake_gs(robot_entity=duo_entity)
+
+    duo = MobileDuoScene(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "1.5")
+
+    duo.initialize_simulation()
+
+    assert len(duo_entity.damping_calls) == 2
+    for damping, _dofs in duo_entity.damping_calls:
+        assert damping == pytest.approx([1.5] * 7)
+
+
+def test_initialize_simulation_propagates_malformed_damping_env(tmp_path, monkeypatch):
+    urdf_path = tmp_path / "duo.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="duo"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    duo_entity = FakeDuoEntity()
+    fake_gs, _ = _fake_gs(robot_entity=duo_entity)
+
+    duo = MobileDuoScene(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setenv("FR3_JOINT_DAMPING", "1,2,3")
+
+    with pytest.raises(ValueError, match="1 \\(scalar\\) or 7 comma-separated"):
+        duo.initialize_simulation()
+
+    # Same cleanup-on-raise contract as the resolved-URDF-build-failure case.
     assert not resolved.exists()
     assert duo._resolved_urdf is None

@@ -124,6 +124,8 @@ class FakeDuoEntity:
         self.set_position_writes = []
         #: ``(values, dofs)`` for every set_dofs_velocity call.
         self.set_velocity_calls = []
+        #: ``(damping, dofs)`` for every set_dofs_damping call.
+        self.damping_calls = []
 
     def get_joint(self, name):
         return self.joints[name]
@@ -150,7 +152,7 @@ class FakeDuoEntity:
         pass
 
     def set_dofs_damping(self, damping, dofs_idx_local):
-        pass
+        self.damping_calls.append((np.asarray(damping, dtype=float), list(dofs_idx_local)))
 
     def set_dofs_position(self, values, dofs_idx_local, zero_velocity=True):
         values = np.asarray(values, dtype=float)

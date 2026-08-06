@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Sequence
 import genesis as gs
 import numpy as np
 
-from franka_sim.franka_genesis_sim import DEFAULT_FR3_DAMPING, ControlMode
+from franka_sim.franka_genesis_sim import ControlMode, resolve_fr3_joint_damping
 from franka_sim.swerve_base import SwerveBase
 from franka_sim.urdf_assets import resolve_urdf_meshes
 
@@ -172,12 +172,18 @@ class MobileDuoScene:
 
             self._bind_entity()
 
+            # Same viscous damping as the single-arm sim, applied identically to
+            # both arms; override both via $FR3_JOINT_DAMPING (see
+            # franka_genesis_sim.resolve_fr3_joint_damping for the default and
+            # parsing rules).
+            damping = resolve_fr3_joint_damping()
+            logger.info("Arm joint damping (left + right): %s", damping)
             for role in ARM_ROLES:
                 dofs = self.arm_dofs_idx[role]
                 self.robot.set_dofs_force_range(
                     lower=-FR3_FORCE_LIMITS, upper=FR3_FORCE_LIMITS, dofs_idx_local=dofs
                 )
-                self.robot.set_dofs_damping(np.full(7, DEFAULT_FR3_DAMPING), dofs)
+                self.robot.set_dofs_damping(damping, dofs)
                 self.robot.set_dofs_position(ARM_INITIAL_Q, dofs)
 
             for _ in range(100):
