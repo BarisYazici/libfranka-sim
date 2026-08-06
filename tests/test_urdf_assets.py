@@ -178,7 +178,7 @@ def test_convert_dae_to_obj_reuses_the_cache(tmp_path, monkeypatch):
         def apply_scale(self, factor):
             raise AssertionError("no rescale expected for a metre-sized mesh")
 
-        def export(self, path, file_type=None):
+        def export(self, path, file_type=None, mtl_name=None):
             Path(path).write_text("o body\n")
 
     class FakeTrimesh:
@@ -197,3 +197,55 @@ def test_convert_dae_to_obj_reuses_the_cache(tmp_path, monkeypatch):
     assert first == second
     assert first.exists()
     assert len(loads) == 1
+
+
+def test_convert_dae_to_obj_names_material_and_mtl_uniquely(tmp_path, monkeypatch):
+    """Regression test: trimesh's OBJ exporter defaults sidecar files to the
+    generic names ``material.mtl`` / ``material_0.png``. Because every mesh
+    converted by this module shares one cache_dir, exporting two different
+    .dae files without a per-mesh name clobbers the first mesh's material
+    with the second's -- the .obj on disk still references "material.mtl",
+    but that file now belongs to a different mesh. This made most of the
+    mobile-duo platform render near-black (wrong/mismatched texture atlas).
+    The fix names each material/mtl after the same digest-qualified stem as
+    the cached .obj so sidecar files can never collide between meshes.
+    """
+    dae_path = tmp_path / "body.dae"
+    dae_path.write_text("<COLLADA/>")
+    cache_dir = tmp_path / "cache"
+
+    export_calls = []
+
+    class FakeMaterial:
+        name = None
+
+    class FakeVisual:
+        material = FakeMaterial()
+
+    class FakeMesh:
+        extents = type("Extents", (), {"max": staticmethod(lambda: 1.0)})()
+        visual = FakeVisual()
+
+        def apply_scale(self, factor):
+            raise AssertionError("no rescale expected for a metre-sized mesh")
+
+        def export(self, path, file_type=None, mtl_name=None):
+            export_calls.append((path, file_type, mtl_name))
+            Path(path).write_text("o body\n")
+
+    class FakeTrimesh:
+        Scene = type("Scene", (), {})
+
+        @staticmethod
+        def load(path):
+            return FakeMesh()
+
+    monkeypatch.setitem(__import__("sys").modules, "trimesh", FakeTrimesh)
+
+    obj_path = urdf_assets.convert_dae_to_obj(dae_path, cache_dir=cache_dir)
+
+    assert len(export_calls) == 1
+    _, file_type, mtl_name = export_calls[0]
+    assert file_type == "obj"
+    assert mtl_name == f"{obj_path.stem}.mtl"
+    assert FakeMesh.visual.material.name == obj_path.stem

@@ -32,6 +32,15 @@ DEFAULT_CACHE_DIR = Path(tempfile.gettempdir()) / "franka_sim_mesh_cache"
 #: authored in millimetres -- true for the franka_description visuals.
 MILLIMETRE_EXTENT_THRESHOLD = 10.0
 
+#: Bump this when ``convert_dae_to_obj``'s output format changes (e.g. what
+#: gets written to the .obj/.mtl/texture files). It is folded into the cache
+#: key below so a code change invalidates stale cache entries automatically,
+#: instead of silently reusing .obj files built by the old, buggy exporter --
+#: which is exactly what let the mtl-collision bug (every mesh sharing one
+#: "material.mtl"/"material_0.png" name, see ``convert_dae_to_obj``) survive
+#: a naive fix that only touched the export call and not the cache key.
+MESH_CACHE_FORMAT_VERSION = 2
+
 
 def resolve_mesh_path(filename: str, mesh_root: PathLike) -> Path:
     """Map one URDF ``<mesh filename=...>`` value to an absolute path.
@@ -62,12 +71,13 @@ def convert_dae_to_obj(dae_path: PathLike, cache_dir: PathLike = DEFAULT_CACHE_D
     dae_path = Path(dae_path)
     stat = dae_path.stat()
     digest = hashlib.sha1(
-        f"{dae_path}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")
+        f"{MESH_CACHE_FORMAT_VERSION}:{dae_path}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")
     ).hexdigest()[:16]
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    obj_path = cache_dir / f"{dae_path.stem}-{digest}.obj"
+    stem = f"{dae_path.stem}-{digest}"
+    obj_path = cache_dir / f"{stem}.obj"
     if obj_path.exists():
         logger.debug("Mesh cache hit: %s", obj_path)
         return obj_path
@@ -81,7 +91,23 @@ def convert_dae_to_obj(dae_path: PathLike, cache_dir: PathLike = DEFAULT_CACHE_D
     if merged.extents.max() > MILLIMETRE_EXTENT_THRESHOLD:
         merged.apply_scale(0.001)
 
-    merged.export(str(obj_path), file_type="obj")
+    # trimesh's OBJ exporter defaults every material/texture sidecar file to
+    # the same generic names ("material.mtl", "material_0.png"). All meshes
+    # converted by this function share one cache_dir, so without a per-mesh
+    # name every conversion clobbers the previous one's sidecar files: the
+    # .obj on disk still says ``mtllib material.mtl``, but that file (and the
+    # texture atlas it points at) now belongs to whichever .dae was converted
+    # *last*. Every mesh but the last one then loads with a mismatched
+    # texture -- which is what made most of the mobile-duo platform render
+    # near-black. Naming the material after the same digest-qualified stem as
+    # the cached .obj makes every export self-contained, so sidecars can
+    # never collide.
+    visual = getattr(merged, "visual", None)
+    material = getattr(visual, "material", None) if visual is not None else None
+    if material is not None:
+        material.name = stem
+
+    merged.export(str(obj_path), file_type="obj", mtl_name=f"{stem}.mtl")
     logger.info("Converted %s -> %s", dae_path, obj_path)
     return obj_path
 
