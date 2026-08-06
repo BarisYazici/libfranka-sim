@@ -238,10 +238,18 @@ class MobileDuoScene:
         with its own closed-loop controller, so the sim only mirrors where it
         says it is. Everything above the joint -- mount, head, both arms --
         follows because they are children of it in the one entity.
+
+        ``zero_velocity=False`` is load-bearing: Genesis' ``set_dofs_position``
+        zeroes the velocity of EVERY DOF of the entity, not just the ones named
+        in ``dofs_idx_local``. Called once per physics step, the default would
+        wipe both arms' joint velocities each step -- an effectively infinite
+        damper that pins them while the teleported lift still moves. Only the
+        spine's own DOF is zeroed, which is what the teleport invalidates.
         """
         lower, upper = SPINE_LIMITS_M
         clamped = min(max(float(position_m), lower), upper)
-        self.robot.set_dofs_position(np.array([clamped]), [self.spine_dof_idx])
+        self.robot.set_dofs_position(np.array([clamped]), [self.spine_dof_idx], zero_velocity=False)
+        self.robot.set_dofs_velocity(np.zeros(1), [self.spine_dof_idx])
 
     def get_role_state(self, role: str) -> Dict[str, np.ndarray]:
         """Latest snapshot for one role (lock-free read)."""

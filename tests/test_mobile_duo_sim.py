@@ -137,6 +137,24 @@ def test_set_spine_position_writes_the_prismatic_joint(scene):
     assert values == pytest.approx([0.42])
 
 
+def test_set_spine_position_never_zeroes_the_other_dofs(scene):
+    """Regression: the lift write must not stop the arms.
+
+    Genesis' ``set_dofs_position`` zeroes the velocity of EVERY DOF of the
+    entity unless ``zero_velocity=False``. This runs once per physics step, so
+    the default pinned both arms while the (kinematic) lift still moved. Only
+    the spine's own DOF may be zeroed.
+    """
+    scene.set_spine_position(0.42)
+
+    values, dofs, zero_velocity = scene.robot.set_position_writes[-1]
+    assert dofs == [scene.spine_dof_idx]
+    assert zero_velocity is False
+    zeroed_values, zeroed_dofs = scene.robot.set_velocity_calls[-1]
+    assert zeroed_dofs == [scene.spine_dof_idx]
+    assert zeroed_values == pytest.approx([0.0])
+
+
 def test_set_spine_position_clamps_to_the_urdf_limits(scene):
     scene.set_spine_position(-1.0)
     assert scene.robot.set_position_calls[-1][0] == pytest.approx([0.0])

@@ -45,6 +45,20 @@ breaking changes — these are called out explicitly.
 
 ### Fixed
 
+- **Mobile-duo arms were inert under torque control.** Both FR3 arms hung
+  motionless in the `--mobile-duo` scene while every layer above them looked
+  healthy (controller `FOLLOWING`, effort interfaces claimed, targets arriving
+  at the bridge). The base pose and the spine lift are advanced
+  *kinematically*, and Genesis' `set_pos`, `set_quat` and `set_dofs_position`
+  all default to `zero_velocity=True`, which zeroes the velocity of **every**
+  DOF of the entity — not just the ones named. Running once per physics step on
+  the one entity that carries both arms, that acted as an infinite damper: a
+  2 Nm command travelled 0.03 rad in 6 s instead of 2.3 rad, and position mode
+  under-tracked by ~0.09 rad. The base and the lift still moved (they are
+  teleported), which is what made the arms look like the only broken part.
+  Both pose writes now pass `zero_velocity=False` and zero only the DOFs the
+  teleport actually invalidates — the root joint and the spine joint.
+  `tests/test_mobile_duo_physics.py` guards this against real physics.
 - **Socket-teardown race in `FrankaSimServer.cleanup()`.** Socket attributes
   (`client_socket`, `server_socket`, `command_socket`, `udp_socket`) were
   re-read between their `shutdown()` and `close()` calls, racing a

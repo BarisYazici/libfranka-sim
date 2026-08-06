@@ -84,6 +84,8 @@ class SwerveBase:
 
         self.steer_dofs_idx = None
         self.drive_dofs_idx = None
+        #: DOFs of the entity's own root (floating) joint; see ``bind``/``apply``.
+        self.root_dofs_idx: list = []
 
         self._twist = np.zeros(6)
         self._steer_targets = np.zeros(2)
@@ -102,13 +104,32 @@ class SwerveBase:
         self.theta = 0.0
 
     def bind(self) -> None:
-        """Resolve the wheel DOF indices. Call once, after ``scene.build()``."""
+        """Resolve the wheel and root DOF indices. Call once, after ``scene.build()``."""
         self.steer_dofs_idx = [
             self.entity.get_joint(name).dof_idx_local for name in self.steer_joints
         ]
         self.drive_dofs_idx = [
             self.entity.get_joint(name).dof_idx_local for name in self.drive_joints
         ]
+        self.root_dofs_idx = self._resolve_root_dofs()
+
+    def _resolve_root_dofs(self) -> list:
+        """DOF indices of the entity's root joint (empty when the base is fixed).
+
+        ``apply`` writes the base pose with ``zero_velocity=False`` because
+        Genesis' ``set_pos``/``set_quat`` otherwise zero **every** DOF of the
+        entity -- on the mobile-duo scene that includes both FR3 arms, which
+        pins them (see ``MobileDuoScene.set_spine_position`` for the same trap).
+        Only the root's own DOFs still need zeroing after the teleport, so they
+        are resolved once here.
+        """
+        base_joint = getattr(self.entity, "base_joint", None)
+        if base_joint is None:
+            return []
+        dof_idx = getattr(base_joint, "dof_idx_local", None)
+        if dof_idx is None:
+            return []
+        return [int(idx) for idx in np.atleast_1d(dof_idx)]
 
     def reset_pose(self, x: float = 0.0, y: float = 0.0, theta: float = 0.0) -> None:
         """Reset the integrated planar pose."""
@@ -184,8 +205,16 @@ class SwerveBase:
         self.entity.control_dofs_velocity(drive_targets, self.drive_dofs_idx)
 
         x, y, theta = self.integrate_pose(dt)
-        self.entity.set_pos(np.array([x, y, self.base_height]))
-        self.entity.set_quat(yaw_to_quat_wxyz(theta))
+        # zero_velocity=False is load-bearing: Genesis' set_pos/set_quat default
+        # to zeroing EVERY DOF of the entity, so on the mobile-duo scene these
+        # two kinematic pose writes would zero both arms' joint velocities every
+        # physics step -- an effectively infinite damper that pins the arms while
+        # the (kinematically teleported) base still looks fine. Only the root's
+        # own DOFs are zeroed, which is what the teleport actually invalidates.
+        self.entity.set_pos(np.array([x, y, self.base_height]), zero_velocity=False)
+        self.entity.set_quat(yaw_to_quat_wxyz(theta), zero_velocity=False)
+        if self.root_dofs_idx:
+            self.entity.set_dofs_velocity(np.zeros(len(self.root_dofs_idx)), self.root_dofs_idx)
 
     def wheel_state(self) -> Tuple[np.ndarray, np.ndarray]:
         """Wheel ``(q, dq)`` as 4-element arrays in ``TMR_JOINT_ORDER``."""

@@ -143,6 +143,51 @@ def test_apply_writes_joint_targets_and_base_pose():
     assert entity.quaternions[-1] == pytest.approx([1.0, 0.0, 0.0, 0.0], abs=1e-9)
 
 
+def test_bind_resolves_the_root_dofs():
+    entity = FakeEntity(root_dofs=(7, 8, 9))
+    base = SwerveBase(entity)
+    base.bind()
+    assert base.root_dofs_idx == [7, 8, 9]
+
+
+def test_bind_tolerates_an_entity_without_a_root_joint():
+    entity = FakeEntity(root_dofs=())
+    base = SwerveBase(entity)
+    base.bind()
+    assert base.root_dofs_idx == []
+
+
+def test_apply_zeroes_only_the_root_dofs_not_the_whole_entity():
+    """Regression: the base pose write must not stop the arms.
+
+    Genesis' ``set_pos``/``set_quat`` zero the velocity of EVERY DOF of the
+    entity unless ``zero_velocity=False``. On the mobile-duo scene that entity
+    carries both FR3 arms, and ``apply`` runs once per physics step, so the
+    default pinned the arms while the (kinematic) base still moved.
+    """
+    entity = FakeEntity(root_dofs=(30, 31, 32, 33, 34, 35))
+    base = SwerveBase(entity, base_height=0.05)
+    base.bind()
+    base.set_twist([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    base.apply(0.01)
+
+    assert [zero_velocity for _, _, zero_velocity in entity.pose_writes] == [False, False]
+    values, dofs = entity.set_velocity_calls[-1]
+    assert dofs == [30, 31, 32, 33, 34, 35]
+    assert values == pytest.approx([0.0] * 6)
+
+
+def test_apply_skips_the_root_zeroing_when_there_is_no_root_joint():
+    entity = FakeEntity(root_dofs=())
+    base = SwerveBase(entity)
+    base.bind()
+
+    base.apply(0.01)
+
+    assert entity.set_velocity_calls == []
+
+
 def test_wheel_state_is_reported_in_joint_index_order():
     entity = FakeEntity(dof_positions=[0.11, 0.22, 0.33, 0.44], dof_velocities=[1.1, 2.2, 3.3, 4.4])
     base = SwerveBase(entity)

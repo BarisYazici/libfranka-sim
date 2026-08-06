@@ -32,14 +32,19 @@ class FakeJoint:
 class FakeEntity:
     """Minimal Genesis RigidEntity stand-in that records every control call."""
 
-    def __init__(self, dof_positions=None, dof_velocities=None):
+    def __init__(self, dof_positions=None, dof_velocities=None, root_dofs=(100, 101, 102)):
         self.joints = {name: FakeJoint(index) for index, name in enumerate(TMR_JOINT_ORDER)}
         self.dof_positions = dof_positions if dof_positions is not None else [0.1, 0.2, 0.3, 0.4]
         self.dof_velocities = dof_velocities if dof_velocities is not None else [1.0, 2.0, 3.0, 4.0]
+        self.base_joint = FakeJoint(list(root_dofs)) if root_dofs else None
         self.position_commands = []
         self.velocity_commands = []
         self.positions = []
         self.quaternions = []
+        #: ``(values, dofs, zero_velocity)`` for every base-pose write.
+        self.pose_writes = []
+        #: ``(values, dofs)`` for every set_dofs_velocity call.
+        self.set_velocity_calls = []
 
     def get_joint(self, name):
         return self.joints[name]
@@ -59,11 +64,16 @@ class FakeEntity:
     def set_dofs_force_range(self, lower, upper, dofs_idx_local):
         pass
 
-    def set_pos(self, position):
-        self.positions.append(np.asarray(position, dtype=float))
+    def set_dofs_velocity(self, values, dofs_idx_local):
+        self.set_velocity_calls.append((np.asarray(values, dtype=float), list(dofs_idx_local)))
 
-    def set_quat(self, quaternion):
+    def set_pos(self, position, zero_velocity=True):
+        self.positions.append(np.asarray(position, dtype=float))
+        self.pose_writes.append(("pos", np.asarray(position, dtype=float), zero_velocity))
+
+    def set_quat(self, quaternion, zero_velocity=True):
         self.quaternions.append(np.asarray(quaternion, dtype=float))
+        self.pose_writes.append(("quat", np.asarray(quaternion, dtype=float), zero_velocity))
 
 
 class FakeLink:
@@ -97,6 +107,7 @@ class FakeDuoEntity:
         names.append(SPINE_JOINT_NAME)
         self.joints = {name: FakeJoint(index) for index, name in enumerate(names)}
         self.n_dofs = len(names)
+        self.base_joint = FakeJoint([100, 101, 102])
         self.dof_positions = np.arange(self.n_dofs, dtype=float) / 100.0
         self.dof_velocities = np.arange(self.n_dofs, dtype=float) / 10.0
         self.links = {
@@ -109,6 +120,10 @@ class FakeDuoEntity:
         self.set_position_calls = []
         self.positions = []
         self.quaternions = []
+        #: ``(values, dofs, zero_velocity)`` for every set_dofs_position call.
+        self.set_position_writes = []
+        #: ``(values, dofs)`` for every set_dofs_velocity call.
+        self.set_velocity_calls = []
 
     def get_joint(self, name):
         return self.joints[name]
@@ -137,14 +152,18 @@ class FakeDuoEntity:
     def set_dofs_damping(self, damping, dofs_idx_local):
         pass
 
-    def set_dofs_position(self, values, dofs_idx_local):
+    def set_dofs_position(self, values, dofs_idx_local, zero_velocity=True):
         values = np.asarray(values, dtype=float)
         self.set_position_calls.append((values, list(dofs_idx_local)))
+        self.set_position_writes.append((values, list(dofs_idx_local), zero_velocity))
         for value, index in zip(values, dofs_idx_local):
             self.dof_positions[index] = value
 
-    def set_pos(self, position):
+    def set_dofs_velocity(self, values, dofs_idx_local):
+        self.set_velocity_calls.append((np.asarray(values, dtype=float), list(dofs_idx_local)))
+
+    def set_pos(self, position, zero_velocity=True):
         self.positions.append(np.asarray(position, dtype=float))
 
-    def set_quat(self, quaternion):
+    def set_quat(self, quaternion, zero_velocity=True):
         self.quaternions.append(np.asarray(quaternion, dtype=float))
