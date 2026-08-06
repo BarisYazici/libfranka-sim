@@ -19,7 +19,7 @@ from typing import Dict, Optional, Sequence
 import genesis as gs
 import numpy as np
 
-from franka_sim.franka_genesis_sim import ControlMode
+from franka_sim.franka_genesis_sim import ControlMode, resolve_gs_backend
 from franka_sim.swerve_base import SwerveBase
 from franka_sim.urdf_assets import resolve_urdf_meshes
 
@@ -80,7 +80,7 @@ class TMRGenesisSim:
         """Build the Genesis scene and bind the wheel joints."""
         if not getattr(gs, "_initialized", False):
             try:
-                gs.init(backend=gs.cpu, logging_level=None)
+                gs.init(backend=resolve_gs_backend(gs), logging_level=None)
             except Exception as exc:  # already initialised by another scene
                 if "already initialized" not in str(exc).lower():
                     raise

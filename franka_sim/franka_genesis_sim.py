@@ -66,6 +66,45 @@ def resolve_fr3_joint_damping(default: float = DEFAULT_FR3_DAMPING) -> np.ndarra
     return np.full(7, default, dtype=float)
 
 
+#: Genesis compute backends selectable via $FRANKA_SIM_BACKEND, and the gs
+#: attribute each name resolves to.
+GS_BACKEND_NAMES = {"cpu": "cpu", "gpu": "gpu"}
+
+
+def resolve_gs_backend(gs_module=None, default: str = "cpu"):
+    """Resolve the Genesis compute backend from $FRANKA_SIM_BACKEND.
+
+    ``cpu`` (the default, unset falls back here) preserves the previous
+    hardcoded behavior. ``gpu`` runs Genesis on the CUDA device via
+    ``gs.gpu`` -- the mobile-duo scene's real-time-paced stepping loop
+    saturates one CPU core (~107%) on this host, falling behind wall-clock
+    real time, while the machine's GPU sits idle.
+
+    Shared by every ``gs.init`` call site (the single-arm sim, the TMR-only
+    sim, and the mobile-duo scene) via this one function, so the whole
+    process agrees on one backend no matter which scene initializes Genesis
+    first (``gs.init`` is process-global and idempotent -- see the
+    ``gs._initialized`` guards at each call site).
+
+    ``gs_module`` defaults to this module's own ``gs`` but each call site
+    should pass its *own* bound ``gs`` (``resolve_gs_backend(gs)``): the
+    physics test fixtures swap a call site's ``gs`` for the real Genesis
+    package one module at a time (``conftest.py`` otherwise stubs it
+    process-wide with a ``MagicMock``), and resolving the backend attribute
+    off a *different* module's ``gs`` than the one ``.init()`` is actually
+    called on would silently mix a stub and the real package.
+    """
+    if gs_module is None:
+        gs_module = gs  # this module's own binding, resolved at call time
+    backend_name = (os.environ.get("FRANKA_SIM_BACKEND") or default).strip().lower()
+    if backend_name not in GS_BACKEND_NAMES:
+        raise ValueError(
+            f"FRANKA_SIM_BACKEND must be one of {sorted(GS_BACKEND_NAMES)}, got {backend_name!r}"
+        )
+    logger.info("Genesis backend: %s", backend_name)
+    return getattr(gs_module, GS_BACKEND_NAMES[backend_name])
+
+
 class ControlMode(Enum):
     POSITION = "position"
     VELOCITY = "velocity"
@@ -159,10 +198,11 @@ class FrankaGenesisSim:
         # return model, data
 
     def initialize_simulation(self):
-        # Initialize Genesis with CPU backend (idempotent: ignore "already initialized").
+        # Initialize Genesis with the resolved backend (idempotent: ignore
+        # "already initialized").
         if not getattr(gs, "_initialized", False):
             try:
-                gs.init(backend=gs.cpu, logging_level=None)
+                gs.init(backend=resolve_gs_backend(gs), logging_level=None)
             except Exception as exc:
                 if "already initialized" not in str(exc).lower():
                     raise

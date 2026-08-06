@@ -20,11 +20,28 @@ from typing import Dict, List, Optional, Sequence
 import genesis as gs
 import numpy as np
 
-from franka_sim.franka_genesis_sim import ControlMode, resolve_fr3_joint_damping
+from franka_sim.franka_genesis_sim import (
+    ControlMode,
+    resolve_fr3_joint_damping,
+    resolve_gs_backend,
+)
 from franka_sim.swerve_base import SwerveBase
 from franka_sim.urdf_assets import resolve_urdf_meshes
 
 logger = logging.getLogger(__name__)
+
+#: Wall-clock window (s) the WARNING check averages the real-time factor
+#: over. Short enough to surface overload promptly, long enough that one
+#: slow step (a GC pause, a render frame) doesn't false-trigger it.
+RTF_WARN_INTERVAL_S = 5.0
+
+#: Wall-clock window (s) the informational real-time-factor log uses,
+#: regardless of value.
+RTF_INFO_INTERVAL_S = 60.0
+
+#: Below this real-time factor over an RTF_WARN_INTERVAL_S window, physics
+#: is falling behind wall-clock real time and a WARNING is logged.
+RTF_WARN_THRESHOLD = 0.95
 
 ROLE_LEFT = "left"
 ROLE_RIGHT = "right"
@@ -73,6 +90,76 @@ def pose_to_column_major(position, quat_wxyz) -> np.ndarray:
     matrix[:3, :3] = rotation
     matrix[:3, 3] = np.asarray(position, dtype=float)
     return matrix.T.flatten()
+
+
+class RealtimeFactorMonitor:
+    """Tracks the achieved real-time factor (RTF) of the paced stepping loop.
+
+    ``run_simulation`` calls :meth:`update` once per iteration with the
+    current wall-clock time (``time.perf_counter()``, taken *after* that
+    iteration's pacing sleep so it reflects the loop's true wall-clock rate)
+    and the amount of simulated time the step just advanced (``dt``).
+
+    ``start_wall`` is the loop's own wall-clock origin (``run_simulation``
+    passes its ``next_step`` starting value) so the first window's elapsed
+    wall time is measured from when the loop actually started, not from an
+    arbitrary first ``update()`` call -- seeding the marks from the first
+    call instead would silently shift every later window boundary by one
+    step's worth of wall time.
+
+    Two independent windows are tracked purely by wall-clock elapsed time:
+    every ``RTF_WARN_INTERVAL_S`` the windowed RTF (simulated-time delta /
+    wall-time delta) is checked and a WARNING is logged if physics fell
+    behind (RTF < ``RTF_WARN_THRESHOLD``, i.e. the loop could not keep pace
+    with real time despite the pacing sleep); every ``RTF_INFO_INTERVAL_S``
+    the windowed RTF is logged at INFO regardless of value. Nothing is
+    logged per-step.
+    """
+
+    def __init__(
+        self,
+        logger_,
+        start_wall: float,
+        warn_interval_s: float = RTF_WARN_INTERVAL_S,
+        info_interval_s: float = RTF_INFO_INTERVAL_S,
+        warn_threshold: float = RTF_WARN_THRESHOLD,
+    ):
+        self._logger = logger_
+        self._warn_interval_s = warn_interval_s
+        self._info_interval_s = info_interval_s
+        self._warn_threshold = warn_threshold
+
+        self._sim_time = 0.0
+        self._warn_wall_mark = start_wall
+        self._warn_sim_mark = 0.0
+        self._info_wall_mark = start_wall
+        self._info_sim_mark = 0.0
+
+    def update(self, now: float, dt: float) -> None:
+        """Record one step (``dt`` of sim time at wall-clock time ``now``)."""
+        self._sim_time += dt
+
+        if now - self._warn_wall_mark >= self._warn_interval_s:
+            rtf = self._window_rtf(now, self._warn_wall_mark, self._warn_sim_mark)
+            if rtf < self._warn_threshold:
+                self._logger.warning(
+                    "simulation running at %.2fx real time (physics overloaded)", rtf
+                )
+            self._warn_wall_mark = now
+            self._warn_sim_mark = self._sim_time
+
+        if now - self._info_wall_mark >= self._info_interval_s:
+            rtf = self._window_rtf(now, self._info_wall_mark, self._info_sim_mark)
+            self._logger.info("simulation running at %.2fx real time", rtf)
+            self._info_wall_mark = now
+            self._info_sim_mark = self._sim_time
+
+    def _window_rtf(self, now: float, wall_mark: float, sim_mark: float) -> float:
+        wall_elapsed = now - wall_mark
+        sim_elapsed = self._sim_time - sim_mark
+        if wall_elapsed <= 0:
+            return 1.0
+        return sim_elapsed / wall_elapsed
 
 
 class MobileDuoScene:
@@ -134,7 +221,7 @@ class MobileDuoScene:
         """Build the scene from the combined URDF and bind every joint group."""
         if not getattr(gs, "_initialized", False):
             try:
-                gs.init(backend=gs.cpu, logging_level=None)
+                gs.init(backend=resolve_gs_backend(gs), logging_level=None)
             except Exception as exc:
                 if "already initialized" not in str(exc).lower():
                     raise
@@ -338,6 +425,7 @@ class MobileDuoScene:
         next_step = time.perf_counter()
         next_render = next_step
         render_period = 1.0 / 30.0
+        rtf_monitor = RealtimeFactorMonitor(logger, next_step)
 
         while self.running:
             self._read_and_publish_state()
@@ -358,6 +446,12 @@ class MobileDuoScene:
             elif slack < -self.dt:
                 next_step = time.perf_counter()
                 next_render = max(next_render, next_step)
+
+            # Wall-clock RTF measured after pacing: when physics keeps up,
+            # the sleep above pads each iteration back to ~dt (RTF ~= 1); an
+            # overloaded step skips the sleep and the iteration runs long
+            # (RTF < 1). See RealtimeFactorMonitor.
+            rtf_monitor.update(time.perf_counter(), self.dt)
 
         if self.enable_vis:
             self.scene.viewer.stop()

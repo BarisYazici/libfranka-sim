@@ -1,5 +1,6 @@
 import math
 import types
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from franka_sim.franka_genesis_sim import (
     DEFAULT_FR3_DAMPING,
     ControlMode,
     resolve_fr3_joint_damping,
+    resolve_gs_backend,
 )
 from franka_sim.mobile_duo_sim import (
     ARM_EE_LINKS,
@@ -19,6 +21,7 @@ from franka_sim.mobile_duo_sim import (
     ROLE_RIGHT,
     ROLES,
     MobileDuoScene,
+    RealtimeFactorMonitor,
     SceneView,
     pose_to_column_major,
 )
@@ -418,3 +421,214 @@ def test_initialize_simulation_propagates_malformed_damping_env(tmp_path, monkey
     # Same cleanup-on-raise contract as the resolved-URDF-build-failure case.
     assert not resolved.exists()
     assert duo._resolved_urdf is None
+
+
+# --- Genesis backend selection (FRANKA_SIM_BACKEND) -------------------------
+#
+# resolve_gs_backend lives in franka_genesis_sim (next to
+# resolve_fr3_joint_damping) but is shared by every gs.init call site --
+# franka_genesis_sim.FrankaGenesisSim, tmr_genesis_sim.TMRGenesisSim, and
+# MobileDuoScene below -- so the whole process agrees on one backend. Its
+# pure-function contract is covered here, alongside the mobile-duo wiring;
+# resolve_fr3_joint_damping's tests above use the same colocation.
+#
+# Each call site passes resolve_gs_backend its *own* bound ``gs``
+# (``resolve_gs_backend(gs)``) rather than relying on
+# franka_genesis_sim's -- test_mobile_duo_physics.py's real-Genesis fixture
+# rebinds only ``mobile_duo_sim.gs`` (conftest.py otherwise stubs ``gs``
+# process-wide with a MagicMock), and resolving the backend attribute off
+# a *different* module's ``gs`` mixed a stub sentinel into a real
+# gs.init() call. The regression test below pins that down.
+
+
+def _fake_backend_gs():
+    """A minimal gs stand-in with distinguishable cpu/gpu sentinel backends."""
+    return types.SimpleNamespace(cpu="BACKEND_CPU", gpu="BACKEND_GPU")
+
+
+def test_resolve_gs_backend_defaults_to_cpu_when_unset(monkeypatch):
+    monkeypatch.delenv("FRANKA_SIM_BACKEND", raising=False)
+    assert resolve_gs_backend(_fake_backend_gs()) == "BACKEND_CPU"
+
+
+def test_resolve_gs_backend_treats_empty_string_as_unset(monkeypatch):
+    """Mirrors FR3_JOINT_DAMPING's empty-string-is-unset convention."""
+    monkeypatch.setenv("FRANKA_SIM_BACKEND", "")
+    assert resolve_gs_backend(_fake_backend_gs()) == "BACKEND_CPU"
+
+
+def test_resolve_gs_backend_gpu_selects_gs_gpu(monkeypatch):
+    monkeypatch.setenv("FRANKA_SIM_BACKEND", "gpu")
+    assert resolve_gs_backend(_fake_backend_gs()) == "BACKEND_GPU"
+
+
+def test_resolve_gs_backend_is_case_insensitive_and_strips_whitespace(monkeypatch):
+    monkeypatch.setenv("FRANKA_SIM_BACKEND", "  GPU\n")
+    assert resolve_gs_backend(_fake_backend_gs()) == "BACKEND_GPU"
+
+
+def test_resolve_gs_backend_rejects_invalid_value(monkeypatch):
+    monkeypatch.setenv("FRANKA_SIM_BACKEND", "tpu")
+    with pytest.raises(ValueError, match="FRANKA_SIM_BACKEND must be one of"):
+        resolve_gs_backend(_fake_backend_gs())
+
+
+def test_resolve_gs_backend_defaults_to_its_own_modules_gs(monkeypatch):
+    """No explicit gs_module: falls back to franka_genesis_sim's own ``gs``,
+    resolved at call time (so monkeypatching it still works), for direct
+    callers that have no gs of their own to pass.
+    """
+    monkeypatch.delenv("FRANKA_SIM_BACKEND", raising=False)
+    monkeypatch.setattr("franka_sim.franka_genesis_sim.gs", _fake_backend_gs())
+    assert resolve_gs_backend() == "BACKEND_CPU"
+
+
+def test_resolve_gs_backend_uses_the_passed_module_not_franka_genesis_sims(monkeypatch):
+    """Regression: resolving off the wrong module's ``gs`` mixes a stub
+    sentinel into a real ``gs.init()`` call (see test_mobile_duo_physics.py's
+    real-Genesis fixture, which rebinds only one module's ``gs``).
+    """
+    monkeypatch.setenv("FRANKA_SIM_BACKEND", "gpu")
+    # franka_genesis_sim's own gs is left as whatever conftest/collection
+    # bound it (a MagicMock or the real package) -- irrelevant here, because
+    # an explicit gs_module is passed and must win.
+    own_gs = _fake_backend_gs()
+    assert resolve_gs_backend(own_gs) is own_gs.gpu
+
+
+def test_initialize_simulation_initializes_genesis_with_the_resolved_backend(tmp_path, monkeypatch):
+    """The scene's gs.init call site routes through resolve_gs_backend(gs),
+    same as the single-arm and TMR-only sims (grepped for other gs.init
+    call sites when adding backend selection), passing its own gs so the
+    resolved backend and the module gs.init() runs on always match.
+    """
+    urdf_path = tmp_path / "duo.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="duo"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    duo_entity = FakeDuoEntity()
+    fake_gs, _ = _fake_gs(robot_entity=duo_entity)
+    fake_gs._initialized = False
+    fake_gs.cpu = "BACKEND_CPU"
+    fake_gs.gpu = "BACKEND_GPU"
+    init_calls = []
+
+    def fake_init(**kwargs):
+        init_calls.append(kwargs)
+        fake_gs._initialized = True
+
+    fake_gs.init = fake_init
+
+    duo = MobileDuoScene(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setenv("FRANKA_SIM_BACKEND", "gpu")
+
+    duo.initialize_simulation()
+
+    assert init_calls == [{"backend": "BACKEND_GPU", "logging_level": None}]
+
+
+# --- real-time-factor monitoring (RealtimeFactorMonitor) --------------------
+#
+# run_simulation's pacing logic (next_step += dt / sleep-slack) is unchanged;
+# RealtimeFactorMonitor only observes it. Fed synthetic (now, dt) pairs here
+# so the warning/info cadence and threshold logic are exercised without a
+# real wall clock or Genesis scene.
+
+
+def test_rtf_monitor_no_warning_and_one_info_log_when_realtime():
+    log = Mock()
+    monitor = RealtimeFactorMonitor(log, 0.0, warn_interval_s=5.0, info_interval_s=60.0)
+
+    now = 0.0
+    for _ in range(60):
+        now += 1.0
+        monitor.update(now, dt=1.0)  # sim time keeps pace with wall time: RTF == 1
+
+    log.warning.assert_not_called()
+    log.info.assert_called_once()
+    message, rtf = log.info.call_args[0]
+    assert "real time" in message
+    assert rtf == pytest.approx(1.0)
+
+
+def test_rtf_monitor_warns_once_per_window_when_overloaded():
+    log = Mock()
+    monitor = RealtimeFactorMonitor(log, 0.0, warn_interval_s=5.0, info_interval_s=60.0)
+
+    now = 0.0
+    for _ in range(5):
+        now += 1.0
+        monitor.update(now, dt=0.5)  # sim advances at half the wall-clock rate: RTF == 0.5
+
+    log.warning.assert_called_once()
+    message, rtf = log.warning.call_args[0]
+    assert "physics overloaded" in message
+    assert rtf == pytest.approx(0.5)
+
+
+def test_rtf_monitor_no_warning_just_above_the_threshold():
+    log = Mock()
+    monitor = RealtimeFactorMonitor(
+        log, 0.0, warn_interval_s=5.0, info_interval_s=60.0, warn_threshold=0.95
+    )
+
+    now = 0.0
+    for _ in range(5):
+        now += 1.0
+        monitor.update(now, dt=0.96)  # RTF 0.96 > the 0.95 threshold
+
+    log.warning.assert_not_called()
+
+
+def test_rtf_monitor_warns_at_the_threshold_boundary():
+    """RTF exactly at the threshold does not warn: the check is strict '<'.
+
+    A single window only (not several accumulated ones): summing ``0.95``
+    many times over multiple resets drifts a couple ULPs below the exact
+    value in floating point, which would make this a flaky float-precision
+    test rather than a check of the '<' boundary itself.
+    """
+    log = Mock()
+    monitor = RealtimeFactorMonitor(
+        log, 0.0, warn_interval_s=5.0, info_interval_s=60.0, warn_threshold=0.95
+    )
+
+    now = 0.0
+    for _ in range(5):
+        now += 1.0
+        monitor.update(now, dt=0.95)  # RTF exactly 0.95
+
+    log.warning.assert_not_called()
+
+
+def test_rtf_monitor_info_log_fires_once_per_minute_regardless_of_overload():
+    log = Mock()
+    monitor = RealtimeFactorMonitor(log, 0.0, warn_interval_s=5.0, info_interval_s=60.0)
+
+    now = 0.0
+    for _ in range(60):
+        now += 1.0
+        monitor.update(now, dt=0.5)  # overloaded for the whole minute
+
+    # One INFO log at the 60s mark, and one WARNING per 5s window (12 of them),
+    # never more than that -- i.e. no per-step logging.
+    assert log.info.call_count == 1
+    assert log.warning.call_count == 12
+    _, info_rtf = log.info.call_args[0]
+    assert info_rtf == pytest.approx(0.5)
+
+
+def test_rtf_monitor_logs_nothing_before_the_first_window_elapses():
+    log = Mock()
+    monitor = RealtimeFactorMonitor(log, 0.0, warn_interval_s=5.0, info_interval_s=60.0)
+
+    now = 0.0
+    for _ in range(4):
+        now += 1.0
+        monitor.update(now, dt=0.1)  # badly overloaded, but only 4s of wall time so far
+
+    log.warning.assert_not_called()
+    log.info.assert_not_called()
