@@ -187,6 +187,7 @@ python -m franka_sim.run_server --mobile-duo \
 | `--scene-urdf PATH` | The combined `mobile_fr3_duo` URDF loaded into the one Genesis scene (required with `--mobile-duo`; see below for generating it) |
 | `--mesh-root PATH` | Package root used to resolve `package://` mesh URIs in the URDF — a `franka_description` checkout; defaults to the URDF's own directory |
 | `--bind ROLE=HOST` | Bind one bridge to a host address; repeat for `left`, `right` and `base` (all three are required) |
+| `--physics {genesis,mujoco}` | Physics backend for the scene (default `genesis`) |
 
 By convention this repo uses three loopback aliases on `127.0.0.0/8`, one per
 role, plus a fourth for the spine device:
@@ -200,6 +201,17 @@ role, plus a fourth for the spine device:
 
 Every bridge still listens on the standard libfranka command port (1337);
 override it for all three at once with `--port`.
+
+**Physics backend.** `--physics mujoco` (needs the `mujoco` extra:
+`pip install 'franka-sim[mujoco]'`) runs the same scene on MuJoCo instead of
+Genesis. Genesis' per-call kernel-launch overhead caps the scene at ~0.4x real
+time at its 2.5 ms step; MuJoCo holds **1.00x real time at a 1 ms step** — the
+rate the FCI bridges actually serve — using about a third of one core. The
+protocol surface, the joint and link names, the initial pose and the reported
+state are identical between the two, so a client cannot tell them apart.
+Contacts are disabled on the MuJoCo path (the chassis' URDF collision meshes
+interpenetrate as authored, and nothing in this scene depends on contact: the
+base pose is integrated kinematically and both arms are servo-driven).
 
 **Generating `--scene-urdf`.** `scripts/generate_mobile_duo_urdf.sh
 <franka_description_dir> <output.urdf>` runs the upstream xacro with the

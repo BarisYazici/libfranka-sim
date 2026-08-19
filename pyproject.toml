@@ -56,6 +56,12 @@ dev = [
 mobile = [
     "trimesh>=4.0",
 ]
+# --physics mujoco for the mobile-duo scene. Kept out of the base
+# dependencies so the Genesis-only install stays unchanged; MjSpec (used to
+# give the chassis root its freejoint) needs MuJoCo 3.2 or newer.
+mujoco = [
+    "mujoco>=3.2",
+]
 
 [tool.setuptools]
 packages = ["franka_sim", "franka_sim.assets"]

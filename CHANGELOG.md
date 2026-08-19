@@ -9,6 +9,17 @@ breaking changes — these are called out explicitly.
 
 ### Added
 
+- **MuJoCo physics backend for the mobile duo** (`--physics mujoco`, default
+  `genesis`): `MobileDuoMujocoScene` implements the same scene contract the
+  runner and the three FCI bridges already consume, so the protocol surface,
+  the joint and link names, the initial pose and the reported state are
+  unchanged. Genesis' per-call kernel-launch overhead caps the scene at ~0.4x
+  real time at its 2.5 ms step; MuJoCo holds **1.00x real time at a 1 ms
+  step** — the rate the bridges actually serve — at about a third of one core.
+  Needs the new `mujoco` extra. Contacts are disabled on this path: the
+  chassis' URDF collision meshes interpenetrate as authored, and nothing in
+  the scene depends on contact (the base pose is integrated kinematically and
+  both arms are servo-driven).
 - **Mobile FR3 duo simulation** (`--mobile-duo`): one Genesis scene combining
   the TMR mobile base and two FR3 arms (rigidly mounted, so base motion
   carries both arms), served over **three** FCI bridges — one per role
