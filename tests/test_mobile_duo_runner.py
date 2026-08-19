@@ -173,7 +173,46 @@ def test_cli_defaults_leave_the_single_arm_path_untouched():
     assert args.urdf is None
     assert args.no_gripper is False
     assert args.gripper_physics is False
+    assert args.physics == "genesis"
     run_server.validate_args(args)
+
+
+def test_cli_selects_the_mujoco_physics_backend():
+    args = run_server.build_parser().parse_args(
+        [
+            "--mobile-duo",
+            "--physics",
+            "mujoco",
+            "--scene-urdf",
+            "/tmp/duo.urdf",
+            "--bind",
+            "left=127.0.0.11",
+            "--bind",
+            "right=127.0.0.12",
+            "--bind",
+            "base=127.0.0.10",
+        ]
+    )
+    assert args.physics == "mujoco"
+    run_server.validate_args(args)
+
+
+def test_cli_rejects_a_physics_choice_without_mobile_duo():
+    args = run_server.build_parser().parse_args(["--physics", "mujoco"])
+    with pytest.raises(ValueError, match="--physics"):
+        run_server.validate_args(args)
+
+
+def test_cli_rejects_an_unknown_physics_backend():
+    with pytest.raises(SystemExit):
+        run_server.build_parser().parse_args(["--mobile-duo", "--physics", "bullet"])
+
+
+def test_resolve_scene_class_returns_each_backend_scene():
+    genesis_scene = run_server.resolve_scene_class("genesis")
+    mujoco_scene = run_server.resolve_scene_class("mujoco")
+    assert genesis_scene.__name__ == "MobileDuoScene"
+    assert mujoco_scene.__name__ == "MobileDuoMujocoScene"
 
 
 class StubSpineServer:

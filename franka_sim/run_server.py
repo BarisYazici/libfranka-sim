@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import importlib
 import logging
 import sys
 
@@ -8,6 +9,22 @@ from franka_sim.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
 
 # Configure logging to silence Numba debug output
 logging.getLogger("numba").setLevel(logging.WARNING)
+
+#: Mobile-duo physics backends, mapped to the module and class implementing the
+#: scene contract MobileDuoRunner consumes. Imported lazily in
+#: :func:`resolve_scene_class` so choosing one backend never pays the other's
+#: (multi-second, native) import cost.
+MOBILE_DUO_PHYSICS = {
+    "genesis": ("franka_sim.mobile_duo_sim", "MobileDuoScene"),
+    "mujoco": ("franka_sim.mobile_duo_mujoco_sim", "MobileDuoMujocoScene"),
+}
+
+
+def resolve_scene_class(physics: str):
+    """Import and return the mobile-duo scene class for one physics backend."""
+    module_name, class_name = MOBILE_DUO_PHYSICS[physics]
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Combined mobile_fr3_duo URDF loaded into Genesis (required with --mobile-duo)",
+    )
+    parser.add_argument(
+        "--physics",
+        choices=sorted(MOBILE_DUO_PHYSICS),
+        default="genesis",
+        help="Physics backend for the mobile-duo scene (requires --mobile-duo): "
+        "genesis (default) or mujoco, which holds real time at a 1 ms step",
     )
     parser.add_argument(
         "--mesh-root",
@@ -102,6 +126,8 @@ def validate_args(args) -> None:
             raise ValueError("--scene-urdf and --bind require --mobile-duo")
         if args.spine or args.spine_cert or args.spine_key:
             raise ValueError("--spine and the --spine-* options require --mobile-duo")
+        if args.physics != "genesis":
+            raise ValueError("--physics requires --mobile-duo")
         return
 
     if not args.scene_urdf:
@@ -115,10 +141,9 @@ def validate_args(args) -> None:
 def run_mobile_duo(args) -> None:
     """Bring up the three-bridge mobile duo simulation (blocks)."""
     from franka_sim.mobile_duo_runner import MobileDuoRunner, parse_bind_specs
-    from franka_sim.mobile_duo_sim import MobileDuoScene
 
     binds = parse_bind_specs(args.bind)
-    scene = MobileDuoScene(
+    scene = resolve_scene_class(args.physics)(
         args.scene_urdf,
         mesh_root=args.mesh_root,
         enable_vis=args.vis,
@@ -146,6 +171,7 @@ def run_mobile_duo(args) -> None:
         scene, binds, port=args.port, arm_urdf=args.urdf, spine_server=spine_server
     )
 
+    print(f"  physics backend -> {args.physics} (dt={scene.dt}s)")
     for role, host in binds.items():
         print(f"  {role:>5} bridge -> {host}:{args.port}")
     if spine_server is not None:
