@@ -1,0 +1,590 @@
+"""MuJoCo backend for the mobile-duo scene, behind the same adapter contract.
+
+Drop-in alternative to :class:`~franka_sim.mobile_duo_sim.MobileDuoScene`: the
+runner, the three FCI bridges and :class:`~franka_sim.mobile_duo_sim.SceneView`
+are unchanged, only the physics engine differs. Genesis' per-call kernel-launch
+overhead caps the shared scene at ~0.4x real time at dt=2.5 ms; MuJoCo's
+zero-copy ``qpos``/``qvel`` views hold real time at dt=1 ms, the rate the FCI
+bridges actually serve.
+
+Everything the two backends must agree on -- joint and link names, the initial
+arm pose, the actuator limits, the spine travel, the state-snapshot layout and
+the real-time-factor monitor -- is imported from ``mobile_duo_sim`` rather than
+restated here, so the two backends cannot drift apart.
+"""
+
+import logging
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Dict, Optional, Sequence
+
+import mujoco
+import numpy as np
+
+from franka_sim.franka_genesis_sim import ControlMode, resolve_fr3_joint_damping
+from franka_sim.mobile_duo_sim import (
+    ARM_EE_LINKS,
+    ARM_INITIAL_Q,
+    ARM_JOINT_NAMES,
+    ARM_ROLES,
+    FR3_FORCE_LIMITS,
+    ROLE_BASE,
+    ROLES,
+    SPINE_JOINT_NAME,
+    SPINE_LIMITS_M,
+    RealtimeFactorMonitor,
+    SceneView,
+    pose_to_column_major,
+)
+from franka_sim.swerve_base import SwerveBase, yaw_to_quat_wxyz
+from franka_sim.urdf_assets import resolve_urdf_meshes
+
+logger = logging.getLogger(__name__)
+
+#: Physics step (s). The FCI bridges serve 1 kHz, so a 1 ms step makes one
+#: physics step per commanded control cycle -- what the real robot does.
+DEFAULT_DT = 0.001
+
+#: Joint-space PD gains for POSITION mode (Nm/rad and Nm*s/rad), taken from the
+#: MuJoCo Menagerie ``franka_fr3`` position actuators. They reproduce the
+#: tracking stiffness Genesis' ``control_dofs_position`` defaults give on the
+#: same arm while staying stable at DEFAULT_DT with an explicit servo.
+ARM_POSITION_KP = np.array([4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000.0])
+ARM_POSITION_KD = np.array([450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0])
+
+#: VELOCITY-mode servo gain (Nm per rad/s of velocity error). Same magnitude as
+#: the position servo's damping term, so both modes saturate FR3_FORCE_LIMITS at
+#: comparable errors.
+ARM_VELOCITY_KV = ARM_POSITION_KD.copy()
+
+#: Rotor inertia reflected through the gearbox (kg*m^2), per arm DOF. The ROS
+#: URDF carries no ``armature``, which leaves the distal joints light enough for
+#: the explicit ARM_POSITION_KP servo to ring at DEFAULT_DT; the Menagerie FR3
+#: value damps that without measurably changing the arm's response.
+ARM_ARMATURE = 0.1
+
+#: Wheel servo gains. The wheels are report-only (the platform pose is
+#: integrated kinematically, see MujocoSwerveBase), so these only need to make
+#: ``q``/``dq`` follow the swerve IK targets over the wire.
+WHEEL_STEER_KP = 200.0
+WHEEL_STEER_KD = 10.0
+WHEEL_DRIVE_KV = 20.0
+
+#: Wheel actuator saturation (Nm), so a servo transient cannot inject a large
+#: impulse into the rest of the tree.
+WHEEL_FORCE_LIMIT = 50.0
+
+#: Rotor inertia (kg*m^2) given to the four TMR wheel DOFs. The URDF's drive
+#: wheel is only ~2e-3 kg*m^2 about its axle, which makes WHEEL_DRIVE_KV's
+#: explicit servo diverge at DEFAULT_DT (gain*dt/inertia >> 2). A geared wheel
+#: motor's reflected rotor inertia is of this order, so this both models the
+#: real drive and keeps the servo stable.
+WHEEL_ARMATURE = 0.05
+
+#: Settling steps run at build time, matching the Genesis scene's warm-up.
+SETTLE_STEPS = 100
+
+#: MuJoCo compiler settings injected into the URDF as a ``<mujoco>`` extension
+#: element. ``strippath=false`` keeps the absolute mesh paths that
+#: ``resolve_urdf_meshes`` wrote (MuJoCo defaults to basename-only for URDF);
+#: ``balanceinertia`` repairs the franka_description links whose inertia tensor
+#: violates the triangle inequality; ``fusestatic=false`` keeps every named link
+#: as its own body so link7 stays addressable for ``O_T_EE``.
+URDF_COMPILER_ATTRS = {
+    "strippath": "false",
+    "balanceinertia": "true",
+    "discardvisual": "false",
+    "fusestatic": "false",
+}
+
+
+def patch_urdf_for_mujoco(urdf_path) -> Path:
+    """Append the ``<mujoco><compiler .../></mujoco>`` extension to a URDF in place.
+
+    ``urdf_path`` must be a copy the caller owns (the temp file
+    ``resolve_urdf_meshes`` writes), never a checked-in asset.
+    """
+    urdf_path = Path(urdf_path)
+    tree = ET.parse(str(urdf_path))
+    root = tree.getroot()
+    for existing in root.findall("mujoco"):
+        root.remove(existing)
+    extension = ET.SubElement(root, "mujoco")
+    ET.SubElement(extension, "compiler", URDF_COMPILER_ATTRS)
+    tree.write(str(urdf_path), xml_declaration=True)
+    return urdf_path
+
+
+class MujocoSwerveBase(SwerveBase):
+    """:class:`SwerveBase` writing MuJoCo ``qpos``/``qfrc_applied`` directly.
+
+    The twist handling, swerve IK and pose integration are inherited unchanged,
+    so both backends drive the platform from identical math. Only the writes are
+    re-implemented: Genesis' ``set_pos``/``control_dofs_*`` entity calls have no
+    MuJoCo equivalent.
+
+    The chassis carries a freejoint purely so the pose *can* be written; it is
+    overwritten from the integrated pose every step (and its velocity zeroed),
+    exactly as in the Genesis scene, so tyre friction never propels the robot.
+    """
+
+    def __init__(self, model, data, base_height: float = 0.0):
+        super().__init__(entity=None, base_height=base_height)
+        self.model = model
+        self.data = data
+        self.root_qpos_adr: Optional[int] = None
+        self.steer_qpos_adr: Optional[np.ndarray] = None
+        self.drive_qpos_adr: Optional[np.ndarray] = None
+
+    def bind(self) -> None:
+        """Resolve the wheel and freejoint addresses. Call once, after compile.
+
+        Addresses are kept as ``intp`` arrays, not lists: they index ``qpos`` and
+        ``qvel`` several times per physics step and a list costs an array
+        conversion on every one of them.
+        """
+        self.steer_dofs_idx = _address_array(self.model, self.steer_joints, _joint_dof_adr)
+        self.drive_dofs_idx = _address_array(self.model, self.drive_joints, _joint_dof_adr)
+        self.steer_qpos_adr = _address_array(self.model, self.steer_joints, _joint_qpos_adr)
+        self.drive_qpos_adr = _address_array(self.model, self.drive_joints, _joint_qpos_adr)
+
+        root_joint = 0
+        if self.model.jnt_type[root_joint] != mujoco.mjtJoint.mjJNT_FREE:
+            raise RuntimeError("Expected the chassis freejoint to be joint 0 of the model")
+        self.root_qpos_adr = int(self.model.jnt_qposadr[root_joint])
+        self.root_dofs_idx = list(range(int(self.model.jnt_dofadr[root_joint]), 6))
+
+    def apply(self, dt: float) -> None:
+        """One physics step: servo the wheels, then teleport the chassis."""
+        steer_targets, drive_targets = self.solve()
+
+        steer_q = self.data.qpos[self.steer_qpos_adr]
+        steer_dq = self.data.qvel[self.steer_dofs_idx]
+        steer_tau = WHEEL_STEER_KP * (steer_targets - steer_q) - WHEEL_STEER_KD * steer_dq
+        self.data.qfrc_applied[self.steer_dofs_idx] = np.clip(
+            steer_tau, -WHEEL_FORCE_LIMIT, WHEEL_FORCE_LIMIT
+        )
+
+        drive_dq = self.data.qvel[self.drive_dofs_idx]
+        drive_tau = WHEEL_DRIVE_KV * (drive_targets - drive_dq)
+        self.data.qfrc_applied[self.drive_dofs_idx] = np.clip(
+            drive_tau, -WHEEL_FORCE_LIMIT, WHEEL_FORCE_LIMIT
+        )
+
+        x, y, theta = self.integrate_pose(dt)
+        adr = self.root_qpos_adr
+        self.data.qpos[adr : adr + 3] = (x, y, self.base_height)
+        self.data.qpos[adr + 3 : adr + 7] = yaw_to_quat_wxyz(theta)
+        self.data.qvel[:6] = 0.0
+
+    def wheel_state(self):
+        """Wheel ``(q, dq)`` as 4-element arrays in ``TMR_JOINT_ORDER``."""
+        steer_q = self.data.qpos[self.steer_qpos_adr]
+        drive_q = self.data.qpos[self.drive_qpos_adr]
+        steer_dq = self.data.qvel[self.steer_dofs_idx]
+        drive_dq = self.data.qvel[self.drive_dofs_idx]
+        positions = np.array([steer_q[0], drive_q[0], steer_q[1], drive_q[1]])
+        velocities = np.array([steer_dq[0], drive_dq[0], steer_dq[1], drive_dq[1]])
+        return positions, velocities
+
+
+def _joint_id(model, name: str) -> int:
+    """Resolve a joint name to its id, raising a named error when it is absent."""
+    joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    if joint_id < 0:
+        raise KeyError(f"Joint {name!r} not found in the compiled model")
+    return joint_id
+
+
+def _joint_qpos_adr(model, name: str) -> int:
+    """``qpos`` index of a scalar (hinge/slide) joint."""
+    return int(model.jnt_qposadr[_joint_id(model, name)])
+
+
+def _joint_dof_adr(model, name: str) -> int:
+    """``qvel``/``qfrc`` index of a scalar (hinge/slide) joint."""
+    return int(model.jnt_dofadr[_joint_id(model, name)])
+
+
+def _address_array(model, names: Sequence[str], resolve) -> np.ndarray:
+    """Resolve several joint names to an ``intp`` index array."""
+    return np.array([resolve(model, name) for name in names], dtype=np.intp)
+
+
+class MobileDuoMujocoScene:
+    """The single MuJoCo model holding the TMR base, the spine and both arms."""
+
+    def __init__(
+        self,
+        urdf_path,
+        mesh_root=None,
+        enable_vis: bool = False,
+        dt: float = DEFAULT_DT,
+        base_height: float = 0.05,
+    ):
+        self.urdf_path = Path(urdf_path)
+        self.mesh_root = mesh_root
+        self.enable_vis = enable_vis
+        self.dt = dt
+        self.base_height = base_height
+
+        self.model = None
+        self.data = None
+        self.viewer = None
+        self.running = False
+        self.swerve: Optional[MujocoSwerveBase] = None
+        self.arm_qpos_adr: Dict[str, np.ndarray] = {}
+        self.arm_dofs_idx: Dict[str, np.ndarray] = {}
+        self.arm_body_ids: Dict[str, int] = {}
+        self.spine_qpos_adr: Optional[int] = None
+        self.spine_dof_idx: Optional[int] = None
+
+        # Optional lift source: any object with ``position_m() -> float``, set by
+        # the runner from the spine stub. See MobileDuoScene for the contract.
+        self.spine_model = None
+
+        self.arm_control_modes = {role: ControlMode.POSITION for role in ARM_ROLES}
+        self.arm_torques = {role: np.zeros(7) for role in ARM_ROLES}
+        self.arm_joint_positions = {role: ARM_INITIAL_Q.copy() for role in ARM_ROLES}
+        self.arm_joint_velocities = {role: np.zeros(7) for role in ARM_ROLES}
+
+        self._prev_dq = {role: np.zeros(7) for role in ROLES}
+        self._ddq_filtered = {role: np.zeros(7) for role in ROLES}
+        self._alpha_acc = 0.95
+        self._resolved_urdf: Optional[Path] = None
+
+        empty = {
+            "q": np.zeros(7),
+            "dq": np.zeros(7),
+            "ddq": np.zeros(7),
+            "q_d": np.zeros(7),
+            "dq_d": np.zeros(7),
+            "ddq_d": np.zeros(7),
+            "tau_J": np.zeros(7),
+            "O_T_EE": np.eye(4).T.flatten(),
+        }
+        self._state_snapshots = {role: dict(empty) for role in ROLES}
+
+    # -- construction ------------------------------------------------------
+
+    def initialize_simulation(self) -> None:
+        """Compile the combined URDF and bind every joint group."""
+        self._resolved_urdf = resolve_urdf_meshes(self.urdf_path, mesh_root=self.mesh_root)
+        # Mirror MobileDuoScene: if anything below raises, stop() is never
+        # reached, so the resolved-URDF temp file would leak. Clean it up on the
+        # failure path and re-raise.
+        try:
+            self.model = self._compile_model(patch_urdf_for_mujoco(self._resolved_urdf))
+            self.data = mujoco.MjData(self.model)
+
+            self._bind_model()
+            self._configure_model()
+
+            for role in ARM_ROLES:
+                self.data.qpos[self.arm_qpos_adr[role]] = ARM_INITIAL_Q
+            mujoco.mj_forward(self.model, self.data)
+
+            for _ in range(SETTLE_STEPS):
+                self._apply_control()
+                mujoco.mj_step(self.model, self.data)
+            self._read_and_publish_state()
+        except Exception:
+            Path(self._resolved_urdf).unlink(missing_ok=True)
+            self._resolved_urdf = None
+            raise
+
+    def _compile_model(self, urdf_path: Path):
+        """Compile the patched URDF, giving the chassis a freejoint and a ground.
+
+        The URDF root link is welded to the world by MuJoCo's URDF importer.
+        ``add_freejoint`` on it is what makes the kinematic pose write in
+        :meth:`MujocoSwerveBase.apply` possible at all, and it lands at joint
+        index 0 (``qpos[0:7]``, ``qvel[0:6]``) because it is the first joint of
+        the first body.
+
+        Contacts are disabled model-wide. The chassis' URDF collision meshes
+        interpenetrate each other by up to 16 cm as authored (they are sized for
+        ROS collision *checking*, where neighbouring links are filtered out, not
+        for a contact solver), so enabling them makes the solver push the whole
+        tree apart and shove both arms off their commanded pose by ~0.8 rad. The
+        base pose is integrated kinematically and the arms are servo-driven, so
+        no contact in this scene is load-bearing for what the FCI bridges
+        report; the teleop stack does its own collision avoidance.
+        """
+        spec = mujoco.MjSpec.from_file(str(urdf_path))
+        spec.option.timestep = self.dt
+        spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+
+        chassis = spec.worldbody.bodies[0]
+        chassis.add_freejoint()
+
+        ground = spec.worldbody.add_geom()
+        ground.name = "ground_plane"
+        ground.type = mujoco.mjtGeom.mjGEOM_PLANE
+        ground.size = [0.0, 0.0, 0.05]
+        ground.rgba = [0.55, 0.55, 0.58, 1.0]
+        ground.contype = 0
+        ground.conaffinity = 0
+
+        light = spec.worldbody.add_light()
+        light.directional = True
+        light.pos = [0.0, 0.0, 4.0]
+        light.dir = [0.0, 0.0, -1.0]
+
+        return spec.compile()
+
+    def _bind_model(self) -> None:
+        """Resolve joint/body addresses once the model is compiled."""
+        self.arm_qpos_adr = {
+            role: _address_array(self.model, ARM_JOINT_NAMES[role], _joint_qpos_adr)
+            for role in ARM_ROLES
+        }
+        self.arm_dofs_idx = {
+            role: _address_array(self.model, ARM_JOINT_NAMES[role], _joint_dof_adr)
+            for role in ARM_ROLES
+        }
+        self.arm_body_ids = {}
+        for role in ARM_ROLES:
+            name = ARM_EE_LINKS[role]
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if body_id < 0:
+                raise KeyError(f"Link {name!r} not found in the compiled model")
+            self.arm_body_ids[role] = body_id
+
+        self.spine_qpos_adr = _joint_qpos_adr(self.model, SPINE_JOINT_NAME)
+        self.spine_dof_idx = _joint_dof_adr(self.model, SPINE_JOINT_NAME)
+
+        self.swerve = MujocoSwerveBase(self.model, self.data, base_height=self.base_height)
+        self.swerve.bind()
+        self.swerve.reset_pose()
+
+    def _configure_model(self) -> None:
+        """Apply gravity compensation, joint damping and arm armature."""
+        # The real FR3 reports tau_J with gravity already removed, and the
+        # Genesis scene loads the whole entity with gravity_compensation=1.0.
+        # MuJoCo's per-body gravcomp is the exact analogue: it cancels weight
+        # only, leaving Coriolis and the joint damping below intact.
+        self.model.body_gravcomp[:] = 1.0
+
+        damping = resolve_fr3_joint_damping()
+        logger.info("Arm joint damping (left + right): %s", damping)
+        for role in ARM_ROLES:
+            dofs = self.arm_dofs_idx[role]
+            self.model.dof_damping[dofs] = damping
+            self.model.dof_armature[dofs] = ARM_ARMATURE
+
+        # The wheel joints are state-report-only on the real TMR (the master
+        # closes their loop onboard). The URDF's viscous damping (5/20 Nm*s/rad)
+        # and Coulomb friction (1/5 Nm) would only make the proportional servos
+        # below under-report the commanded wheel speed and steering angle by a
+        # constant offset, so both are dropped and the DOFs get WHEEL_ARMATURE
+        # instead. The arms keep their URDF friction: that one is real.
+        wheel_dofs = np.concatenate([self.swerve.steer_dofs_idx, self.swerve.drive_dofs_idx])
+        self.model.dof_damping[wheel_dofs] = 0.0
+        self.model.dof_frictionloss[wheel_dofs] = 0.0
+        self.model.dof_armature[wheel_dofs] = WHEEL_ARMATURE
+
+    def view(self, role: str) -> SceneView:
+        """Return the simulator adapter for one bridge."""
+        if role not in ROLES:
+            raise ValueError(f"Unknown role {role!r}; expected one of {ROLES}")
+        return SceneView(self, role)
+
+    # -- command interface -------------------------------------------------
+
+    def set_arm_control_mode(self, role: str, mode: ControlMode) -> None:
+        """Set one arm's control mode (lock-free atomic reference swap)."""
+        if not isinstance(mode, ControlMode):
+            raise ValueError(f"Mode must be a ControlMode enum, got {type(mode)}")
+        logger.info("Arm %s control mode -> %s", role, mode.value)
+        self.arm_control_modes[role] = mode
+
+    def update_arm_torques(self, role: str, torques) -> None:
+        """Publish one arm's commanded torques."""
+        self.arm_torques[role] = np.asarray(torques, dtype=float)
+
+    def update_arm_joint_positions(self, role: str, positions) -> None:
+        """Publish one arm's commanded joint positions."""
+        self.arm_joint_positions[role] = np.asarray(positions, dtype=float)
+
+    def update_arm_joint_velocities(self, role: str, velocities) -> None:
+        """Publish one arm's commanded joint velocities."""
+        self.arm_joint_velocities[role] = np.asarray(velocities, dtype=float)
+
+    def update_base_twist(self, twist: Sequence[float]) -> None:
+        """Publish the base body-frame twist ``[vx, vy, vz, wx, wy, wz]``."""
+        self.swerve.set_twist(twist)
+
+    def set_spine_position(self, position_m: float) -> None:
+        """Place the lift carriage, clamped to the URDF's travel limits.
+
+        Kinematic, like the base pose: the real spine is a separate REST device
+        with its own closed-loop controller, so the sim only mirrors where it
+        says it is. Writing ``qpos``/``qvel`` for that one address touches no
+        other DOF, so unlike Genesis' entity-wide ``set_dofs_position`` it
+        cannot pin the arms.
+        """
+        lower, upper = SPINE_LIMITS_M
+        self.data.qpos[self.spine_qpos_adr] = min(max(float(position_m), lower), upper)
+        self.data.qvel[self.spine_dof_idx] = 0.0
+
+    def get_role_state(self, role: str) -> Dict[str, np.ndarray]:
+        """Latest snapshot for one role (lock-free read)."""
+        return self._state_snapshots[role]
+
+    # -- physics loop ------------------------------------------------------
+
+    def arm_control_torque(self, role: str) -> np.ndarray:
+        """Actuator torque for one arm this step, clamped to FR3_FORCE_LIMITS.
+
+        Gravity is not part of this: ``body_gravcomp`` already cancels it, so
+        TORQUE mode passes the client's command through unchanged -- the same
+        contract the real FCI offers.
+        """
+        mode = self.arm_control_modes[role]
+        if mode == ControlMode.TORQUE:
+            tau = self.arm_torques[role]
+        else:
+            qpos_adr = self.arm_qpos_adr[role]
+            dofs = self.arm_dofs_idx[role]
+            dq = self.data.qvel[dofs]
+            if mode == ControlMode.POSITION:
+                error = self.arm_joint_positions[role] - self.data.qpos[qpos_adr]
+                tau = ARM_POSITION_KP * error - ARM_POSITION_KD * dq
+            else:
+                tau = ARM_VELOCITY_KV * (self.arm_joint_velocities[role] - dq)
+        return np.clip(tau, -FR3_FORCE_LIMITS, FR3_FORCE_LIMITS)
+
+    def _apply_control(self) -> None:
+        """Apply one control step for the base, the lift and both arms."""
+        # qfrc_applied persists across steps, so every controlled DOF is
+        # rewritten each step and the uncontrolled ones (casters, rocker arm)
+        # are held at zero.
+        self.data.qfrc_applied[:] = 0.0
+
+        self.swerve.apply(self.dt)
+
+        if self.spine_model is not None:
+            self.set_spine_position(self.spine_model.position_m())
+
+        for role in ARM_ROLES:
+            self.data.qfrc_applied[self.arm_dofs_idx[role]] = self.arm_control_torque(role)
+
+    def _filtered_acceleration(self, role: str, dq: np.ndarray) -> np.ndarray:
+        """Low-passed numerical joint acceleration for one role."""
+        raw = (dq - self._prev_dq[role]) / self.dt
+        self._ddq_filtered[role] = (
+            self._alpha_acc * self._ddq_filtered[role] + (1 - self._alpha_acc) * raw
+        )
+        self._prev_dq[role] = dq.copy()
+        return self._ddq_filtered[role]
+
+    def _read_and_publish_state(self) -> None:
+        """Read the model once and publish one snapshot per role."""
+        snapshots = {}
+
+        for role in ARM_ROLES:
+            # Copies, not views: the snapshot is handed to the bridge threads
+            # and must not change under them when the next step runs.
+            q = np.array(self.data.qpos[self.arm_qpos_adr[role]])
+            dq = np.array(self.data.qvel[self.arm_dofs_idx[role]])
+            ddq = self._filtered_acceleration(role, dq)
+            body_id = self.arm_body_ids[role]
+            snapshots[role] = {
+                "q": q,
+                "dq": dq,
+                "ddq": ddq,
+                "q_d": self.arm_joint_positions[role],
+                "dq_d": dq,
+                "ddq_d": ddq,
+                "tau_J": self.arm_torques[role],
+                "O_T_EE": pose_to_column_major(self.data.xpos[body_id], self.data.xquat[body_id]),
+            }
+
+        wheel_q, wheel_dq = self.swerve.wheel_state()
+        q = np.zeros(7)
+        dq = np.zeros(7)
+        q[:4] = wheel_q
+        dq[:4] = wheel_dq
+        ddq = self._filtered_acceleration(ROLE_BASE, dq)
+        snapshots[ROLE_BASE] = {
+            "q": q,
+            "dq": dq,
+            "ddq": ddq,
+            "q_d": q,
+            "dq_d": dq,
+            "ddq_d": ddq,
+            "tau_J": np.zeros(7),
+            "O_T_EE": self.swerve.base_pose_matrix(),
+        }
+
+        self._state_snapshots = snapshots
+
+    def run_simulation(self) -> None:
+        """Physics loop, paced to wall-clock realtime (see MobileDuoScene)."""
+        logger.info("Starting mobile-duo MuJoCo simulation loop (dt=%.4fs)", self.dt)
+
+        next_step = time.perf_counter()
+        next_render = next_step
+        render_period = 1.0 / 30.0
+        rtf_monitor = RealtimeFactorMonitor(logger, next_step)
+
+        while self.running:
+            self._read_and_publish_state()
+            self._apply_control()
+            mujoco.mj_step(self.model, self.data)
+
+            # One local reference per iteration: stop() clears self.viewer, and
+            # it can run on another thread while this loop is between the None
+            # check and the sync.
+            viewer = self.viewer
+            now = time.perf_counter()
+            if viewer is not None and now >= next_render:
+                if not viewer.is_running():
+                    self.running = False
+                    break
+                viewer.sync()
+                next_render += render_period
+                if next_render < now:
+                    next_render = now + render_period
+
+            next_step += self.dt
+            slack = next_step - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            elif slack < -self.dt:
+                next_step = time.perf_counter()
+                next_render = max(next_render, next_step)
+
+            # Wall-clock RTF measured after pacing: when physics keeps up, the
+            # sleep above pads each iteration back to ~dt (RTF ~= 1); an
+            # overloaded step skips the sleep and the iteration runs long
+            # (RTF < 1). See RealtimeFactorMonitor.
+            rtf_monitor.update(time.perf_counter(), self.dt)
+
+    def start(self) -> None:
+        """Build (if needed) and run the physics loop in the calling thread."""
+        if self.model is None:
+            self.initialize_simulation()
+
+        if self.enable_vis and self.viewer is None:
+            import mujoco.viewer
+
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+
+        self.running = True
+        self.run_simulation()
+
+    def stop(self) -> None:
+        """Stop the loop, close the viewer and remove the generated URDF copy."""
+        self.running = False
+        if self.viewer is not None:
+            try:
+                self.viewer.close()
+            except Exception:
+                logger.exception("Error closing the MuJoCo viewer")
+            self.viewer = None
+        if self._resolved_urdf is not None:
+            Path(self._resolved_urdf).unlink(missing_ok=True)
+            self._resolved_urdf = None
