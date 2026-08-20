@@ -543,6 +543,206 @@ def test_set_cartesian_impedance(tcp_client, udp_client, sim_server, mock_genesi
     assert status == 0  # Success
 
 
+def test_set_guiding_mode(tcp_client, udp_client, sim_server, mock_genesis_sim):
+    """Test SetGuidingMode command handling.
+
+    Regression: without a response, a real libfranka client's setGuidingMode()
+    call blocks forever. The request is ``std::array<bool, 6> guiding_mode`` +
+    ``bool nullspace`` (7 bytes, no padding under pack(1)); no RobotState field
+    reflects guiding mode, so the handler is ACK-only.
+    """
+    assert perform_handshake(tcp_client)
+
+    guiding_mode = [True, False, True, False, True, False]
+    nullspace = True
+
+    payload = struct.pack("<7?", *guiding_mode, nullspace)
+    assert len(payload) == 7
+
+    command_id = 1
+    header = MessageHeader(Command.kSetGuidingMode, command_id, 12 + len(payload))
+    tcp_client.sendall(header.to_bytes() + payload)
+
+    tcp_client.settimeout(2.0)
+    response_header = MessageHeader.from_bytes(tcp_client.recv(12))
+    assert response_header.command == Command.kSetGuidingMode
+    assert response_header.command_id == command_id
+    assert response_header.size == 16  # Header (12) + status (1) + padding (3)
+
+    status = struct.unpack("<B3x", tcp_client.recv(4))[0]
+    assert status == 0  # Success
+
+
+def test_set_ee_to_k(tcp_client, udp_client, sim_server, mock_genesis_sim):
+    """Test SetEEToK command handling.
+
+    Request is a single ``std::array<double, 16> EE_T_K`` (128 bytes). The
+    real robot reflects EE_T_K back in RobotState, so verify the sim does too.
+    """
+    assert perform_handshake(tcp_client)
+
+    # Identity rotation with a translation in the last column (column-major 4x4).
+    ee_t_k = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.01, 0.02, 0.03, 1.0,
+    ]
+
+    payload = struct.pack("<16d", *ee_t_k)
+    assert len(payload) == 128
+
+    command_id = 1
+    header = MessageHeader(Command.kSetEEToK, command_id, 12 + len(payload))
+    tcp_client.sendall(header.to_bytes() + payload)
+
+    tcp_client.settimeout(2.0)
+    response_header = MessageHeader.from_bytes(tcp_client.recv(12))
+    assert response_header.command == Command.kSetEEToK
+    assert response_header.command_id == command_id
+    assert response_header.size == 16
+
+    status = struct.unpack("<B3x", tcp_client.recv(4))[0]
+    assert status == 0  # Success
+
+    assert np.allclose(sim_server.robot_state.state["EE_T_K"], ee_t_k)
+
+
+def test_set_ne_to_ee(tcp_client, udp_client, sim_server, mock_genesis_sim):
+    """Test SetNEToEE command handling.
+
+    Request is a single ``std::array<double, 16> NE_T_EE`` (128 bytes). The
+    real robot reflects NE_T_EE back in RobotState, so verify the sim does too.
+    """
+    assert perform_handshake(tcp_client)
+
+    ne_t_ee = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.1, 1.0,
+    ]
+
+    payload = struct.pack("<16d", *ne_t_ee)
+    assert len(payload) == 128
+
+    command_id = 1
+    header = MessageHeader(Command.kSetNEToEE, command_id, 12 + len(payload))
+    tcp_client.sendall(header.to_bytes() + payload)
+
+    tcp_client.settimeout(2.0)
+    response_header = MessageHeader.from_bytes(tcp_client.recv(12))
+    assert response_header.command == Command.kSetNEToEE
+    assert response_header.command_id == command_id
+    assert response_header.size == 16
+
+    status = struct.unpack("<B3x", tcp_client.recv(4))[0]
+    assert status == 0  # Success
+
+    assert np.allclose(sim_server.robot_state.state["NE_T_EE"], ne_t_ee)
+
+
+def test_set_load(tcp_client, udp_client, sim_server, mock_genesis_sim):
+    """Test SetLoad command handling.
+
+    Request is ``double m_load`` + ``std::array<double, 3> F_x_Cload`` +
+    ``std::array<double, 9> I_load`` (104 bytes, no padding). The real robot
+    reflects the mounted load back in RobotState, so verify the sim does too.
+    """
+    assert perform_handshake(tcp_client)
+
+    m_load = 1.5
+    f_x_cload = [0.01, 0.02, 0.03]
+    i_load = [0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.002]
+
+    payload = struct.pack("<d3d9d", m_load, *f_x_cload, *i_load)
+    assert len(payload) == 104
+
+    command_id = 1
+    header = MessageHeader(Command.kSetLoad, command_id, 12 + len(payload))
+    tcp_client.sendall(header.to_bytes() + payload)
+
+    tcp_client.settimeout(2.0)
+    response_header = MessageHeader.from_bytes(tcp_client.recv(12))
+    assert response_header.command == Command.kSetLoad
+    assert response_header.command_id == command_id
+    assert response_header.size == 16
+
+    status = struct.unpack("<B3x", tcp_client.recv(4))[0]
+    assert status == 0  # Success
+
+    assert sim_server.robot_state.state["m_load"] == pytest.approx(m_load)
+    assert np.allclose(sim_server.robot_state.state["F_x_Cload"], f_x_cload)
+    assert np.allclose(sim_server.robot_state.state["I_load"], i_load)
+
+
+# Payloads used by test_no_command_hangs below: one well-formed request per
+# guarded command, sized exactly per its libfranka_new v10 Request struct
+# (research_interface/robot/service_types.h, #pragma pack(push, 1)).
+_GUARD_COMMAND_PAYLOADS = {
+    Command.kStopMove: b"",
+    Command.kSetCollisionBehavior: struct.pack("<52d", *([10.0] * 52)),
+    Command.kSetJointImpedance: struct.pack("<7d", *([3000.0] * 7)),
+    Command.kSetCartesianImpedance: struct.pack("<6d", *([3000.0] * 6)),
+    Command.kSetGuidingMode: struct.pack("<7?", *([False] * 7)),
+    Command.kSetEEToK: struct.pack("<16d", *([0.0] * 16)),
+    Command.kSetNEToEE: struct.pack("<16d", *([0.0] * 16)),
+    Command.kSetLoad: struct.pack("<13d", *([0.0] * 13)),
+    Command.kAutomaticErrorRecovery: b"",
+    Command.kGetRobotModel: b"",
+}
+
+# kConnect is the handshake itself (exercised by perform_handshake() in every
+# test above) and kMove requires UDP command-loop sequencing to complete its
+# second (motion-finished) response -- both are documented exclusions rather
+# than a weaker guard, per test_move_command/test_stop_move_command above.
+_GUARD_EXCLUDED_COMMANDS = {Command.kConnect, Command.kMove}
+
+
+def _recv_exact(sock, size):
+    """Read exactly `size` bytes or raise, so a short/partial reply fails loudly."""
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed while reading response")
+        data.extend(chunk)
+    return bytes(data)
+
+
+@pytest.mark.parametrize("command", [c for c in Command if c not in _GUARD_EXCLUDED_COMMANDS])
+def test_no_command_hangs(command, tcp_client, udp_client, sim_server, mock_genesis_sim):
+    """Regression guard: every non-interactive v10 command gets a real TCP reply.
+
+    Before this fix, SetGuidingMode/SetEEToK/SetNEToEE/SetLoad had no handler
+    at all: the server read the header, matched no branch, and never replied --
+    a real libfranka client blocks forever on the TCP recv. This iterates every
+    command the v10 enum defines (except the documented interactive
+    exclusions) and asserts a well-formed response arrives within a bounded
+    timeout, so a silent server surfaces as a fast test failure/timeout, not a
+    hang.
+    """
+    assert perform_handshake(tcp_client)
+
+    payload = _GUARD_COMMAND_PAYLOADS[command]
+    command_id = 42
+    header = MessageHeader(command=command, command_id=command_id, size=12 + len(payload))
+    tcp_client.sendall(header.to_bytes() + payload)
+
+    tcp_client.settimeout(2.0)
+    response_header = MessageHeader.from_bytes(_recv_exact(tcp_client, 12))
+    assert response_header.command == command
+    assert response_header.command_id == command_id
+    assert response_header.size >= 12
+
+    # Drain and sanity-check the rest of the reply so a truncated/garbage body
+    # (not just a header) also fails the guard.
+    remaining = response_header.size - 12
+    if remaining > 0:
+        body = _recv_exact(tcp_client, remaining)
+        assert len(body) == remaining
+
+
 def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_genesis_sim):
     """Test handling of motion_generation_finished flag"""
     assert perform_handshake(tcp_client)

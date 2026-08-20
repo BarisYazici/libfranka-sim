@@ -255,3 +255,76 @@ class SetCartesianImpedanceCommand:
         # Total expected size: 6 * 8 = 48 bytes
         K_x = list(struct.unpack("<6d", data[:48]))
         return cls(K_x)
+
+
+@dataclass
+class SetGuidingModeCommand:
+    """Represents a SetGuidingMode command request.
+
+    Matches ``research_interface::robot::SetGuidingMode::Request`` (service_types.h):
+    ``std::array<bool, 6> guiding_mode`` + ``bool nullspace``, 1 byte each under
+    ``#pragma pack(push, 1)`` -> 7 bytes total, no padding.
+    """
+
+    guiding_mode: list[bool]  # 6 elements (x, y, z, roll, pitch, yaw)
+    nullspace: bool
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SetGuidingModeCommand":
+        """Parse SetGuidingMode command from binary data (7 bytes: 6 bool + 1 bool)."""
+        values = struct.unpack("<7?", data[:7])
+        return cls(list(values[:6]), values[6])
+
+
+@dataclass
+class SetEEToKCommand:
+    """Represents a SetEEToK command request.
+
+    Matches ``research_interface::robot::SetEEToK::Request``: a single
+    ``std::array<double, 16> EE_T_K`` (column-major 4x4 transform) -> 128 bytes.
+    """
+
+    EE_T_K: list[float]  # 16 elements, column-major 4x4 transform
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SetEEToKCommand":
+        """Parse SetEEToK command from binary data (16 doubles = 128 bytes)."""
+        return cls(list(struct.unpack("<16d", data[:128])))
+
+
+@dataclass
+class SetNEToEECommand:
+    """Represents a SetNEToEE command request.
+
+    Matches ``research_interface::robot::SetNEToEE::Request``: a single
+    ``std::array<double, 16> NE_T_EE`` (column-major 4x4 transform) -> 128 bytes.
+    """
+
+    NE_T_EE: list[float]  # 16 elements, column-major 4x4 transform
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SetNEToEECommand":
+        """Parse SetNEToEE command from binary data (16 doubles = 128 bytes)."""
+        return cls(list(struct.unpack("<16d", data[:128])))
+
+
+@dataclass
+class SetLoadCommand:
+    """Represents a SetLoad command request.
+
+    Matches ``research_interface::robot::SetLoad::Request``: ``double m_load``
+    + ``std::array<double, 3> F_x_Cload`` + ``std::array<double, 9> I_load`` ->
+    8 + 24 + 72 = 104 bytes, no padding under ``#pragma pack(push, 1)``.
+    """
+
+    m_load: float
+    F_x_Cload: list[float]  # 3 elements
+    I_load: list[float]  # 9 elements (3x3 inertia matrix)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SetLoadCommand":
+        """Parse SetLoad command from binary data (1 double + 3 doubles + 9 doubles)."""
+        m_load = struct.unpack("<d", data[:8])[0]
+        F_x_Cload = list(struct.unpack("<3d", data[8:32]))
+        I_load = list(struct.unpack("<9d", data[32:104]))
+        return cls(m_load, F_x_Cload, I_load)

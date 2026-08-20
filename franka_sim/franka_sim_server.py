@@ -28,7 +28,11 @@ from franka_sim.franka_protocol import (
     MoveStatus,
     SetCartesianImpedanceCommand,
     SetCollisionBehaviorCommand,
+    SetEEToKCommand,
+    SetGuidingModeCommand,
     SetJointImpedanceCommand,
+    SetLoadCommand,
+    SetNEToEECommand,
     convert_to_libfranka_controller_mode,
     convert_to_libfranka_motion_mode,
 )
@@ -817,6 +821,145 @@ class FrankaSimServer:
             response_data = struct.pack("<B3x", 1)  # Status 1 = Error
             client_socket.sendall(header_bytes + response_data)
 
+    def handle_set_guiding_mode_command(
+        self, client_socket, header: MessageHeader, payload: bytes
+    ):
+        """Handle SetGuidingMode command received over TCP.
+
+        Without a response, a real libfranka client blocks forever (the
+        setGuidingMode() call has no way to complete). No RobotState field
+        reflects the guiding mode, so this is ACK-only, mirroring the
+        SetCollisionBehavior no-op pattern.
+        """
+        try:
+            # Parse the command
+            cmd = SetGuidingModeCommand.from_bytes(payload)
+            logger.info("Received SetGuidingMode command with values:")
+            logger.debug(f"Guiding mode: {cmd.guiding_mode}, nullspace: {cmd.nullspace}")
+
+            # For now, just acknowledge the command without actually implementing behavior
+            # Send success response (status = 0)
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(Command.kSetGuidingMode, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 0)  # 1 byte status + 3 bytes padding
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent SetGuidingMode success response")
+
+        except Exception as e:
+            logger.error(f"Error handling SetGuidingMode command: {e}")
+            # Send error response (status = 1)
+            total_size = 12 + 4
+            response_header = MessageHeader(Command.kSetGuidingMode, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 1)  # Status 1 = Error
+            client_socket.sendall(header_bytes + response_data)
+
+    def handle_set_ee_to_k_command(self, client_socket, header: MessageHeader, payload: bytes):
+        """Handle SetEEToK command received over TCP.
+
+        The real robot reflects EE_T_K (stiffness frame relative to the
+        end-effector) back in RobotState, so store it there too.
+        """
+        try:
+            # Parse the command
+            cmd = SetEEToKCommand.from_bytes(payload)
+            logger.info("Received SetEEToK command with values:")
+            logger.debug(f"EE_T_K: {cmd.EE_T_K}")
+
+            # Reflect EE_T_K in subsequent RobotState broadcasts, like the real robot.
+            self.robot_state.state["EE_T_K"] = cmd.EE_T_K
+
+            # Send success response (status = 0)
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(Command.kSetEEToK, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 0)  # 1 byte status + 3 bytes padding
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent SetEEToK success response")
+
+        except Exception as e:
+            logger.error(f"Error handling SetEEToK command: {e}")
+            # Send error response (status = 1)
+            total_size = 12 + 4
+            response_header = MessageHeader(Command.kSetEEToK, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 1)  # Status 1 = Error
+            client_socket.sendall(header_bytes + response_data)
+
+    def handle_set_ne_to_ee_command(self, client_socket, header: MessageHeader, payload: bytes):
+        """Handle SetNEToEE command received over TCP.
+
+        The real robot reflects NE_T_EE (end-effector relative to the
+        nominal end-effector, i.e. the flange-mount frame) back in
+        RobotState, so store it there too.
+        """
+        try:
+            # Parse the command
+            cmd = SetNEToEECommand.from_bytes(payload)
+            logger.info("Received SetNEToEE command with values:")
+            logger.debug(f"NE_T_EE: {cmd.NE_T_EE}")
+
+            # Reflect NE_T_EE in subsequent RobotState broadcasts, like the real robot.
+            self.robot_state.state["NE_T_EE"] = cmd.NE_T_EE
+
+            # Send success response (status = 0)
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(Command.kSetNEToEE, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 0)  # 1 byte status + 3 bytes padding
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent SetNEToEE success response")
+
+        except Exception as e:
+            logger.error(f"Error handling SetNEToEE command: {e}")
+            # Send error response (status = 1)
+            total_size = 12 + 4
+            response_header = MessageHeader(Command.kSetNEToEE, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 1)  # Status 1 = Error
+            client_socket.sendall(header_bytes + response_data)
+
+    def handle_set_load_command(self, client_socket, header: MessageHeader, payload: bytes):
+        """Handle SetLoad command received over TCP.
+
+        The real robot reflects the externally-mounted load (mass, center of
+        mass, inertia) back in RobotState, so store it there too.
+        """
+        try:
+            # Parse the command
+            cmd = SetLoadCommand.from_bytes(payload)
+            logger.info("Received SetLoad command with values:")
+            logger.debug(
+                f"m_load: {cmd.m_load}, F_x_Cload: {cmd.F_x_Cload}, I_load: {cmd.I_load}"
+            )
+
+            # Reflect the load in subsequent RobotState broadcasts, like the real robot.
+            self.robot_state.state["m_load"] = cmd.m_load
+            self.robot_state.state["F_x_Cload"] = cmd.F_x_Cload
+            self.robot_state.state["I_load"] = cmd.I_load
+
+            # Send success response (status = 0)
+            total_size = 12 + 4  # Header (12) + status (1) + padding (3)
+            response_header = MessageHeader(Command.kSetLoad, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 0)  # 1 byte status + 3 bytes padding
+
+            client_socket.sendall(header_bytes + response_data)
+            logger.info("Sent SetLoad success response")
+
+        except Exception as e:
+            logger.error(f"Error handling SetLoad command: {e}")
+            # Send error response (status = 1)
+            total_size = 12 + 4
+            response_header = MessageHeader(Command.kSetLoad, header.command_id, total_size)
+            header_bytes = response_header.to_bytes()
+            response_data = struct.pack("<B3x", 1)  # Status 1 = Error
+            client_socket.sendall(header_bytes + response_data)
+
     def handle_automatic_error_recovery_command(
         self, client_socket, header: MessageHeader, payload: bytes
     ):
@@ -897,6 +1040,18 @@ class FrankaSimServer:
                 elif header.command == Command.kSetCartesianImpedance:
                     logger.info("Handling SetCartesianImpedance command")
                     self.handle_set_cartesian_impedance_command(client_socket, header, payload)
+                elif header.command == Command.kSetGuidingMode:
+                    logger.info("Handling SetGuidingMode command")
+                    self.handle_set_guiding_mode_command(client_socket, header, payload)
+                elif header.command == Command.kSetEEToK:
+                    logger.info("Handling SetEEToK command")
+                    self.handle_set_ee_to_k_command(client_socket, header, payload)
+                elif header.command == Command.kSetNEToEE:
+                    logger.info("Handling SetNEToEE command")
+                    self.handle_set_ne_to_ee_command(client_socket, header, payload)
+                elif header.command == Command.kSetLoad:
+                    logger.info("Handling SetLoad command")
+                    self.handle_set_load_command(client_socket, header, payload)
                 elif header.command == Command.kGetRobotModel:
                     logger.info("Handling GetRobotModel command")
                     self.handle_get_robot_model(client_socket, header)
