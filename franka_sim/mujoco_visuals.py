@@ -31,7 +31,7 @@ an MJCF material with that material's diffuse rgba.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import mujoco
 
@@ -347,6 +347,119 @@ def apply_dae_material_visuals(
         len(palette.material_names),
     )
     return added
+
+
+#: The lift's grey (and shading-darkened white) materials, keyed by the link
+#: that draws them, mapped to a flat neutral Franka white. Picked by rendering
+#: the scene and identifying, geom by geom, which material actually forms the
+#: visible column -- see the module docstring addendum below for the evidence.
+#:
+#: ``franka_spine`` (the fixed vertical column) draws 692 of its 2651
+#: triangles in a genuine mid-grey (0.412) trim panel; the rest is already a
+#: 0.98 near-white. ``mount_link`` (the arm-mount plate the column's prismatic
+#: joint carries) is the surprise: its *dominant* submesh by far -- 222,326 of
+#: its 254,792 triangles, the whole ``fr3_duo_mount.dae`` body -- is a genuine
+#: mid-grey (0.439), with only the smaller ``fr3_duo_cover.dae`` (32,466
+#: triangles) already white. Both links' near-white submeshes are included too
+#: (colour unchanged) purely so :func:`apply_lift_color_overrides` can give them
+#: a private material to brighten without touching the shared palette entry
+#: ``base_link``'s correct rim white reuses.
+LINK_COLOR_OVERRIDES: Dict[str, Dict[Rgba, Rgba]] = {
+    "franka_spine": {
+        (0.412, 0.412, 0.412, 1.0): (0.95, 0.95, 0.95, 1.0),
+        (0.980, 0.980, 0.980, 1.0): (0.980, 0.980, 0.980, 1.0),
+    },
+    "mount_link": {
+        (0.439, 0.439, 0.439, 1.0): (0.95, 0.95, 0.95, 1.0),
+        (1.000, 1.000, 1.000, 1.0): (1.000, 1.000, 1.000, 1.0),
+    },
+}
+
+#: Emissive boost given to every material :func:`apply_lift_color_overrides`
+#: touches. The scene lights the lift with a single top-down directional light
+#: plus MuJoCo's default headlight (ambient 0.1) -- there is no fill light --
+#: so a correctly-white 0.98 diffuse column face that does not point at either
+#: light shades down to as little as 0.42 once rendered (measured on
+#: ``franka_spine``'s dominant submesh, the actual visible pillar). A flat rgba
+#: swap cannot fix that: the material was never mis-coloured, the shading was
+#: doing the darkening. Emission adds a light-independent floor to the
+#: material's own colour, which does: 0.45 brings that same worst-case face
+#: back up to ~0.83 in the render while leaving the better-lit faces close to
+#: fully white, instead of flattening every face to identical white.
+LIFT_EMISSION = 0.45
+
+
+def apply_lift_color_overrides(
+    scene_spec: mujoco.MjSpec,
+    overrides: Dict[str, Dict[Rgba, Rgba]] = LINK_COLOR_OVERRIDES,
+    emission: float = LIFT_EMISSION,
+) -> int:
+    """Brighten the lift assembly's grey materials to a neutral Franka white.
+
+    Mutates ``scene_spec`` in place and returns the number of geoms
+    repainted. Must run after :func:`apply_dae_material_visuals`, once each
+    matching geom already wears one of that function's shared-by-colour
+    materials -- this only ever swaps a geom's ``material`` reference, it never
+    edits mesh geometry, mass, or any other physics property.
+
+    A shared material cannot be brightened in place: ``franka_spine``'s 0.98
+    near-white is the exact same MJCF material ``base_link``'s (correct,
+    untouched) rim reuses, since :class:`_DaePalette` keys materials by colour
+    across the whole scene. So every matching geom instead gets its own
+    private, link-scoped copy of the colour -- one add_material() per distinct
+    (link, new colour) pair, reused across that link's own geoms -- which is
+    also what lets this repaint the lift without ever touching ``base_link``
+    or the arms, whose greys/whites are correct as authored.
+
+    ``overrides`` and ``emission`` default to the module constants but take an
+    explicit link/colour, so a caller (or a test) can restrict or replace the
+    picked colours without editing this function.
+    """
+    materials = {material.name: material for material in scene_spec.materials}
+    private_material_names: Dict[Tuple[str, Rgba], str] = {}
+    repainted = 0
+
+    for link, colour_map in overrides.items():
+        body = scene_spec.find_body(link)
+        if body is None:
+            logger.debug("Lift colour override skipped: no body named %r", link)
+            continue
+        for geom in body.geoms:
+            if not _is_visual(geom) or not geom.material:
+                continue
+            source = materials.get(geom.material)
+            if source is None:
+                continue
+            # ``source.rgba`` is a float32 numpy array: round() on a float32
+            # scalar rounds within float32 precision (e.g. 0.9800000190734863
+            # for the DAE's 0.98), which compares unequal to the plain Python
+            # float64 literals in ``overrides``. Casting to float first rounds
+            # in float64, landing on the same value the literals parse to.
+            old_rgba = tuple(round(float(channel), 3) for channel in source.rgba)
+            new_rgba = colour_map.get(old_rgba)
+            if new_rgba is None:
+                continue
+
+            key = (link, new_rgba)
+            private_name = private_material_names.get(key)
+            if private_name is None:
+                private_name = f"{DAE_ASSET_PREFIX}lift_{link}_{len(private_material_names)}"
+                private = scene_spec.add_material()
+                private.name = private_name
+                private.rgba = new_rgba
+                private.emission = emission
+                private_material_names[key] = private_name
+                materials[private_name] = private
+            geom.material = private_name
+            repainted += 1
+
+    logger.info(
+        "Brightened %d lift-assembly geoms to Franka white (emission=%.2f) across %d links",
+        repainted,
+        emission,
+        len({link for link, _ in private_material_names}),
+    )
+    return repainted
 
 
 def _split_or_none(dae_path: Path, cache_dir) -> Optional[List[MaterialSubmesh]]:

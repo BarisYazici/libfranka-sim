@@ -672,6 +672,65 @@ def test_the_lift_column_is_not_one_flat_colour(scene):
     assert luminance[-1] > 0.9, f"the lift has no light panel: {colours}"
 
 
+def dominant_visual_material(built, body_name):
+    """The rgba of one body's visible geom with the most mesh triangles.
+
+    Triangle count is what :data:`~franka_sim.mujoco_visuals.LINK_COLOR_OVERRIDES`
+    was picked by: it is the geom that actually reads as "the surface" of a
+    link in a render, as opposed to a thin trim panel that happens to also
+    carry a ``<visual>`` element of its own.
+    """
+    geoms = visible_geoms_of(built, body_name)
+    dominant = max(geoms, key=lambda g: built.model.mesh_facenum[built.model.geom_dataid[g]])
+    matid = int(built.model.geom_matid[dominant])
+    rgba = built.model.mat_rgba[matid] if matid >= 0 else built.model.geom_rgba[dominant]
+    return tuple(np.round(rgba, 6))
+
+
+@pytest.mark.parametrize("link", ["franka_spine", "mount_link"])
+def test_the_lift_columns_dominant_material_reads_as_franka_white(scene, link):
+    """The user-visible fix: each lift link's biggest submesh is near-white.
+
+    ``mount_link`` is the surprising one: its dominant submesh by triangle
+    count (222,326 of 254,792 triangles) is ``fr3_duo_mount.dae``'s own
+    mid-grey (0.439), not the small white ``fr3_duo_cover.dae`` sitting on top
+    of it -- without the override this assertion fails on ``mount_link`` even
+    though ``base_link``'s and the arms' materials are all correct as authored.
+    """
+    rgba = dominant_visual_material(scene, link)
+    luminance = sum(rgba[:3]) / 3.0
+    assert luminance > 0.9, f"{link}'s dominant visual material is not white-ish: {rgba}"
+
+
+def test_the_lift_colour_override_leaves_the_chassis_and_arms_alone(scene):
+    """The brightening is scoped to the lift, not a blanket repaint.
+
+    ``base_link`` reuses ``franka_spine``'s exact white MJCF material for its
+    rim (both come from the same 0.98 COLLADA colour, deduplicated by the
+    palette), so a naive in-place material edit would have brightened the TMR
+    chassis too. It must not: the override gives the lift links private
+    material copies instead.
+
+    Rounded to 3 decimals rather than reusing ``visual_colours_of``'s 6: the
+    rgba values come back as float32, and float32 rounded to 6 decimals does
+    not reliably equal the float64 literals below (it does at 3).
+    """
+    colours = {
+        tuple(round(float(channel), 3) for channel in rgba)
+        for rgba in (
+            scene.model.mat_rgba[int(scene.model.geom_matid[g])]
+            for g in visible_geoms_of(scene, "base_link")
+        )
+    }
+    assert colours == {
+        (0.0, 0.0, 0.0, 1.0),
+        (0.745, 0.196, 0.196, 1.0),
+        (0.745, 0.745, 0.745, 1.0),
+        (0.937, 0.937, 0.153, 1.0),
+        (0.98, 0.98, 0.98, 1.0),
+    }
+
+
 def test_a_single_material_dae_becomes_a_single_coloured_geom(scene):
     """One material is the right answer for the head, not a failed split."""
     (geom,) = visible_geoms_of(scene, "head_link")

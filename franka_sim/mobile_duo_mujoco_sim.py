@@ -38,7 +38,11 @@ from franka_sim.mobile_duo_common import (
     SPINE_LIMITS_M,
     SceneView,
 )
-from franka_sim.mujoco_visuals import apply_dae_material_visuals, apply_fr3v2_visuals
+from franka_sim.mujoco_visuals import (
+    apply_dae_material_visuals,
+    apply_fr3v2_visuals,
+    apply_lift_color_overrides,
+)
 from franka_sim.sim_common import (
     FR3_FORCE_LIMITS,
     RealtimeFactorMonitor,
@@ -448,6 +452,13 @@ class MobileDuoMujocoScene:
             "chassis and lift COLLADA",
             lambda: apply_dae_material_visuals(spec, self.urdf_path, mesh_root=self.mesh_root),
         )
+        if repainted:
+            # Runs only once the COLLADA split above has actually given
+            # franka_spine/mount_link their per-material palette -- without
+            # it there is nothing for the colour map to match against.
+            self._apply_visual_upgrade(
+                "lift Franka-white brightening", lambda: apply_lift_color_overrides(spec)
+            )
         swapped = self._apply_visual_upgrade(
             "Menagerie FR3 v2 arm", lambda: apply_fr3v2_visuals(spec)
         )
