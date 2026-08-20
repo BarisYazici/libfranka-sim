@@ -1,29 +1,47 @@
-"""Give the mobile-duo scene's two arms the MuJoCo Menagerie FR3 v2 visuals.
+"""Repaint a URDF-imported MuJoCo scene that the COLLADA merge left flat grey.
 
 The combined ``mobile_fr3_duo.urdf`` references the franka_description COLLADA
 visuals, and :func:`~franka_sim.urdf_assets.resolve_urdf_meshes` has to merge
 each of those into a single ``.obj`` before MuJoCo (or Genesis) will load it.
-Merging throws the per-submesh materials away, so every arm link renders in one
-flat default grey and the two FR3s read as clay models.
+Merging throws the per-submesh materials away, so every link renders in one flat
+default grey: the FR3s read as clay models, the TMR platform as a grey slab and
+the lift as a featureless dark box.
 
-The Menagerie's ``franka_fr3_v2`` model carries the same geometry already split
-per material by ``obj2mjcf``: one ``.obj`` per (link, material) pair plus the
-matching ``<material>`` palette. Its ``fr3v2_link0..7`` body frames are the
-identical FR3 kinematic frames the URDF uses -- verified numerically to 1e-15
-against the compiled scene -- so the visuals can simply be transplanted onto the
-URDF's ``left_fr3v2_link*`` / ``right_fr3v2_link*`` bodies.
+Both halves of the fix work on the :class:`mujoco.MjSpec` of an already-imported
+URDF, and both are *visual-only*: they only ever delete and add non-colliding,
+zero-density geoms, so masses, inertias, collision geoms, joints, DOF properties
+and actuators come out bit-identical. Both are optional -- when either source
+cannot be read the caller keeps the merged visuals and the scene still runs.
 
-This is a *visual-only* transplant: it deletes and adds non-colliding geoms with
-zero density, so masses, inertias, collision geoms, joints and actuators are
-untouched. When the Menagerie model cannot be resolved the caller keeps the
-converted-URDF visuals; nothing here is required for the scene to run.
+:func:`apply_fr3v2_visuals` handles the two arms. The Menagerie's
+``franka_fr3_v2`` model carries the same geometry already split per material by
+``obj2mjcf``: one ``.obj`` per (link, material) pair plus the matching
+``<material>`` palette. Its ``fr3v2_link0..7`` body frames are the identical FR3
+kinematic frames the URDF uses -- verified numerically to 1e-15 against the
+compiled scene -- so the visuals can simply be transplanted onto the URDF's
+``left_fr3v2_link*`` / ``right_fr3v2_link*`` bodies.
+
+:func:`apply_dae_material_visuals` handles everything else -- the TMR chassis,
+the lift column, the arm mount and the head -- which has no Menagerie
+counterpart. There the colours are recovered from the source COLLADA itself:
+:func:`~franka_sim.urdf_assets.split_dae_by_material` re-splits each ``.dae``
+into one ``.obj`` per material, and each of those becomes its own geom wearing
+an MJCF material with that material's diffuse rgba.
 """
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import mujoco
+
+from franka_sim.urdf_assets import (
+    DEFAULT_CACHE_DIR,
+    MaterialSubmesh,
+    Rgba,
+    link_visual_dae_meshes,
+    split_dae_by_material,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +56,11 @@ FR3V2_VISUAL_LINKS = tuple(range(8))
 
 #: Body-name prefixes of the two arms inside the combined URDF.
 ARM_BODY_PREFIXES = ("left_", "right_")
+
+#: Namespace for the mesh and material assets derived from the URDF's own
+#: COLLADA visuals, so they cannot collide with the names MuJoCo's URDF importer
+#: already gave the merged meshes (which stay in the spec, unreferenced).
+DAE_ASSET_PREFIX = "dae_"
 
 
 def resolve_fr3v2_mjcf() -> Path:
@@ -187,3 +210,159 @@ def apply_fr3v2_visuals(
         mjcf_path,
     )
     return added
+
+
+class _DaePalette:
+    """Adds one ``<mesh>`` per submesh and one ``<material>`` per colour, once each.
+
+    Materials are keyed by colour rather than by (link, material) pair, so the
+    white the TMR platform and the lift column share ends up as one MJCF
+    material instead of one per link.
+    """
+
+    def __init__(self, scene_spec: mujoco.MjSpec):
+        self._scene = scene_spec
+        self.meshes: List[str] = []
+        self.material_names: List[str] = []
+
+    def mesh(self, path: Path) -> str:
+        """Namespaced name of a submesh asset, adding it on first reference."""
+        name = DAE_ASSET_PREFIX + path.stem
+        if name not in self.meshes:
+            mesh = self._scene.add_mesh()
+            mesh.name = name
+            mesh.file = str(path)
+            self.meshes.append(name)
+        return name
+
+    def material(self, rgba: Rgba) -> str:
+        """Namespaced name of a material for one rgba, adding it on first use."""
+        name = DAE_ASSET_PREFIX + "".join(f"{int(round(channel * 255)):02x}" for channel in rgba)
+        if name not in self.material_names:
+            material = self._scene.add_material()
+            material.name = name
+            material.rgba = rgba
+            self.material_names.append(name)
+        return name
+
+
+def _split_link_visual(
+    body, geom, submeshes: Sequence[MaterialSubmesh], palette, index: int
+) -> int:
+    """Replace one merged visual geom with one geom per material. Returns the count.
+
+    The replacements inherit the original geom's ``pos``/``quat``/``group``, so
+    a link whose ``<visual>`` carried an ``<origin>`` (the FR3 duo cover sits
+    68 mm up its mount) keeps it. ``index`` seeds the generated geom names and
+    must be unique within the body: ``mount_link`` splits two COLLADA files.
+    """
+    pos = tuple(geom.pos)
+    quat = tuple(geom.quat)
+    group = geom.group
+    geom.delete()
+
+    for offset, submesh in enumerate(submeshes):
+        replacement = body.add_geom()
+        replacement.name = f"{body.name}_visual{index + offset}"
+        replacement.type = mujoco.mjtGeom.mjGEOM_MESH
+        replacement.meshname = palette.mesh(submesh.path)
+        replacement.material = palette.material(submesh.rgba)
+        replacement.group = group
+        replacement.pos = pos
+        replacement.quat = quat
+        # Visual-only, and provably so: a zero-density massless geom cannot
+        # reach the inertia the compiler gives the body, whatever
+        # ``inertiafromgeom`` is set to.
+        replacement.contype = 0
+        replacement.conaffinity = 0
+        replacement.density = 0.0
+        replacement.mass = 0.0
+    return len(submeshes)
+
+
+def apply_dae_material_visuals(
+    scene_spec: mujoco.MjSpec,
+    urdf_path,
+    mesh_root=None,
+    skip_body_prefixes: Sequence[str] = ARM_BODY_PREFIXES,
+    cache_dir=DEFAULT_CACHE_DIR,
+) -> int:
+    """Repaint the non-arm links from the colours in their source COLLADA files.
+
+    Mutates ``scene_spec`` in place and returns the number of visual geoms
+    added. ``urdf_path`` is the *original* URDF (the one whose ``<visual>``
+    elements still name ``.dae`` files), and ``mesh_root`` resolves its
+    ``package://`` references, exactly as for
+    :func:`~franka_sim.urdf_assets.resolve_urdf_meshes`.
+
+    The arm links are skipped by default because :func:`apply_fr3v2_visuals`
+    gives them better visuals than their COLLADA carries -- and because it would
+    then be replacing geoms this function had already multiplied, which the
+    positional link-to-geom mapping below cannot express.
+
+    Every failure mode is per-``<visual>`` and non-fatal: a link whose geoms do
+    not line up with its ``<visual>`` elements, or a ``.dae`` ``trimesh`` cannot
+    split, simply keeps the merged grey visual it already had.
+    """
+    palette = _DaePalette(scene_spec)
+    replaced = 0
+    added = 0
+
+    for link, dae_files in link_visual_dae_meshes(urdf_path, mesh_root).items():
+        if any(link.startswith(prefix) for prefix in skip_body_prefixes):
+            continue
+        if not any(dae_files):
+            continue
+        body = scene_spec.find_body(link)
+        if body is None:
+            logger.debug("Link %r has COLLADA visuals but no body in the scene", link)
+            continue
+
+        visuals = [geom for geom in body.geoms if _is_visual(geom)]
+        if len(visuals) != len(dae_files):
+            logger.warning(
+                "Keeping %r's merged visuals: it has %d visual geoms but %d <visual> elements",
+                link,
+                len(visuals),
+                len(dae_files),
+            )
+            continue
+
+        on_body = 0
+        for geom, dae_path in zip(visuals, dae_files):
+            if dae_path is None:
+                continue
+            submeshes = _split_or_none(dae_path, cache_dir)
+            if not submeshes:
+                continue
+            replaced += 1
+            on_body += _split_link_visual(body, geom, submeshes, palette, on_body)
+        added += on_body
+
+    logger.info(
+        "Repainted %d merged COLLADA visuals as %d per-material geoms (%d meshes, %d materials)",
+        replaced,
+        added,
+        len(palette.meshes),
+        len(palette.material_names),
+    )
+    return added
+
+
+def _split_or_none(dae_path: Path, cache_dir) -> Optional[List[MaterialSubmesh]]:
+    """Split one ``.dae`` by material, or None when it cannot be split.
+
+    ``trimesh`` is an optional dependency and COLLADA is a large format, so this
+    can fail for anything from a missing import to an unsupported ``<effect>``;
+    none of that is worth failing a scene build over.
+    """
+    try:
+        return split_dae_by_material(dae_path, cache_dir)
+    except Exception as exc:
+        logger.info(
+            "Keeping the merged visual for %s; it could not be split by material (%s: %s)",
+            dae_path,
+            type(exc).__name__,
+            exc,
+        )
+        return None

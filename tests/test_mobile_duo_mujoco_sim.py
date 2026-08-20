@@ -18,11 +18,6 @@ import pytest
 mujoco = pytest.importorskip("mujoco")
 
 from franka_sim.franka_genesis_sim import ControlMode  # noqa: E402
-from franka_sim.menagerie_visuals import (  # noqa: E402
-    ASSET_PREFIX,
-    FR3V2_VISUAL_LINKS,
-    resolve_fr3v2_mjcf,
-)
 from franka_sim.mobile_duo_mujoco_sim import (  # noqa: E402
     COLLISION_GEOM_GROUP,
     DEFAULT_DT,
@@ -42,7 +37,14 @@ from franka_sim.mobile_duo_sim import (  # noqa: E402
     SPINE_LIMITS_M,
     SceneView,
 )
+from franka_sim.mujoco_visuals import (  # noqa: E402
+    ASSET_PREFIX,
+    FR3V2_VISUAL_LINKS,
+    apply_dae_material_visuals,
+    resolve_fr3v2_mjcf,
+)
 from franka_sim.swerve_base import TMR_WHEEL_RADIUS  # noqa: E402
+from franka_sim.urdf_assets import resolve_urdf_meshes  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCENE_URDF = REPO_ROOT / "assets" / "mobile_duo" / "mobile_fr3_duo.urdf"
@@ -84,6 +86,22 @@ MENAGERIE_VISUALS_PER_LINK = (6, 1, 1, 1, 1, 1, 10, 7)
 #: What each arm link had before the swap: the one merged ``.obj`` that
 #: ``resolve_urdf_meshes`` writes per ``<visual>`` element.
 URDF_VISUALS_PER_LINK = (1,) * len(FR3V2_VISUAL_LINKS)
+
+#: Visual geoms each non-arm link carries once its COLLADA is split by
+#: material: one per material in the ``.dae`` files its ``<visual>`` elements
+#: reference. Counted from the sources rather than read back from the model, so
+#: a split that silently collapses to one merged geom fails the test.
+#: ``mount_link`` has two ``<visual>`` elements (mount + cover), one material
+#: each; ``base_link``'s TMR body is the only genuinely multi-material one.
+CHASSIS_VISUALS_PER_LINK = {
+    "base_link": 5,
+    "franka_spine": 3,
+    "mount_link": 2,
+    "head_link": 1,
+}
+
+#: What those links had before the split: one merged ``.obj`` per ``<visual>``.
+MERGED_VISUALS_PER_LINK = {"base_link": 1, "franka_spine": 1, "mount_link": 2, "head_link": 1}
 
 
 @pytest.fixture
@@ -490,7 +508,7 @@ def test_scene_falls_back_to_the_urdf_visuals_without_the_menagerie(monkeypatch,
         raise RuntimeError("no menagerie for you")
 
     monkeypatch.setattr(
-        "franka_sim.menagerie_visuals.resolve_fr3v2_mjcf",
+        "franka_sim.mujoco_visuals.resolve_fr3v2_mjcf",
         unavailable,
     )
     fallback = MobileDuoMujocoScene(SCENE_URDF, mesh_root=MESH_ROOT)
@@ -568,6 +586,193 @@ def test_base_and_spine_visuals_follow_the_kinematic_writes(scene):
     assert carriage_after[2] - carriage_before[2] == pytest.approx(0.6, abs=1e-2)
     # ...and the arm went along for the ride in x too.
     assert carriage_after[0] - carriage_before[0] == pytest.approx(0.15, abs=5e-3)
+
+
+# -- chassis and lift colours ---------------------------------------------
+#
+# The TMR platform and the lift have no Menagerie counterpart, so their colours
+# come out of their own COLLADA: one geom per material, each wearing that
+# material's diffuse rgba. Before this the merged .obj gave each link a single
+# default-grey geom -- the lift read as a featureless dark box.
+
+
+@pytest.fixture
+def flat_scene(monkeypatch):
+    """A scene built with the COLLADA split disabled: merged grey visuals.
+
+    This is both the "before" picture and the reference for "visual only": the
+    two models must differ in their visual geoms and in nothing else.
+    """
+
+    def unavailable(dae_path, cache_dir=None):
+        raise RuntimeError("no trimesh for you")
+
+    monkeypatch.setattr("franka_sim.mujoco_visuals.split_dae_by_material", unavailable)
+    built = MobileDuoMujocoScene(SCENE_URDF, mesh_root=MESH_ROOT)
+    built.initialize_simulation()
+    yield built
+    built.stop()
+
+
+def visual_colours_of(built, body_name):
+    """Distinct rgba the visible geoms of one body are drawn in."""
+    colours = set()
+    for geom in visible_geoms_of(built, body_name):
+        matid = int(built.model.geom_matid[geom])
+        rgba = built.model.mat_rgba[matid] if matid >= 0 else built.model.geom_rgba[geom]
+        colours.add(tuple(np.round(rgba, 6)))
+    return colours
+
+
+@pytest.mark.parametrize("link,expected", sorted(CHASSIS_VISUALS_PER_LINK.items()))
+def test_each_non_arm_link_draws_one_geom_per_collada_material(scene, link, expected):
+    visible = visible_geoms_of(scene, link)
+    assert len(visible) == expected, f"{link} draws {len(visible)} geoms"
+    for geom in visible:
+        assert scene.model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_MESH
+        assert scene.model.geom_matid[geom] >= 0, f"{link} geom {geom} has no material"
+
+
+def test_the_tmr_platform_wears_its_own_livery(scene):
+    """Five materials in the chassis COLLADA, five colours on the platform."""
+    colours = visual_colours_of(scene, "base_link")
+    assert len(colours) == CHASSIS_VISUALS_PER_LINK["base_link"]
+
+    # The TMR is red-bodied with black wheels/rubber and white panels: both
+    # extremes of the luminance range are present, which no shade of the old
+    # uniform grey could produce.
+    luminance = sorted(sum(colour[:3]) / 3.0 for colour in colours)
+    assert luminance[0] < 0.1 and luminance[-1] > 0.9
+    assert any(colour[0] - colour[1] > 0.4 and colour[0] - colour[2] > 0.4 for colour in colours)
+
+
+def test_the_lift_column_is_not_one_flat_colour(scene):
+    """The regression this fixes: the spine used to render as dark grey boxes."""
+    colours = visual_colours_of(scene, "franka_spine")
+    assert len(colours) == CHASSIS_VISUALS_PER_LINK["franka_spine"]
+    luminance = sorted(sum(colour[:3]) / 3.0 for colour in colours)
+    assert luminance[-1] > 0.9, f"the lift has no light panel: {colours}"
+
+
+def test_a_single_material_dae_becomes_a_single_coloured_geom(scene):
+    """One material is the right answer for the head, not a failed split."""
+    (geom,) = visible_geoms_of(scene, "head_link")
+    matid = int(scene.model.geom_matid[geom])
+    assert matid >= 0
+    assert tuple(np.round(scene.model.mat_rgba[matid][:3], 3)) != (0.5, 0.5, 0.5)
+
+
+def test_the_split_keeps_each_visual_elements_origin():
+    """``mount_link``'s cover sits 68 mm up its mount; the split must keep that.
+
+    Asserted on the spec rather than the compiled model because MuJoCo re-centres
+    every mesh's vertices at compile time and folds the offset into ``geom_pos``,
+    which hides the ``<origin>`` the replacement geoms inherited.
+    """
+    resolved = resolve_urdf_meshes(SCENE_URDF, mesh_root=MESH_ROOT)
+    try:
+        spec = mujoco.MjSpec.from_file(str(patch_urdf_for_mujoco(resolved)))
+        apply_dae_material_visuals(spec, SCENE_URDF, mesh_root=MESH_ROOT)
+        mount = spec.find_body("mount_link")
+        offsets = sorted(
+            round(float(geom.pos[2]), 4)
+            for geom in mount.geoms
+            if geom.contype == 0 and geom.conaffinity == 0
+        )
+        assert offsets == [0.0, 0.068]
+    finally:
+        Path(resolved).unlink(missing_ok=True)
+
+
+def test_non_arm_visuals_are_rigidly_attached_to_their_link_frame(scene):
+    """Every split geom draws at its own body's frame, not scattered at the origin."""
+    scene.spine_model = FixedSpine(0.35)
+    scene.update_base_twist([0.1, 0.05, 0.0, 0.0, 0.0, 0.2])
+    step(scene, seconds=0.5)
+
+    for link in CHASSIS_VISUALS_PER_LINK:
+        body_id = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, link)
+        for geom in visible_geoms_of(scene, link):
+            expected = (
+                scene.data.xpos[body_id]
+                + scene.data.xmat[body_id].reshape(3, 3) @ scene.model.geom_pos[geom]
+            )
+            assert scene.data.geom_xpos[geom] == pytest.approx(expected, abs=1e-9), link
+
+
+def test_the_split_geoms_cover_the_merged_mesh_they_replaced(scene, flat_scene):
+    """Same bounding box as the merged visual: the node transforms were applied.
+
+    Sub-meshes of a COLLADA Scene are stored in their own local frames, so a
+    split that forgets the scene-graph transform scatters them around the link
+    origin -- visible here as a bounding box that no longer matches the merged
+    mesh's.
+    """
+    for link in CHASSIS_VISUALS_PER_LINK:
+        split = _visual_bounds(scene, link)
+        merged = _visual_bounds(flat_scene, link)
+        assert split[0] == pytest.approx(merged[0], abs=1e-6), f"{link} lower bound"
+        assert split[1] == pytest.approx(merged[1], abs=1e-6), f"{link} upper bound"
+
+
+def _visual_bounds(built, link):
+    """World-frame AABB over the drawn vertices of one link's visible geoms."""
+    lower = []
+    upper = []
+    for geom in visible_geoms_of(built, link):
+        mesh = int(built.model.geom_dataid[geom])
+        start = int(built.model.mesh_vertadr[mesh])
+        vertices = built.model.mesh_vert[start : start + int(built.model.mesh_vertnum[mesh])]
+        placed = vertices @ built.data.geom_xmat[geom].reshape(3, 3).T + built.data.geom_xpos[geom]
+        lower.append(placed.min(axis=0))
+        upper.append(placed.max(axis=0))
+    return np.min(lower, axis=0), np.max(upper, axis=0)
+
+
+def test_the_collada_split_changes_nothing_the_physics_reads(scene, flat_scene):
+    """Visual-only, held to the same bar as the Menagerie arm swap."""
+    assert (flat_scene.model.nq, flat_scene.model.nv) == (scene.model.nq, scene.model.nv)
+    assert flat_scene.model.body_mass == pytest.approx(scene.model.body_mass)
+    assert flat_scene.model.body_inertia == pytest.approx(scene.model.body_inertia)
+    assert flat_scene.model.body_ipos == pytest.approx(scene.model.body_ipos)
+    assert flat_scene.model.body_iquat == pytest.approx(scene.model.body_iquat)
+    assert flat_scene.model.dof_damping == pytest.approx(scene.model.dof_damping)
+    assert flat_scene.model.dof_armature == pytest.approx(scene.model.dof_armature)
+    assert flat_scene.model.dof_frictionloss == pytest.approx(scene.model.dof_frictionloss)
+    assert flat_scene.model.jnt_range == pytest.approx(scene.model.jnt_range)
+
+    # The collision set is untouched: same geoms, same sizes, same positions.
+    def collision_geoms(built):
+        colliding = (built.model.geom_contype != 0) | (built.model.geom_conaffinity != 0)
+        return (
+            built.model.geom_type[colliding],
+            built.model.geom_size[colliding],
+            built.model.geom_pos[colliding],
+            built.model.geom_bodyid[colliding],
+        )
+
+    for split, merged in zip(collision_geoms(scene), collision_geoms(flat_scene)):
+        assert split == pytest.approx(merged)
+
+
+def test_the_scene_still_builds_when_the_collada_cannot_be_split(flat_scene):
+    """The COLLADA split is optional; without trimesh the merged visuals stay."""
+    for link, expected in MERGED_VISUALS_PER_LINK.items():
+        assert len(visible_geoms_of(flat_scene, link)) == expected, link
+    # ...and the arms are unaffected, because the two upgrades are independent.
+    assert (
+        len(visible_geoms_of(flat_scene, "left_fr3v2_link0"))
+        == (MENAGERIE_VISUALS_PER_LINK if MENAGERIE_MJCF else URDF_VISUALS_PER_LINK)[0]
+    )
+
+
+def test_the_arms_are_left_to_the_menagerie_swap(scene):
+    """The COLLADA split must not fight the arm transplant over the same geoms."""
+    expected = expected_visuals_per_link(scene)
+    for index in FR3V2_VISUAL_LINKS:
+        for prefix in ("left_fr3v2", "right_fr3v2"):
+            visible = visible_geoms_of(scene, f"{prefix}_link{index}")
+            assert len(visible) == expected[index], f"{prefix}_link{index}"
 
 
 # -- pacing ---------------------------------------------------------------

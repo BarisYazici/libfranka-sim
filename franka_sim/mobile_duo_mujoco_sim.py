@@ -23,7 +23,6 @@ import mujoco
 import numpy as np
 
 from franka_sim.franka_genesis_sim import ControlMode, resolve_fr3_joint_damping
-from franka_sim.menagerie_visuals import apply_fr3v2_visuals
 from franka_sim.mobile_duo_sim import (
     ARM_EE_LINKS,
     ARM_INITIAL_Q,
@@ -38,6 +37,7 @@ from franka_sim.mobile_duo_sim import (
     SceneView,
     pose_to_column_major,
 )
+from franka_sim.mujoco_visuals import apply_dae_material_visuals, apply_fr3v2_visuals
 from franka_sim.swerve_base import SwerveBase, yaw_to_quat_wxyz
 from franka_sim.urdf_assets import resolve_urdf_meshes
 
@@ -378,14 +378,14 @@ class MobileDuoMujocoScene:
         no contact in this scene is load-bearing for what the FCI bridges
         report; the teleop stack does its own collision avoidance.
 
-        The spec is also where both arms trade their flat merged-COLLADA visuals
-        for the Menagerie's per-material ones; see :meth:`_upgrade_arm_visuals`.
+        The spec is also where every link trades its flat merged-COLLADA visual
+        for per-material ones; see :meth:`_upgrade_visuals`.
         """
         spec = mujoco.MjSpec.from_file(str(urdf_path))
         spec.option.timestep = self.dt
         spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
 
-        self._upgrade_arm_visuals(spec)
+        self._upgrade_visuals(spec)
 
         chassis = spec.worldbody.bodies[0]
         chassis.add_freejoint()
@@ -405,21 +405,42 @@ class MobileDuoMujocoScene:
 
         return spec.compile()
 
-    def _upgrade_arm_visuals(self, spec) -> bool:
-        """Give both arms the Menagerie FR3 v2 visuals, if they can be resolved.
+    def _upgrade_visuals(self, spec) -> bool:
+        """Repaint the scene: Menagerie arms, per-material chassis and lift.
 
-        Purely cosmetic, and optional by design: ``robot_descriptions`` fetches
-        the Menagerie over the network on first use, so a fresh or offline host
-        can fail here. That must never stop the scene from building -- the
-        converted-URDF visuals it falls back to are the same geometry, just flat
-        grey. See :mod:`franka_sim.menagerie_visuals`.
+        Both halves are purely cosmetic and optional by design.
+        ``robot_descriptions`` fetches the Menagerie over the network on first
+        use, so a fresh or offline host can fail the arm swap; the COLLADA split
+        needs the optional ``trimesh`` dependency. Neither may stop the scene
+        from building -- the converted-URDF visuals fallen back to are the same
+        geometry, just flat grey. See :mod:`franka_sim.mujoco_visuals`.
+
+        The chassis and lift are repainted first: their per-material split maps
+        one ``<visual>`` element to one geom positionally, which only holds while
+        the spec still looks like the imported URDF. The arm swap runs second and
+        replaces the arm geoms wholesale, so ordering matters.
         """
+        # Passed the source URDF, not the resolved copy: the split reads the
+        # original .dae files, which the copy has already replaced with merged
+        # .obj paths.
+        repainted = self._apply_visual_upgrade(
+            "chassis and lift COLLADA",
+            lambda: apply_dae_material_visuals(spec, self.urdf_path, mesh_root=self.mesh_root),
+        )
+        swapped = self._apply_visual_upgrade(
+            "Menagerie FR3 v2 arm", lambda: apply_fr3v2_visuals(spec)
+        )
+        return repainted and swapped
+
+    @staticmethod
+    def _apply_visual_upgrade(what: str, upgrade) -> bool:
+        """Run one visual upgrade, downgrading any failure to a log line."""
         try:
-            apply_fr3v2_visuals(spec)
+            upgrade()
         except Exception as exc:
             logger.info(
-                "Keeping the converted-URDF arm visuals; the MuJoCo Menagerie FR3 v2 "
-                "model is unavailable (%s: %s)",
+                "Keeping the converted-URDF visuals; the %s visuals are unavailable (%s: %s)",
+                what,
                 type(exc).__name__,
                 exc,
             )
