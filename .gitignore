@@ -8,3 +8,5 @@ __pycache__/
 site/
 libfranka_new
 assets/mobile_duo/
+build/
+dist/
