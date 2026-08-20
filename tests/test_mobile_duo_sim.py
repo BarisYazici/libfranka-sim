@@ -16,10 +16,13 @@ from franka_sim.mobile_duo_sim import (
     ARM_EE_LINKS,
     ARM_INITIAL_Q,
     ARM_JOINT_NAMES,
+    LINK_POSE_READ_EVERY,
     ROLE_BASE,
     ROLE_LEFT,
     ROLE_RIGHT,
     ROLES,
+    SPINE_HOLD_KP,
+    SPINE_HOLD_KV,
     MobileDuoScene,
     RealtimeFactorMonitor,
     SceneView,
@@ -74,6 +77,40 @@ def test_arm_state_reads_only_that_arms_joints(scene):
     left_dofs = [scene.robot.joints[name].dof_idx_local for name in ARM_JOINT_NAMES[ROLE_LEFT]]
     expected = [scene.robot.dof_positions[index] for index in left_dofs]
     assert scene.get_role_state(ROLE_LEFT)["q"] == pytest.approx(expected)
+
+
+def test_each_arm_reports_its_own_flange_pose(scene):
+    """The whole-entity link read is sliced by local link index, so a swapped or
+    off-by-one index would hand one arm the other's flange (or a filler link's).
+    """
+    for role in (ROLE_LEFT, ROLE_RIGHT):
+        link = scene.robot.links[ARM_EE_LINKS[role]]
+        matrix = scene.get_role_state(role)["O_T_EE"].reshape(4, 4).T
+        assert matrix[:3, 3] == pytest.approx(link._position), role
+        expected = pose_to_column_major(link._position, link._quaternion)
+        assert scene.get_role_state(role)["O_T_EE"] == pytest.approx(expected), role
+
+
+def test_link_poses_are_re_read_on_the_decimation_period(scene):
+    """q/dq come off the entity every step; the flange poses do not.
+
+    Their consumers top out at 50 Hz, so LINK_POSE_READ_EVERY trades three of
+    every four whole-entity link reads away. The pose must still refresh on the
+    period, and must be the stale one in between.
+    """
+    left = scene.robot.links[ARM_EE_LINKS[ROLE_LEFT]]
+    stale = left._position.copy()
+    reads_before = scene.robot.links_read_count
+    left._position = np.array([9.0, 9.0, 9.0])
+
+    for _ in range(LINK_POSE_READ_EVERY - 1):
+        scene._read_and_publish_state()
+        assert scene.robot.links_read_count == reads_before
+        assert scene.get_role_state(ROLE_LEFT)["O_T_EE"][12:15] == pytest.approx(stale)
+
+    scene._read_and_publish_state()
+    assert scene.robot.links_read_count == reads_before + 1
+    assert scene.get_role_state(ROLE_LEFT)["O_T_EE"][12:15] == pytest.approx([9.0, 9.0, 9.0])
 
 
 def test_base_state_pads_the_wheel_joints(scene):
@@ -167,6 +204,57 @@ def test_set_spine_position_clamps_to_the_urdf_limits(scene):
     assert scene.robot.set_position_calls[-1][0] == pytest.approx([0.0])
     scene.set_spine_position(9.0)
     assert scene.robot.set_position_calls[-1][0] == pytest.approx([0.85])
+
+
+def test_set_spine_position_holds_with_a_persisting_control_target(scene):
+    """The teleport alone leaves an unactuated DOF free-running between writes.
+
+    Genesis keeps a control target until it is overwritten, so pairing the
+    teleport with one ``control_dofs_position`` holds the carriage for free --
+    which is what lets the write-on-change skip below be unconditional.
+    """
+    scene.set_spine_position(0.42)
+
+    values, dofs = scene.robot.position_commands[-1]
+    assert dofs == [scene.spine_dof_idx]
+    assert values == pytest.approx([0.42])
+
+
+def test_set_spine_position_writes_nothing_while_the_target_is_unchanged(scene):
+    scene.set_spine_position(0.42)
+    writes = len(scene.robot.set_position_calls)
+    commands = len(scene.robot.position_commands)
+
+    for _ in range(50):
+        scene.set_spine_position(0.42)
+
+    assert len(scene.robot.set_position_calls) == writes
+    assert len(scene.robot.position_commands) == commands
+
+
+def test_initialize_simulation_arms_the_spine_hold(tmp_path, monkeypatch):
+    """The lift gains have to be set once, before any position is commanded."""
+    urdf_path = tmp_path / "duo.urdf"
+    urdf_path.write_text('<?xml version="1.0"?><robot name="duo"></robot>')
+    resolved = tmp_path / "resolved.urdf"
+    resolved.write_text("<robot/>")
+
+    duo_entity = FakeDuoEntity()
+    fake_gs, _ = _fake_gs(robot_entity=duo_entity)
+
+    duo = MobileDuoScene(urdf_path, enable_vis=False)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+
+    duo.initialize_simulation()
+
+    spine_dofs = [duo.spine_dof_idx]
+    assert [dofs for _, dofs in duo_entity.kp_calls] == [spine_dofs]
+    assert [dofs for _, dofs in duo_entity.kv_calls] == [spine_dofs]
+    assert duo_entity.kp_calls[0][0] == pytest.approx([SPINE_HOLD_KP])
+    assert duo_entity.kv_calls[0][0] == pytest.approx([SPINE_HOLD_KV])
+    assert duo_entity.position_commands[-1][1] == spine_dofs
+    assert duo_entity.position_commands[-1][0] == pytest.approx([0.0])
 
 
 def test_spine_model_drives_the_joint_every_step(scene):

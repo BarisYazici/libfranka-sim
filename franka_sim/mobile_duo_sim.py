@@ -75,6 +75,37 @@ SPINE_JOINT_NAME = "franka_spine_vertical_joint"
 #: Travel limits of that joint in the combined URDF (metres).
 SPINE_LIMITS_M = (0.0, 0.85)
 
+#: Position-hold gains and force ceiling for the lift DOF. The URDF gives the
+#: joint no actuation of its own, so once the teleport stops repeating it
+#: free-runs under the arms' reaction forces -- a sub-millimetre sawtooth that
+#: rides straight into both flanges' O_T_EE. A stiff PD target persists in
+#: Genesis at zero per-step cost and holds it instead. The gains are not a model
+#: of the real drive (the real spine is a separate closed-loop device the sim
+#: only mirrors), so the URDF's ``effort="100"`` -- which describes that drive --
+#: does not bound them; the ceiling only has to beat the reaction forces.
+SPINE_HOLD_KP = 1.0e5
+SPINE_HOLD_KV = 1.0e4
+SPINE_HOLD_FORCE_N = 2000.0
+
+#: Visualizer refresh rate when the scene is started with a viewer. Genesis'
+#: viewer window repaints on its own thread, but the scene-graph update that
+#: feeds it runs inside ``scene.step`` on the physics thread, and its whole cost
+#: lands on the single step that happens to carry it -- pacing cannot claw that
+#: back, so it comes straight off the real-time factor (measured ~2% of the
+#: budget at this rate). 30 Hz is the point where the viewer still reads as
+#: smooth motion; drop it if a scene ever needs the headroom back.
+RENDER_FPS = 30.0
+
+#: Physics steps between two whole-entity link-pose reads. The joint state
+#: (q/dq) is re-read every step because the UDP RobotState carries it at 1 kHz,
+#: but the two link-pose reads only feed the arms' ``O_T_EE``, whose consumers
+#: are the 30 Hz ROS 2 state publishers and the teleop stack's FrankaRobotState
+#: at 50 Hz. At dt=2.5 ms this still refreshes the flange pose at 100 Hz --
+#: twice the fastest consumer -- for a quarter of the kernel launches. Raising
+#: it further would start to alias those consumers; lowering it to 1 restores
+#: per-step reads.
+LINK_POSE_READ_EVERY = 4
+
 
 def pose_to_column_major(position, quat_wxyz) -> np.ndarray:
     """Build a column-major 4x4 transform from a position and a (w, x, y, z) quat."""
@@ -203,6 +234,18 @@ class MobileDuoScene:
         self._alpha_acc = 0.95
         self._resolved_urdf: Optional[Path] = None
 
+        # Per-step fast-path caches. The index maps need the built entity, so
+        # _bind_entity fills them in; the rest are the "what did we last write /
+        # last read" state the write-on-change and decimated-read paths compare
+        # against, and start deliberately empty so the first pass through the
+        # loop writes and reads everything.
+        self._arm_dofs_np: Dict[str, np.ndarray] = {}
+        self._arm_link_idx: Dict[str, int] = {}
+        self._last_arm_cmd = {role: (None, None) for role in ARM_ROLES}
+        self._spine_last_written: Optional[float] = None
+        self._link_read_countdown = 0
+        self._arm_ee_pose = {role: np.eye(4).T.flatten() for role in ARM_ROLES}
+
         empty = {
             "q": np.zeros(7),
             "dq": np.zeros(7),
@@ -232,6 +275,11 @@ class MobileDuoScene:
                 camera_lookat=(0.0, 0.0, 0.8),
                 camera_fov=40,
                 res=(640, 480),
+                # Must stay >= RENDER_FPS: this caps a rate limiter inside
+                # Genesis' viewer.update(), which sleeps on whatever thread
+                # called it -- here the physics thread. run_simulation does its
+                # own visualizer pacing at the slower RENDER_FPS, so the limiter
+                # never fires; set it below that and it would stall physics.
                 max_FPS=60,
             ),
             sim_options=gs.options.SimOptions(dt=self.dt),
@@ -273,6 +321,18 @@ class MobileDuoScene:
                 self.robot.set_dofs_damping(damping, dofs)
                 self.robot.set_dofs_position(ARM_INITIAL_Q, dofs)
 
+            # Arm the lift's position hold once; set_spine_position then only
+            # has to move the target. See SPINE_HOLD_KP.
+            spine_dofs = [self.spine_dof_idx]
+            self.robot.set_dofs_force_range(
+                lower=np.array([-SPINE_HOLD_FORCE_N]),
+                upper=np.array([SPINE_HOLD_FORCE_N]),
+                dofs_idx_local=spine_dofs,
+            )
+            self.robot.set_dofs_kp(np.array([SPINE_HOLD_KP]), spine_dofs)
+            self.robot.set_dofs_kv(np.array([SPINE_HOLD_KV]), spine_dofs)
+            self.set_spine_position(0.0)
+
             for _ in range(100):
                 self.scene.step()
             self._read_and_publish_state()
@@ -293,6 +353,15 @@ class MobileDuoScene:
         self.swerve.bind()
         self.swerve.reset_pose()
 
+        # Precomputed slices for the batched per-step reads/writes: the indexed
+        # Genesis getters re-validate their dof-index argument and launch one
+        # kernel per call, which at ~400 Hz dominates the loop (measured 88% of
+        # loop time before batching). See _read_and_publish_state.
+        self._arm_dofs_np = {
+            role: np.asarray(self.arm_dofs_idx[role], dtype=np.intp) for role in ARM_ROLES
+        }
+        self._arm_link_idx = {role: self.arm_links[role].idx_local for role in ARM_ROLES}
+
     def view(self, role: str) -> "SceneView":
         """Return the simulator adapter for one bridge."""
         if role not in ROLES:
@@ -308,17 +377,23 @@ class MobileDuoScene:
         logger.info("Arm %s control mode -> %s", role, mode.value)
         self.arm_control_modes[role] = mode
 
+    # The three command setters below run on the FCI bridge threads and are
+    # lock-free by atomic reference swap: each binds a *fresh* array, which the
+    # physics thread then owns for as long as it reads it. ``np.array`` (a copy)
+    # rather than ``np.asarray`` so a caller that recycles one decode buffer
+    # cannot mutate a command the physics thread is mid-way through publishing.
+
     def update_arm_torques(self, role: str, torques) -> None:
         """Publish one arm's commanded torques."""
-        self.arm_torques[role] = np.asarray(torques, dtype=float)
+        self.arm_torques[role] = np.array(torques, dtype=float)
 
     def update_arm_joint_positions(self, role: str, positions) -> None:
         """Publish one arm's commanded joint positions."""
-        self.arm_joint_positions[role] = np.asarray(positions, dtype=float)
+        self.arm_joint_positions[role] = np.array(positions, dtype=float)
 
     def update_arm_joint_velocities(self, role: str, velocities) -> None:
         """Publish one arm's commanded joint velocities."""
-        self.arm_joint_velocities[role] = np.asarray(velocities, dtype=float)
+        self.arm_joint_velocities[role] = np.array(velocities, dtype=float)
 
     def update_base_twist(self, twist: Sequence[float]) -> None:
         """Publish the base body-frame twist ``[vx, vy, vz, wx, wy, wz]``."""
@@ -338,11 +413,27 @@ class MobileDuoScene:
         wipe both arms' joint velocities each step -- an effectively infinite
         damper that pins them while the teleported lift still moves. Only the
         spine's own DOF is zeroed, which is what the teleport invalidates.
+
+        Write-on-change, and *only* on change: the carriage sits still almost
+        all the time, and three redundant kernel launches per step (each of
+        which drags a scene-wide forward-kinematics pass behind it) are pure
+        overhead at 400 Hz. What holds the joint between changes is the PD
+        target set alongside the teleport -- Genesis keeps control targets until
+        they are overwritten, so the hold costs nothing per step. Re-teleporting
+        periodically instead would leave the joint free-running in between,
+        which shows up as a sawtooth on both flanges' O_T_EE (see
+        SPINE_HOLD_KP).
         """
         lower, upper = SPINE_LIMITS_M
         clamped = min(max(float(position_m), lower), upper)
-        self.robot.set_dofs_position(np.array([clamped]), [self.spine_dof_idx], zero_velocity=False)
-        self.robot.set_dofs_velocity(np.zeros(1), [self.spine_dof_idx])
+        if clamped == self._spine_last_written:
+            return
+        self._spine_last_written = clamped
+        spine_dofs = [self.spine_dof_idx]
+        target = np.array([clamped])
+        self.robot.set_dofs_position(target, spine_dofs, zero_velocity=False)
+        self.robot.set_dofs_velocity(np.zeros(1), spine_dofs)
+        self.robot.control_dofs_position(target, spine_dofs)
 
     def get_role_state(self, role: str) -> Dict[str, np.ndarray]:
         """Latest snapshot for one role (lock-free read)."""
@@ -357,15 +448,34 @@ class MobileDuoScene:
         if self.spine_model is not None:
             self.set_spine_position(self.spine_model.position_m())
 
+        # Genesis control targets persist across steps, so each arm's target is
+        # rewritten only when its VALUE changed since the last write. Comparing
+        # values rather than array identity matters both ways: a client holding
+        # a constant target (franka_ros2's joint-impedance controller streaming
+        # the same q_d at 1 kHz) keeps hitting the skip, and a caller that
+        # recycles one buffer can never be mistaken for "nothing new". Comparing
+        # 7 floats costs a few microseconds against tens per kernel launch.
         for role in ARM_ROLES:
-            dofs = self.arm_dofs_idx[role]
             mode = self.arm_control_modes[role]
             if mode == ControlMode.POSITION:
-                self.robot.control_dofs_position(self.arm_joint_positions[role], dofs)
+                target = self.arm_joint_positions[role]
             elif mode == ControlMode.VELOCITY:
-                self.robot.control_dofs_velocity(self.arm_joint_velocities[role], dofs)
+                target = self.arm_joint_velocities[role]
             elif mode == ControlMode.TORQUE:
-                self.robot.control_dofs_force(self.arm_torques[role], dofs)
+                target = self.arm_torques[role]
+            else:
+                continue
+            last_mode, last_target = self._last_arm_cmd[role]
+            if last_mode == mode and np.array_equal(last_target, target):
+                continue
+            dofs = self._arm_dofs_np[role]
+            if mode == ControlMode.POSITION:
+                self.robot.control_dofs_position(target, dofs)
+            elif mode == ControlMode.VELOCITY:
+                self.robot.control_dofs_velocity(target, dofs)
+            else:
+                self.robot.control_dofs_force(target, dofs)
+            self._last_arm_cmd[role] = (mode, np.array(target, dtype=float))
 
     def _filtered_acceleration(self, role: str, dq: np.ndarray) -> np.ndarray:
         """Low-passed numerical joint acceleration for one role."""
@@ -377,15 +487,40 @@ class MobileDuoScene:
         return self._ddq_filtered[role]
 
     def _read_and_publish_state(self) -> None:
-        """Read the entity once and publish one snapshot per role."""
+        """Read the entity once and publish one snapshot per role.
+
+        Whole-entity reads (position, velocity, link positions, link
+        quaternions) instead of per-role indexed getters: the indexed reads
+        cost one kernel launch plus dof-index validation EACH, which at
+        ~400 Hz measured as 54% of the whole loop. Slicing the full arrays
+        in numpy is effectively free by comparison.
+
+        The two link-pose reads are decimated on top of that
+        (``LINK_POSE_READ_EVERY``); the joint-state pair is not, because the
+        UDP RobotState reports q/dq at 1 kHz.
+        """
+        q_all = self.robot.get_dofs_position().cpu().numpy()
+        dq_all = self.robot.get_dofs_velocity().cpu().numpy()
+
+        self._link_read_countdown -= 1
+        if self._link_read_countdown <= 0:
+            self._link_read_countdown = LINK_POSE_READ_EVERY
+            links_pos = self.robot.get_links_pos().cpu().numpy()
+            links_quat = self.robot.get_links_quat().cpu().numpy()
+            self._arm_ee_pose = {
+                role: pose_to_column_major(
+                    links_pos[self._arm_link_idx[role]], links_quat[self._arm_link_idx[role]]
+                )
+                for role in ARM_ROLES
+            }
+
         snapshots = {}
 
         for role in ARM_ROLES:
-            dofs = self.arm_dofs_idx[role]
-            q = self.robot.get_dofs_position(dofs).cpu().numpy()
-            dq = self.robot.get_dofs_velocity(dofs).cpu().numpy()
+            idx = self._arm_dofs_np[role]
+            q = q_all[idx]
+            dq = dq_all[idx]
             ddq = self._filtered_acceleration(role, dq)
-            link = self.arm_links[role]
             snapshots[role] = {
                 "q": q,
                 "dq": dq,
@@ -394,12 +529,10 @@ class MobileDuoScene:
                 "dq_d": dq,
                 "ddq_d": ddq,
                 "tau_J": self.arm_torques[role],
-                "O_T_EE": pose_to_column_major(
-                    link.get_pos().cpu().numpy(), link.get_quat().cpu().numpy()
-                ),
+                "O_T_EE": self._arm_ee_pose[role],
             }
 
-        wheel_q, wheel_dq = self.swerve.wheel_state()
+        wheel_q, wheel_dq = self.swerve.wheel_state_from(q_all, dq_all)
         q = np.zeros(7)
         dq = np.zeros(7)
         q[:4] = wheel_q
@@ -424,7 +557,7 @@ class MobileDuoScene:
 
         next_step = time.perf_counter()
         next_render = next_step
-        render_period = 1.0 / 30.0
+        render_period = 1.0 / RENDER_FPS
         rtf_monitor = RealtimeFactorMonitor(logger, next_step)
 
         while self.running:

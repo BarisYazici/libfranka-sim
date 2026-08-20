@@ -76,28 +76,54 @@ DQ_SLICE = robot_state_field_slice("dq", 7)
 
 
 class IntegratingDuoEntity(FakeDuoEntity):
-    """A fake entity whose joints actually integrate the commands they receive."""
+    """A fake entity whose joints actually integrate their control targets.
+
+    A Genesis control target *persists*: the solver re-applies it on every
+    ``scene.step`` until something overwrites it, which is exactly why the
+    physics loop writes a target only when its value changes -- at 400 Hz the
+    redundant kernel launches, not the physics, are what costs. So the
+    integration has to hang off the step, not off the ``control_dofs_*`` call:
+    a fake that moved a joint once per call reports a robot that stops dead
+    while the client is still holding a perfectly good constant command.
+
+    :meth:`step` therefore stands in for ``scene.step`` and must be driven by
+    whatever loop drives ``_apply_control``.
+    """
 
     def __init__(self, dt):
         super().__init__()
         self.dt = dt
         self.dof_positions = np.zeros(self.n_dofs)
         self.dof_velocities = np.zeros(self.n_dofs)
+        #: dof index -> (kind, value) for the target the solver still holds.
+        #: One entry per DOF: a later target of either kind replaces the
+        #: earlier one, which is what switching a bridge's control mode does.
+        self.targets = {}
 
     def control_dofs_position(self, values, dofs_idx_local):
         super().control_dofs_position(values, dofs_idx_local)
-        for value, index in zip(np.asarray(values, dtype=float), dofs_idx_local):
-            self.dof_positions[index] = value
-            self.dof_velocities[index] = 0.0
+        self._hold("position", values, dofs_idx_local)
 
     def control_dofs_velocity(self, values, dofs_idx_local):
         super().control_dofs_velocity(values, dofs_idx_local)
-        for value, index in zip(np.asarray(values, dtype=float), dofs_idx_local):
-            self.dof_velocities[index] = value
-            self.dof_positions[index] += value * self.dt
+        self._hold("velocity", values, dofs_idx_local)
 
     def control_dofs_force(self, values, dofs_idx_local):
         super().control_dofs_force(values, dofs_idx_local)
+
+    def _hold(self, kind, values, dofs_idx_local):
+        for value, index in zip(np.asarray(values, dtype=float), dofs_idx_local):
+            self.targets[int(index)] = (kind, float(value))
+
+    def step(self):
+        """Advance every held target by one ``dt``, as ``scene.step`` would."""
+        for index, (kind, value) in self.targets.items():
+            if kind == "position":
+                self.dof_positions[index] = value
+                self.dof_velocities[index] = 0.0
+            else:
+                self.dof_velocities[index] = value
+                self.dof_positions[index] += value * self.dt
 
 
 @pytest.fixture
@@ -114,9 +140,13 @@ def duo_stack(tmp_path):
     stop_event = threading.Event()
 
     def step_loop():
+        # read / apply / step, in run_simulation's order: the entity's step is
+        # what advances the held control targets, so it stands where
+        # scene.step() stands in the real loop.
         while not stop_event.is_set():
             scene._read_and_publish_state()
             scene._apply_control()
+            scene.robot.step()
             time.sleep(scene.dt)
 
     stepper = threading.Thread(target=step_loop, name="duo-stepper", daemon=True)
@@ -354,6 +384,7 @@ def spine_stack(tmp_path):
         while not stop_event.is_set():
             scene._read_and_publish_state()
             scene._apply_control()
+            scene.robot.step()
             time.sleep(scene.dt)
 
     stepper = threading.Thread(target=step_loop, name="spine-stepper", daemon=True)

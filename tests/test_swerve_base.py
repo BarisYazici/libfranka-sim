@@ -150,20 +150,63 @@ def test_bind_resolves_the_root_dofs():
     assert base.root_dofs_idx == [7, 8, 9]
 
 
+def test_bind_resolves_the_root_qpos_entries():
+    entity = FakeEntity(root_qs=(40, 41, 42, 43, 44, 45, 46))
+    base = SwerveBase(entity)
+    base.bind()
+    assert base.root_qs_idx == [40, 41, 42, 43, 44, 45, 46]
+
+
 def test_bind_tolerates_an_entity_without_a_root_joint():
     entity = FakeEntity(root_dofs=())
     base = SwerveBase(entity)
     base.bind()
     assert base.root_dofs_idx == []
+    assert base.root_qs_idx == []
+
+
+def test_apply_writes_a_free_root_pose_as_one_qpos_call():
+    """One setter call, not two: each one costs a full forward-kinematics pass.
+
+    A free root joint's qpos is ``[x, y, z, qw, qx, qy, qz]``, so the pair of
+    ``set_pos``/``set_quat`` writes folds into a single ``set_qpos``.
+    """
+    entity = FakeEntity(root_qs=(40, 41, 42, 43, 44, 45, 46))
+    base = SwerveBase(entity, base_height=0.05)
+    base.bind()
+    base.set_twist([0.0, 0.0, 0.0, 0.0, 0.0, math.pi])
+
+    base.apply(0.5)
+
+    assert len(entity.qpos_writes) == 1
+    values, qs_idx, _ = entity.qpos_writes[-1]
+    assert qs_idx == [40, 41, 42, 43, 44, 45, 46]
+    assert values == pytest.approx(
+        [0.0, 0.0, 0.05, math.cos(math.pi / 4.0), 0.0, 0.0, math.sin(math.pi / 4.0)], abs=1e-9
+    )
+
+
+def test_apply_falls_back_to_set_pos_and_set_quat_without_root_qpos():
+    """A fixed base keeps its pose in links_state, not qpos, so the pair stays."""
+    entity = FakeEntity(root_qs=())
+    base = SwerveBase(entity, base_height=0.05)
+    base.bind()
+    base.set_twist([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    base.apply(0.01)
+
+    assert entity.qpos_writes == []
+    assert [kind for kind, _, _ in entity.pose_writes] == ["pos", "quat"]
+    assert entity.positions[-1] == pytest.approx([0.01, 0.0, 0.05], abs=1e-9)
 
 
 def test_apply_zeroes_only_the_root_dofs_not_the_whole_entity():
     """Regression: the base pose write must not stop the arms.
 
-    Genesis' ``set_pos``/``set_quat`` zero the velocity of EVERY DOF of the
-    entity unless ``zero_velocity=False``. On the mobile-duo scene that entity
-    carries both FR3 arms, and ``apply`` runs once per physics step, so the
-    default pinned the arms while the (kinematic) base still moved.
+    Genesis' pose setters zero the velocity of EVERY DOF of the entity unless
+    ``zero_velocity=False``. On the mobile-duo scene that entity carries both
+    FR3 arms, and ``apply`` runs once per physics step, so the default pinned
+    the arms while the (kinematic) base still moved.
     """
     entity = FakeEntity(root_dofs=(30, 31, 32, 33, 34, 35))
     base = SwerveBase(entity, base_height=0.05)
@@ -172,7 +215,8 @@ def test_apply_zeroes_only_the_root_dofs_not_the_whole_entity():
 
     base.apply(0.01)
 
-    assert [zero_velocity for _, _, zero_velocity in entity.pose_writes] == [False, False]
+    assert entity.pose_writes
+    assert not any(zero_velocity for _, _, zero_velocity in entity.pose_writes)
     values, dofs = entity.set_velocity_calls[-1]
     assert dofs == [30, 31, 32, 33, 34, 35]
     assert values == pytest.approx([0.0] * 6)
