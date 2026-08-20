@@ -105,24 +105,3 @@ Practical consequence: Genesis needs a 2.5 ms step to hold real time on the sing
 arm, and still lands around 0.4x on the mobile duo. The FCI bridges serve at 1 kHz
 regardless, so on Genesis the physics is being sub-sampled relative to the control
 rate.
-
-## Choosing
-
-```mermaid
-graph TD
-    A[What are you doing?] --> B[Running a controller<br/>against the FCI]
-    A --> C[Training a policy<br/>with many parallel envs]
-    B --> D[MuJoCo — default.<br/>1 ms step, 1.00x real time]
-    C --> E[Genesis — GPU-parallel.<br/>pip install 'franka-sim[genesis]']
-```
-
-If you are doing the first thing — developing a controller, testing a `franka_ros2`
-stack, running teleop, validating a handshake — you want wall-clock fidelity at
-1 kHz, and MuJoCo is the answer.
-
-If you are doing the second — collecting rollouts, training a policy — you want
-throughput across many environments and do not care that any single one lags real
-time, and Genesis is the answer.
-
-Since both backends present an identical protocol surface, you can develop against
-one and switch to the other with a flag.
