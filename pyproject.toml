@@ -67,6 +67,16 @@ genesis = [
     "numba==0.60.0",
     "torch>=2.0.0",
 ]
+# Build the documentation site (mkdocs.yml + docs/), deployed to
+# https://barisyazici.github.io/libfranka-sim/ by .github/workflows/docs.yml.
+# The site build imports nothing from franka_sim, so these are the only tools
+# the docs job actually needs. mkdocs is pinned <2: MkDocs 2.0 removes the
+# plugin and theming systems Material depends on.
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5,<10",
+    "pymdown-extensions>=10.7,<12",
+]
 
 [tool.setuptools]
 packages = ["franka_sim", "franka_sim.assets"]

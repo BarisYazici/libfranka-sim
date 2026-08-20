@@ -1,0 +1,93 @@
+site_name: franka-sim
+site_description: >-
+  A libfranka FCI simulator that speaks the real wire protocol — unmodified
+  libfranka clients connect to it exactly as they connect to an FR3.
+site_url: https://barisyazici.github.io/libfranka-sim/
+repo_url: https://github.com/BarisYazici/libfranka-sim
+repo_name: BarisYazici/libfranka-sim
+edit_uri: edit/main/docs/
+copyright: Apache-2.0 licensed. Not affiliated with Franka Robotics GmbH.
+
+docs_dir: docs
+
+# --strict promotes these to build failures, so a dead cross-reference or a
+# stale #anchor breaks CI instead of shipping.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.blocks.caption
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.keys
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/BarisYazici/libfranka-sim
+      name: libfranka-sim on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/franka-sim/
+      name: franka-sim on PyPI
+
+nav:
+  - Overview: index.md
+  - Installation: install.md
+  - Client compatibility: compatibility.md
+  - State &amp; command fidelity: robot-state.md
+  - Mobile FR3 duo: mobile-duo.md
+  - Physics backends: backends.md

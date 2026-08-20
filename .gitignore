@@ -3,7 +3,8 @@ __pycache__/
 .pytest_cache/
 .coverage
 
-# Local-only documentation (kept on disk, not tracked/pushed)
-docs/
+# docs/ is the MkDocs source for https://barisyazici.github.io/libfranka-sim/
+# and IS tracked. Only the built site is ignored.
+site/
 libfranka_new
 assets/mobile_duo/
