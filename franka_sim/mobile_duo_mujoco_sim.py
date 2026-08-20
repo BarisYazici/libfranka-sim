@@ -85,6 +85,29 @@ WHEEL_ARMATURE = 0.05
 #: Settling steps run at build time, matching the Genesis scene's warm-up.
 SETTLE_STEPS = 100
 
+#: Geom group the URDF's ``<collision>`` geoms are moved into. MuJoCo's URDF
+#: importer leaves them in group 0 next to the ``<visual>`` geoms in group 1,
+#: and every MuJoCo viewer renders groups 0-2 by default -- so each link draws
+#: its detailed visual mesh *and* its coarse collision hull on top of it, which
+#: reads as one tangled clump of interpenetrating meshes rather than two arms.
+#: Group 3 is MuJoCo's convention for "collision only, hidden by default".
+COLLISION_GEOM_GROUP = 3
+
+#: Wall-clock lag (s) the paced loop catches up on before it gives up and
+#: resynchronises its deadline.
+#:
+#: ``viewer.sync()`` blocks on the mutex the viewer's render thread holds while
+#: it draws, which measures ~12 ms per call on this host, so every rendered
+#: frame leaves the loop ~12 steps behind. Resynchronising at anything less
+#: than a frame's worth of lag *discards* that simulated time instead of making
+#: it up -- ~0.36 s per wall-clock second at 30 FPS, which is exactly the 0.70x
+#: real-time factor the viewer used to cost. Catching up takes ~17 un-slept
+#: steps and finishes long before the next frame is due.
+#:
+#: The bound still exists so a genuinely overloaded loop cannot spiral: past
+#: this much lag the backlog is dropped and the RTF monitor reports the truth.
+MAX_CATCHUP_LAG_S = 0.25
+
 #: MuJoCo compiler settings injected into the URDF as a ``<mujoco>`` extension
 #: element. ``strippath=false`` keeps the absolute mesh paths that
 #: ``resolve_urdf_meshes`` wrote (MuJoCo defaults to basename-only for URDF);
@@ -212,6 +235,45 @@ def _address_array(model, names: Sequence[str], resolve) -> np.ndarray:
     return np.array([resolve(model, name) for name in names], dtype=np.intp)
 
 
+def log_gl_renderer() -> Optional[str]:
+    """Log the OpenGL renderer the viewer will get, and return it.
+
+    The passive viewer draws through GLFW, so a throwaway hidden GLFW window
+    reports the same driver the viewer thread will bind. Worth one line in the
+    log: a software renderer (llvmpipe/swrast, which a conda-shipped Mesa can
+    shadow the system driver with) is slow enough to stall the paced loop, and
+    it is otherwise invisible from inside the process. Never fatal -- this is
+    diagnostics, not a dependency.
+    """
+    try:
+        import glfw
+        from OpenGL import GL
+
+        glfw.init()
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+        window = glfw.create_window(1, 1, "gl-probe", None, None)
+        if window is None:
+            raise RuntimeError("GLFW could not create a probe window")
+        try:
+            glfw.make_context_current(window)
+            renderer = GL.glGetString(GL.GL_RENDERER).decode()
+            vendor = GL.glGetString(GL.GL_VENDOR).decode()
+        finally:
+            glfw.destroy_window(window)
+    except Exception as exc:
+        logger.info("Could not determine the OpenGL renderer (%s: %s)", type(exc).__name__, exc)
+        return None
+
+    logger.info("Viewer OpenGL renderer: %s (%s)", renderer, vendor)
+    if any(marker in renderer.lower() for marker in ("llvmpipe", "softpipe", "swrast")):
+        logger.warning(
+            "OpenGL is running on a software rasteriser (%s); the viewer will be slow. "
+            "Check that no Mesa libGL from the Python environment shadows the system driver.",
+            renderer,
+        )
+    return renderer
+
+
 class MobileDuoMujocoScene:
     """The single MuJoCo model holding the TMR base, the spine and both arms."""
 
@@ -243,6 +305,9 @@ class MobileDuoMujocoScene:
         # Optional lift source: any object with ``position_m() -> float``, set by
         # the runner from the spine stub. See MobileDuoScene for the contract.
         self.spine_model = None
+        #: Last height the lift was placed at, held when no spine device is
+        #: attached. See ``_apply_control``.
+        self._spine_position_m = SPINE_LIMITS_M[0]
 
         self.arm_control_modes = {role: ControlMode.POSITION for role in ARM_ROLES}
         self.arm_torques = {role: np.zeros(7) for role in ARM_ROLES}
@@ -385,6 +450,25 @@ class MobileDuoMujocoScene:
         self.model.dof_frictionloss[wheel_dofs] = 0.0
         self.model.dof_armature[wheel_dofs] = WHEEL_ARMATURE
 
+        self._hide_collision_geoms()
+
+    def _hide_collision_geoms(self) -> None:
+        """Move the URDF's collision geoms into COLLISION_GEOM_GROUP.
+
+        MuJoCo's URDF importer is the discriminator: it gives ``<visual>`` geoms
+        ``contype``/``conaffinity`` 0 and ``<collision>`` geoms 1. The ground
+        plane this module adds is non-colliding too (contacts are disabled), so
+        it keeps its own group and stays visible.
+        """
+        collision = (self.model.geom_contype != 0) | (self.model.geom_conaffinity != 0)
+        self.model.geom_group[collision] = COLLISION_GEOM_GROUP
+        logger.info(
+            "Hid %d collision geoms from the viewer (group %d); %d visual geoms remain",
+            int(collision.sum()),
+            COLLISION_GEOM_GROUP,
+            int((~collision).sum()),
+        )
+
     def view(self, role: str) -> SceneView:
         """Return the simulator adapter for one bridge."""
         if role not in ROLES:
@@ -426,7 +510,8 @@ class MobileDuoMujocoScene:
         cannot pin the arms.
         """
         lower, upper = SPINE_LIMITS_M
-        self.data.qpos[self.spine_qpos_adr] = min(max(float(position_m), lower), upper)
+        self._spine_position_m = min(max(float(position_m), lower), upper)
+        self.data.qpos[self.spine_qpos_adr] = self._spine_position_m
         self.data.qvel[self.spine_dof_idx] = 0.0
 
     def get_role_state(self, role: str) -> Dict[str, np.ndarray]:
@@ -465,8 +550,17 @@ class MobileDuoMujocoScene:
 
         self.swerve.apply(self.dt)
 
-        if self.spine_model is not None:
-            self.set_spine_position(self.spine_model.position_m())
+        # The lift is placed every step, not only when a spine device is
+        # attached: gravity is compensated, so an unwritten prismatic joint is
+        # weightless and free, and the carriage (with both arms on it) creeps up
+        # the tower on numerical noise -- ~0.15 m over four minutes when run
+        # without --spine. Holding the last commanded height matches the real
+        # device, which is closed-loop and stays where it was put.
+        self.set_spine_position(
+            self.spine_model.position_m()
+            if self.spine_model is not None
+            else self._spine_position_m
+        )
 
         for role in ARM_ROLES:
             self.data.qfrc_applied[self.arm_dofs_idx[role]] = self.arm_control_torque(role)
@@ -550,11 +644,11 @@ class MobileDuoMujocoScene:
                     next_render = now + render_period
 
             next_step += self.dt
-            slack = next_step - time.perf_counter()
-            if slack > 0:
-                time.sleep(slack)
-            elif slack < -self.dt:
-                next_step = time.perf_counter()
+            now = time.perf_counter()
+            if next_step > now:
+                time.sleep(next_step - now)
+            elif now - next_step > MAX_CATCHUP_LAG_S:
+                next_step = now
                 next_render = max(next_render, next_step)
 
             # Wall-clock RTF measured after pacing: when physics keeps up, the
@@ -571,6 +665,7 @@ class MobileDuoMujocoScene:
         if self.enable_vis and self.viewer is None:
             import mujoco.viewer
 
+            log_gl_renderer()
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
 
         self.running = True

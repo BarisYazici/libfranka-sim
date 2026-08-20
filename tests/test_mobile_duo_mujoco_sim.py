@@ -8,6 +8,8 @@ are skipped when the generated ``mobile_fr3_duo.urdf`` or the
 
 import math
 import os
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +19,11 @@ mujoco = pytest.importorskip("mujoco")
 
 from franka_sim.franka_genesis_sim import ControlMode  # noqa: E402
 from franka_sim.mobile_duo_mujoco_sim import (  # noqa: E402
+    COLLISION_GEOM_GROUP,
     DEFAULT_DT,
+    MAX_CATCHUP_LAG_S,
     MobileDuoMujocoScene,
+    log_gl_renderer,
     patch_urdf_for_mujoco,
 )
 from franka_sim.mobile_duo_sim import (  # noqa: E402
@@ -240,6 +245,20 @@ def test_spine_follows_the_spine_model_and_clamps_to_its_travel(scene):
     assert scene.data.qpos[scene.spine_qpos_adr] == pytest.approx(SPINE_LIMITS_M[0])
 
 
+def test_the_lift_holds_its_height_without_a_spine_device(scene):
+    """Gravity is compensated, so an unwritten lift would drift up the tower."""
+    assert scene.spine_model is None
+    step(scene, seconds=2.0)
+    assert scene.data.qpos[scene.spine_qpos_adr] == pytest.approx(SPINE_LIMITS_M[0], abs=1e-9)
+
+    scene.spine_model = FixedSpine(0.5)
+    step(scene, seconds=0.05)
+    scene.spine_model = None
+    step(scene, seconds=2.0)
+    # The last commanded height is held, not released.
+    assert scene.data.qpos[scene.spine_qpos_adr] == pytest.approx(0.5, abs=1e-9)
+
+
 def test_moving_the_spine_does_not_pin_the_arms(scene):
     """The lift teleport must not zero the arm velocities (the Genesis trap)."""
     scene.spine_model = FixedSpine(0.3)
@@ -308,6 +327,166 @@ def test_arm_ee_poses_are_above_the_platform_and_mirrored(scene):
     assert left[1] > 0.0 > right[1]
     assert left[0] == pytest.approx(right[0], abs=1e-6)
     assert left[2] == pytest.approx(right[2], abs=1e-6)
+
+
+# -- rendering ------------------------------------------------------------
+#
+# The viewer renders geom groups 0-2 by default, so what lands in which group
+# decides what the user actually sees. These lock that down: the physics is
+# read through data.xpos/qpos and the picture through data.geom_xpos, and both
+# come off the same forward kinematics, so a wrong picture means a wrong group
+# or a geom bound to the wrong body -- not stale data.
+
+DEFAULT_VIEWER_GROUPS = (0, 1, 2)
+
+
+def geoms_of(built, body_name):
+    """Geom ids attached to one body."""
+    body_id = mujoco.mj_name2id(built.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    return [i for i in range(built.model.ngeom) if built.model.geom_bodyid[i] == body_id]
+
+
+def visible_geoms_of(built, body_name):
+    """Geom ids on one body that the default viewer draws."""
+    return [
+        i for i in geoms_of(built, body_name) if built.model.geom_group[i] in DEFAULT_VIEWER_GROUPS
+    ]
+
+
+def test_collision_geoms_are_hidden_from_the_default_viewer(scene):
+    colliding = (scene.model.geom_contype != 0) | (scene.model.geom_conaffinity != 0)
+    assert colliding.any(), "the URDF should still carry collision geoms"
+    assert np.all(scene.model.geom_group[colliding] == COLLISION_GEOM_GROUP)
+    assert COLLISION_GEOM_GROUP not in DEFAULT_VIEWER_GROUPS
+
+    # ...and the visual geoms are the ones left visible.
+    assert np.all(np.isin(scene.model.geom_group[~colliding], DEFAULT_VIEWER_GROUPS))
+
+
+def test_the_ground_plane_stays_visible(scene):
+    ground = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_GEOM, "ground_plane")
+    assert ground >= 0
+    assert scene.model.geom_group[ground] in DEFAULT_VIEWER_GROUPS
+
+
+@pytest.mark.parametrize("prefix", ["left_fr3v2", "right_fr3v2"])
+def test_every_arm_link_is_drawn_exactly_once(scene, prefix):
+    """Both arms must render as arms: one visual mesh per link, no hull on top."""
+    for index in range(8):
+        visible = visible_geoms_of(scene, f"{prefix}_link{index}")
+        assert len(visible) == 1, f"{prefix}_link{index} draws {len(visible)} geoms"
+        assert scene.model.geom_type[visible[0]] == mujoco.mjtGeom.mjGEOM_MESH
+
+
+def test_visual_geoms_are_rigidly_attached_to_their_link_frame(scene):
+    """Each visible geom sits at its own body's frame, at every joint angle."""
+    q = ARM_INITIAL_Q + np.array([0.3, 0.2, -0.4, 0.3, 0.5, -0.2, 0.1])
+    for role in ARM_ROLES:
+        scene.data.qpos[scene.arm_qpos_adr[role]] = q
+    mujoco.mj_forward(scene.model, scene.data)
+
+    for index in range(8):
+        for prefix in ("left_fr3v2", "right_fr3v2"):
+            body = f"{prefix}_link{index}"
+            body_id = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, body)
+            for geom in visible_geoms_of(scene, body):
+                expected = (
+                    scene.data.xpos[body_id]
+                    + scene.data.xmat[body_id].reshape(3, 3) @ scene.model.geom_pos[geom]
+                )
+                assert scene.data.geom_xpos[geom] == pytest.approx(expected, abs=1e-9), body
+
+
+def test_arm_visuals_move_with_the_commanded_joint_angles(scene):
+    link7 = visible_geoms_of(scene, "left_fr3v2_link7")[0]
+    before = np.array(scene.data.geom_xpos[link7])
+
+    target = ARM_INITIAL_Q.copy()
+    target[0] += 0.5
+    scene.update_arm_joint_positions(ROLE_LEFT, target)
+    step(scene)
+
+    after = np.array(scene.data.geom_xpos[link7])
+    assert np.linalg.norm(after - before) > 0.1
+    # The drawn geom and the reported O_T_EE agree: one forward kinematics.
+    reported = np.asarray(scene.get_role_state(ROLE_LEFT)["O_T_EE"]).reshape(4, 4).T[:3, 3]
+    assert np.linalg.norm(after - reported) < 0.2
+
+
+def test_base_and_spine_visuals_follow_the_kinematic_writes(scene):
+    """The chassis and lift teleports move the drawn geometry, not just qpos."""
+    platform = visible_geoms_of(scene, "base_link")[0]
+    carriage = visible_geoms_of(scene, "left_fr3v2_link0")[0]
+    platform_before = np.array(scene.data.geom_xpos[platform])
+    carriage_before = np.array(scene.data.geom_xpos[carriage])
+
+    scene.spine_model = FixedSpine(0.6)
+    scene.update_base_twist([0.15, 0.0, 0.0, 0.0, 0.0, 0.0])
+    step(scene)
+
+    platform_after = np.array(scene.data.geom_xpos[platform])
+    carriage_after = np.array(scene.data.geom_xpos[carriage])
+    # The platform advanced along +x with the integrated pose.
+    assert platform_after[0] - platform_before[0] == pytest.approx(0.15, abs=5e-3)
+    # The lift carried the arm mount up the tower.
+    assert carriage_after[2] - carriage_before[2] == pytest.approx(0.6, abs=1e-2)
+    # ...and the arm went along for the ride in x too.
+    assert carriage_after[0] - carriage_before[0] == pytest.approx(0.15, abs=5e-3)
+
+
+# -- pacing ---------------------------------------------------------------
+
+
+class SlowSyncViewer:
+    """Stub passive-viewer handle whose sync() blocks like the real one.
+
+    ``mujoco.viewer``'s ``sync()`` waits on the mutex the render thread holds
+    while drawing, which measures ~12 ms per call on the reference host.
+    """
+
+    def __init__(self, sync_delay_s=0.012):
+        self.sync_delay_s = sync_delay_s
+        self.syncs = 0
+
+    def is_running(self):
+        """The stub viewer window is always open."""
+        return True
+
+    def sync(self):
+        """Block for one render-thread mutex hold."""
+        self.syncs += 1
+        time.sleep(self.sync_delay_s)
+
+
+def test_max_catchup_lag_absorbs_a_whole_render_frame():
+    """A 30 FPS frame's worth of stall must be caught up, never discarded."""
+    assert MAX_CATCHUP_LAG_S > 1.0 / 30.0
+
+
+def test_paced_loop_holds_real_time_through_slow_viewer_syncs(scene):
+    """Regression: viewer syncs used to reset the deadline and drop sim time."""
+    scene.viewer = SlowSyncViewer()
+    scene.running = True
+
+    start_time = scene.data.time
+    wall_start = time.perf_counter()
+    thread = threading.Thread(target=scene.run_simulation, daemon=True)
+    thread.start()
+    time.sleep(3.0)
+    scene.running = False
+    thread.join(timeout=5.0)
+    wall_elapsed = time.perf_counter() - wall_start
+    scene.viewer = None
+
+    assert not thread.is_alive()
+    rtf = (scene.data.time - start_time) / wall_elapsed
+    assert rtf > 0.95, f"real-time factor {rtf:.2f} with a slow viewer sync"
+
+
+def test_log_gl_renderer_never_raises():
+    """Diagnostics only: a headless or GL-less host must not break startup."""
+    result = log_gl_renderer()
+    assert result is None or isinstance(result, str)
 
 
 def test_snapshots_are_copies_the_next_step_cannot_mutate(scene):
