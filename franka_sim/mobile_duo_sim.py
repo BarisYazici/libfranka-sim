@@ -25,23 +25,15 @@ from franka_sim.franka_genesis_sim import (
     resolve_fr3_joint_damping,
     resolve_gs_backend,
 )
+from franka_sim.sim_common import (
+    FR3_FORCE_LIMITS,
+    RealtimeFactorMonitor,
+    pose_to_column_major,
+)
 from franka_sim.swerve_base import SwerveBase
 from franka_sim.urdf_assets import resolve_urdf_meshes
 
 logger = logging.getLogger(__name__)
-
-#: Wall-clock window (s) the WARNING check averages the real-time factor
-#: over. Short enough to surface overload promptly, long enough that one
-#: slow step (a GC pause, a render frame) doesn't false-trigger it.
-RTF_WARN_INTERVAL_S = 5.0
-
-#: Wall-clock window (s) the informational real-time-factor log uses,
-#: regardless of value.
-RTF_INFO_INTERVAL_S = 60.0
-
-#: Below this real-time factor over an RTF_WARN_INTERVAL_S window, physics
-#: is falling behind wall-clock real time and a WARNING is logged.
-RTF_WARN_THRESHOLD = 0.95
 
 ROLE_LEFT = "left"
 ROLE_RIGHT = "right"
@@ -66,100 +58,11 @@ ARM_EE_LINKS: Dict[str, str] = {
 #: mobile_fr3_duo.ros2_control.xacro.
 ARM_INITIAL_Q = np.array([0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4])
 
-#: FR3 actuator limits: joints 1-4 +/-87 Nm, joints 5-7 +/-12 Nm.
-FR3_FORCE_LIMITS = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
-
 #: Prismatic lift joint carrying the mount, the head and both arms.
 SPINE_JOINT_NAME = "franka_spine_vertical_joint"
 
 #: Travel limits of that joint in the combined URDF (metres).
 SPINE_LIMITS_M = (0.0, 0.85)
-
-
-def pose_to_column_major(position, quat_wxyz) -> np.ndarray:
-    """Build a column-major 4x4 transform from a position and a (w, x, y, z) quat."""
-    w, x, y, z = (float(value) for value in quat_wxyz)
-    rotation = np.array(
-        [
-            [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * w * z, 2 * x * z + 2 * w * y],
-            [2 * x * y + 2 * w * z, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * w * x],
-            [2 * x * z - 2 * w * y, 2 * y * z + 2 * w * x, 1 - 2 * x * x - 2 * y * y],
-        ]
-    )
-    matrix = np.eye(4)
-    matrix[:3, :3] = rotation
-    matrix[:3, 3] = np.asarray(position, dtype=float)
-    return matrix.T.flatten()
-
-
-class RealtimeFactorMonitor:
-    """Tracks the achieved real-time factor (RTF) of the paced stepping loop.
-
-    ``run_simulation`` calls :meth:`update` once per iteration with the
-    current wall-clock time (``time.perf_counter()``, taken *after* that
-    iteration's pacing sleep so it reflects the loop's true wall-clock rate)
-    and the amount of simulated time the step just advanced (``dt``).
-
-    ``start_wall`` is the loop's own wall-clock origin (``run_simulation``
-    passes its ``next_step`` starting value) so the first window's elapsed
-    wall time is measured from when the loop actually started, not from an
-    arbitrary first ``update()`` call -- seeding the marks from the first
-    call instead would silently shift every later window boundary by one
-    step's worth of wall time.
-
-    Two independent windows are tracked purely by wall-clock elapsed time:
-    every ``RTF_WARN_INTERVAL_S`` the windowed RTF (simulated-time delta /
-    wall-time delta) is checked and a WARNING is logged if physics fell
-    behind (RTF < ``RTF_WARN_THRESHOLD``, i.e. the loop could not keep pace
-    with real time despite the pacing sleep); every ``RTF_INFO_INTERVAL_S``
-    the windowed RTF is logged at INFO regardless of value. Nothing is
-    logged per-step.
-    """
-
-    def __init__(
-        self,
-        logger_,
-        start_wall: float,
-        warn_interval_s: float = RTF_WARN_INTERVAL_S,
-        info_interval_s: float = RTF_INFO_INTERVAL_S,
-        warn_threshold: float = RTF_WARN_THRESHOLD,
-    ):
-        self._logger = logger_
-        self._warn_interval_s = warn_interval_s
-        self._info_interval_s = info_interval_s
-        self._warn_threshold = warn_threshold
-
-        self._sim_time = 0.0
-        self._warn_wall_mark = start_wall
-        self._warn_sim_mark = 0.0
-        self._info_wall_mark = start_wall
-        self._info_sim_mark = 0.0
-
-    def update(self, now: float, dt: float) -> None:
-        """Record one step (``dt`` of sim time at wall-clock time ``now``)."""
-        self._sim_time += dt
-
-        if now - self._warn_wall_mark >= self._warn_interval_s:
-            rtf = self._window_rtf(now, self._warn_wall_mark, self._warn_sim_mark)
-            if rtf < self._warn_threshold:
-                self._logger.warning(
-                    "simulation running at %.2fx real time (physics overloaded)", rtf
-                )
-            self._warn_wall_mark = now
-            self._warn_sim_mark = self._sim_time
-
-        if now - self._info_wall_mark >= self._info_interval_s:
-            rtf = self._window_rtf(now, self._info_wall_mark, self._info_sim_mark)
-            self._logger.info("simulation running at %.2fx real time", rtf)
-            self._info_wall_mark = now
-            self._info_sim_mark = self._sim_time
-
-    def _window_rtf(self, now: float, wall_mark: float, sim_mark: float) -> float:
-        wall_elapsed = now - wall_mark
-        sim_elapsed = self._sim_time - sim_mark
-        if wall_elapsed <= 0:
-            return 1.0
-        return sim_elapsed / wall_elapsed
 
 
 class MobileDuoScene:

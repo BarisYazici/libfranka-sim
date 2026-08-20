@@ -3,6 +3,7 @@
 import argparse
 import enum
 import errno
+import importlib
 import logging
 import select
 import socket
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from franka_sim.franka_genesis_sim import ControlMode, FrankaGenesisSim
+from franka_sim.control_modes import ControlMode
 from franka_sim.franka_protocol import (
     COMMAND_PORT,
     Command,
@@ -37,6 +38,31 @@ from franka_sim.robot_state import RobotState
 # Configure detailed logging for debugging
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+#: Single-arm physics backends, mapped to the module and class implementing the
+#: simulator contract this server consumes. Imported lazily in
+#: :func:`resolve_sim_class` so choosing one backend never pays the other's
+#: (multi-second, native) import cost -- and so an install without Genesis can
+#: still run the default one.
+SINGLE_ARM_PHYSICS = {
+    "genesis": ("franka_sim.franka_genesis_sim", "FrankaGenesisSim"),
+    "mujoco": ("franka_sim.mujoco_franka_sim", "MujocoFrankaSim"),
+}
+
+#: Backend used when the caller does not inject a simulator or name one. MuJoCo
+#: holds real time at the 1 ms step the FCI serves; Genesis needs 2.5 ms.
+DEFAULT_PHYSICS = "mujoco"
+
+
+def resolve_sim_class(physics: str = DEFAULT_PHYSICS):
+    """Import and return the single-arm simulator class for one physics backend."""
+    if physics not in SINGLE_ARM_PHYSICS:
+        raise ValueError(
+            f"Unknown physics backend {physics!r}; expected one of {sorted(SINGLE_ARM_PHYSICS)}"
+        )
+    module_name, class_name = SINGLE_ARM_PHYSICS[physics]
+    return getattr(importlib.import_module(module_name), class_name)
 
 
 class RobotMode(enum.IntEnum):
@@ -73,6 +99,7 @@ class FrankaSimServer:
         gripper_backend=None,
         gripper_physics: bool = False,
         mobile_base: bool = False,
+        physics: str = DEFAULT_PHYSICS,
     ):
         """
         Initialize the Franka simulation server.
@@ -80,8 +107,12 @@ class FrankaSimServer:
         Args:
             host: IP address to bind to (default: all interfaces)
             port: TCP port for command interface
-            enable_vis: Enable visualization of the Genesis simulator
-            genesis_sim: Optional pre-configured Genesis simulator instance for testing
+            enable_vis: Enable visualization of the simulator
+            genesis_sim: Optional pre-configured simulator instance (any backend,
+                or a fake in tests). Kept under its historical name because
+                dozens of callers inject through it.
+            physics: Backend built when ``genesis_sim`` is not injected --
+                ``mujoco`` (default) or ``genesis``.
             urdf_path: URDF served to the client via GetRobotModel. Defaults to the
                 bundled hand-less FR3 arm model.
             mobile_base: Serve a swerve mobile base instead of an arm. The
@@ -112,10 +143,10 @@ class FrankaSimServer:
         # SwerveBase._twist_rejected.
         self._mobile_hold_logged = False
 
-        # Initialize Genesis simulator
+        # Build the physics backend unless one was injected.
         if genesis_sim is None:
-            logger.info("Initializing simulation")
-            self.genesis_sim = FrankaGenesisSim(
+            logger.info("Initializing simulation (physics backend: %s)", physics)
+            self.genesis_sim = resolve_sim_class(physics)(
                 enable_vis=enable_vis, enable_hand=(gripper_physics and enable_gripper)
             )
             logger.info("Simulation initialized")

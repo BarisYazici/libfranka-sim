@@ -173,7 +173,7 @@ def test_cli_defaults_leave_the_single_arm_path_untouched():
     assert args.urdf is None
     assert args.no_gripper is False
     assert args.gripper_physics is False
-    assert args.physics == "genesis"
+    assert args.physics == "mujoco"
     run_server.validate_args(args)
 
 
@@ -197,10 +197,12 @@ def test_cli_selects_the_mujoco_physics_backend():
     run_server.validate_args(args)
 
 
-def test_cli_rejects_a_physics_choice_without_mobile_duo():
-    args = run_server.build_parser().parse_args(["--physics", "mujoco"])
-    with pytest.raises(ValueError, match="--physics"):
-        run_server.validate_args(args)
+def test_cli_accepts_a_physics_choice_for_the_single_arm():
+    """--physics selects the single-arm backend too, so it needs no --mobile-duo."""
+    args = run_server.build_parser().parse_args(["--physics", "genesis"])
+    assert args.mobile_duo is False
+    assert args.physics == "genesis"
+    run_server.validate_args(args)
 
 
 def test_cli_rejects_an_unknown_physics_backend():

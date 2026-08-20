@@ -4,15 +4,30 @@ import os
 import platform
 import sys
 import time
-from enum import Enum
 from pathlib import Path
 
 import genesis as gs
 import numpy as np
 
+from franka_sim.control_modes import ControlMode
+from franka_sim.sim_common import DEFAULT_FR3_DAMPING, resolve_fr3_joint_damping
+
 # import pinocchio as pin
 
 logger = logging.getLogger(__name__)
+
+#: Re-exported so ``from franka_sim.franka_genesis_sim import ControlMode`` (and
+#: the damping helpers) keep working now that they live in genesis-free modules
+#: -- the MuJoCo backends are the default and must not import ``genesis``.
+__all__ = [
+    "ControlMode",
+    "DEFAULT_FR3_DAMPING",
+    "FrankaGenesisSim",
+    "GS_BACKEND_NAMES",
+    "default_fr3_mjcf",
+    "resolve_fr3_joint_damping",
+    "resolve_gs_backend",
+]
 
 
 def default_fr3_mjcf():
@@ -37,33 +52,6 @@ def default_fr3_mjcf():
             f"{exc}). It is downloaded and cached on first use, so the first run needs "
             "network access; set $FR3_MJCF to a local MJCF path to run fully offline."
         ) from exc
-
-
-# Default joint viscous damping (Nm*s/rad), applied to all 7 joints unless
-# overridden via $FR3_JOINT_DAMPING. Calibrated against a logged real-robot
-# joint_impedance run so the sim's joint excursions match the real FR3 to within
-# ~5% (the bare MJCF value of 0.21 is far too small and the sim over-travels).
-DEFAULT_FR3_DAMPING = 5.0
-
-
-def resolve_fr3_joint_damping(default: float = DEFAULT_FR3_DAMPING) -> np.ndarray:
-    """Resolve per-joint FR3 viscous damping (Nm*s/rad) from $FR3_JOINT_DAMPING.
-
-    A scalar broadcasts to all 7 joints; 7 comma-separated values set each
-    joint individually; unset (or empty) falls back to ``default``. Shared by
-    the single-arm sim and the mobile-duo scene so every FR3 arm in the
-    process honors the same override with identical parsing/validation.
-    """
-    damping_env = os.environ.get("FR3_JOINT_DAMPING")
-    if damping_env:
-        vals = [float(x) for x in damping_env.split(",")]
-        if len(vals) not in (1, 7):
-            raise ValueError(
-                f"FR3_JOINT_DAMPING must be 1 (scalar) or 7 comma-separated "
-                f"values, got {len(vals)}"
-            )
-        return np.array(vals * 7 if len(vals) == 1 else vals, dtype=float)
-    return np.full(7, default, dtype=float)
 
 
 #: Genesis compute backends selectable via $FRANKA_SIM_BACKEND, and the gs
@@ -103,14 +91,6 @@ def resolve_gs_backend(gs_module=None, default: str = "cpu"):
         )
     logger.info("Genesis backend: %s", backend_name)
     return getattr(gs_module, GS_BACKEND_NAMES[backend_name])
-
-
-class ControlMode(Enum):
-    POSITION = "position"
-    VELOCITY = "velocity"
-    TORQUE = "torque"
-    STEERING_DRIVE = "steering_drive"  # mobile base: steering=position, drive=velocity
-    NONE = "none"
 
 
 class FrankaGenesisSim:

@@ -19,6 +19,11 @@ MOBILE_DUO_PHYSICS = {
     "mujoco": ("franka_sim.mobile_duo_mujoco_sim", "MobileDuoMujocoScene"),
 }
 
+#: Physics backend used unless ``--physics`` says otherwise, for the single arm
+#: and the mobile duo alike. MuJoCo holds real time at the 1 ms step the FCI
+#: serves, where Genesis needs 2.5 ms and still falls behind in the duo scene.
+DEFAULT_PHYSICS = "mujoco"
+
 
 def resolve_scene_class(physics: str):
     """Import and return the mobile-duo scene class for one physics backend."""
@@ -35,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--vis",
         action="store_true",
         default=False,
-        help="Enable visualization of the Genesis simulator",
+        help="Enable visualization of the simulator",
     )
     parser.add_argument(
         "--urdf",
@@ -53,27 +58,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gripper-physics",
         action="store_true",
-        help="Use the Genesis physics gripper (9-DOF, fingers move in the viewer)",
+        help="Use the physics gripper (9-DOF, fingers move in the viewer)",
     )
     parser.add_argument(
         "--mobile-duo",
         action="store_true",
         default=False,
-        help="Serve the mobile FR3 duo: one Genesis scene, three FCI bridges "
+        help="Serve the mobile FR3 duo: one physics scene, three FCI bridges "
         "(left arm, right arm, TMR base)",
     )
     parser.add_argument(
         "--scene-urdf",
         type=str,
         default=None,
-        help="Combined mobile_fr3_duo URDF loaded into Genesis (required with --mobile-duo)",
+        help="Combined mobile_fr3_duo URDF loaded into the scene (required with --mobile-duo)",
     )
     parser.add_argument(
         "--physics",
         choices=sorted(MOBILE_DUO_PHYSICS),
-        default="genesis",
-        help="Physics backend for the mobile-duo scene (requires --mobile-duo): "
-        "genesis (default) or mujoco, which holds real time at a 1 ms step",
+        default=DEFAULT_PHYSICS,
+        help="Physics backend for the single arm and the mobile-duo scene alike: "
+        "mujoco, which holds real time at a 1 ms step, or genesis "
+        f"(default: {DEFAULT_PHYSICS})",
     )
     parser.add_argument(
         "--mesh-root",
@@ -126,8 +132,6 @@ def validate_args(args) -> None:
             raise ValueError("--scene-urdf and --bind require --mobile-duo")
         if args.spine or args.spine_cert or args.spine_key:
             raise ValueError("--spine and the --spine-* options require --mobile-duo")
-        if args.physics != "genesis":
-            raise ValueError("--physics requires --mobile-duo")
         return
 
     if not args.scene_urdf:
@@ -190,6 +194,7 @@ def run_single_arm(args) -> None:
     from franka_sim import FrankaSimServer
 
     print(f"Starting Franka Simulation Server {'with' if args.vis else 'without'} visualization")
+    print(f"  physics backend -> {args.physics}")
     print("Connect to the server using 'localhost' or '127.0.0.1' as the robot IP address")
     print("Press Ctrl+C to stop the server")
 
@@ -198,6 +203,7 @@ def run_single_arm(args) -> None:
         urdf_path=args.urdf,
         enable_gripper=not args.no_gripper,
         gripper_physics=args.gripper_physics,
+        physics=args.physics,
     )
     try:
         server.start()
