@@ -48,7 +48,10 @@ def real_genesis():
     fsm = None
     original_gs = None
     try:
-        import genesis as gs
+        try:
+            import genesis as gs
+        except ImportError:
+            pytest.skip("Genesis is not installed; skipping physics integration tests.")
 
         if not isinstance(getattr(gs, "__file__", None), str):
             pytest.skip("real genesis could not be loaded")
@@ -98,6 +101,7 @@ def physics_gripper(real_genesis):
     sim_thread.join(timeout=2.0)
 
 
+@genesis_required
 def test_wire_client_move_drives_physics_fingers(physics_gripper):
     """A libfranka-style wire client opens/closes the physics fingers and sees it over UDP."""
     from examples.gripper.gripper_wire_client import GripperWireClient

@@ -37,15 +37,9 @@ jobs:
 
     - name: Install package dependencies
       run: |
-        python -m pip install numpy==1.26.4 genesis-world==0.2.1 numba==0.60.0 'robot_descriptions>=1.12' pytest pytest-cov
-        # Install PyTorch based on OS
-        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-          # For Linux, use CPU-only PyTorch from specific URL
-          python -m pip install torch==2.0.1+cpu torchvision==0.15.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
-        else
-          # For macOS, use standard PyTorch package
-          python -m pip install torch==2.0.1 torchvision==0.15.2
-        fi
+        # Core deps only (MuJoCo is the default physics backend; Genesis is
+        # an optional extra and is not needed to build/import the package).
+        python -m pip install numpy==1.26.4 'mujoco>=3.2,<3.3' 'trimesh>=4.0' 'robot_descriptions>=1.12' pytest pytest-cov
         # Verify numpy is installed
         python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
 
@@ -149,7 +143,7 @@ jobs:
         body: |
           # franka-sim ${{ steps.get_release_info.outputs.version }}
 
-          A high-fidelity Genesis simulation server that communicates with the Franka robot's network protocol, enabling seamless switching between simulation and hardware.
+          A high-fidelity simulation server that communicates with the Franka robot's network protocol, enabling seamless switching between simulation and hardware. Runs on MuJoCo by default; Genesis is available via `pip install 'franka-sim[genesis]'`.
 
           ## Installation
 

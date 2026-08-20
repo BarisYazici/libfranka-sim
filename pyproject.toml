@@ -9,9 +9,11 @@ requires-python = ">=3.8"
 dynamic = ["version"]  # Use dynamic versioning from git tags
 dependencies = [
     "numpy==1.26.4",
-    "genesis-world==0.2.1",
-    "numba==0.60.0",
-    "torch>=2.0.0",
+    # Upper bound: mujoco_franka_sim.py's MjSpec light setup (light.directional)
+    # breaks on mujoco>=3.3 (the attribute was removed from MjsLight there,
+    # verified against 3.3.7). Widen once that call site is ported.
+    "mujoco>=3.2,<3.3",
+    "trimesh>=4.0",
     "robot_descriptions>=1.12",
     "pytest"
 ]
@@ -53,14 +55,17 @@ dev = [
     "pytest-cov>=4.1.0",
 
 ]
-mobile = [
-    "trimesh>=4.0",
-]
-# --physics mujoco for the mobile-duo scene. Kept out of the base
-# dependencies so the Genesis-only install stays unchanged; MjSpec (used to
-# give the chassis root its freejoint) needs MuJoCo 3.2 or newer.
-mujoco = [
-    "mujoco>=3.2",
+# --physics genesis for the single-arm and mobile-duo scenes. Kept out of the
+# base dependencies since MuJoCo (the default backend) holds real time at the
+# FCI's 1 ms step where Genesis needs 2.5 ms and still falls behind on the
+# duo scene; pull this extra in only to run the Genesis path.
+# NOTE: genesis-world==0.2.1 needs "libigl<2.6" (>=2.6 changes
+# igl.signed_distance's return arity); pip install that pin alongside this
+# extra if Genesis import fails with an unpacking error.
+genesis = [
+    "genesis-world==0.2.1",
+    "numba==0.60.0",
+    "torch>=2.0.0",
 ]
 
 [tool.setuptools]

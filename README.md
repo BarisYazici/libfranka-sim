@@ -1,6 +1,6 @@
 # Franka Simulation Server
 
-A high-fidelity Genesis simulation server that communicates with the Franka robot's network protocol, enabling seamless switching between simulation and hardware.
+A high-fidelity simulation server that communicates with the Franka robot's network protocol, enabling seamless switching between simulation and hardware. Runs on MuJoCo by default; Genesis is available as an optional backend.
 
 ## Overview
 
@@ -51,7 +51,8 @@ and are **not** compatible with this server.
 
 ![Architecture](./assets/libfranka_sim.svg)
 
-In this repository, we only provide the simulation server backend with Genesis connection.
+In this repository, we only provide the simulation server backend, with a
+choice of physics engines behind it (MuJoCo by default, Genesis optionally).
 
 The libfranka python bindings will become available in a separate repository.
 
@@ -62,8 +63,8 @@ The system consists of several key components:
    - Handles TCP command interface and UDP state updates
    - Targets the latest libfranka wire protocol (robot server version 10)
 
-2. **Genesis Simulation Backend**
-   - Physics-based robot simulation using the Genesis engine
+2. **Physics Simulation Backend**
+   - Physics-based robot simulation using MuJoCo (default) or Genesis (`--physics genesis`)
    - Real-time joint state computation and dynamics
 
 3. **State Management**
@@ -88,18 +89,26 @@ The system consists of several key components:
 
 ### Prerequisites
 - Python 3.9+
-- genesis-world==0.2.1
 - numpy==1.26.4
-- numba==0.60.0
+- mujoco>=3.2,<3.3 (the default physics backend, installed automatically)
+
+Genesis is an optional backend (`--physics genesis`) — see below.
 
 ### Installation
 
 #### Option 1: Install from PyPI (Recommended)
 
-The package is available on PyPI and can be installed with pip:
+The package is available on PyPI and can be installed with pip. This pulls in
+MuJoCo, the default physics backend:
 
 ```bash
 pip install franka-sim
+```
+
+To also use the Genesis backend, install the `genesis` extra:
+
+```bash
+pip install 'franka-sim[genesis]'
 ```
 
 #### Option 2: Install from Source
@@ -160,7 +169,7 @@ python -m franka_sim.run_server -v --no-gripper
 
 ### Mobile duo (two arms + TMR base on one scene)
 
-`--mobile-duo` serves the mobile FR3 duo: one Genesis scene (both arms and the
+`--mobile-duo` serves the mobile FR3 duo: one physics scene (both arms and the
 TMR mobile base, physically rigid to each other) driven by **three** FCI
 bridges, one per role. libfranka clients cannot be told to use a port other
 than 1337, so the bridges are separated by **host IP** instead — each is
@@ -184,10 +193,10 @@ python -m franka_sim.run_server --mobile-duo \
 | Flag | Meaning |
 | ---- | ------- |
 | `--mobile-duo` | Serve the mobile duo instead of the classic single-arm server |
-| `--scene-urdf PATH` | The combined `mobile_fr3_duo` URDF loaded into the one Genesis scene (required with `--mobile-duo`; see below for generating it) |
+| `--scene-urdf PATH` | The combined `mobile_fr3_duo` URDF loaded into the one physics scene (required with `--mobile-duo`; see below for generating it) |
 | `--mesh-root PATH` | Package root used to resolve `package://` mesh URIs in the URDF — a `franka_description` checkout; defaults to the URDF's own directory |
 | `--bind ROLE=HOST` | Bind one bridge to a host address; repeat for `left`, `right` and `base` (all three are required) |
-| `--physics {genesis,mujoco}` | Physics backend for the scene (default `genesis`) |
+| `--physics {genesis,mujoco}` | Physics backend for the scene (default `mujoco`) |
 
 By convention this repo uses three loopback aliases on `127.0.0.0/8`, one per
 role, plus a fourth for the spine device:
@@ -202,16 +211,18 @@ role, plus a fourth for the spine device:
 Every bridge still listens on the standard libfranka command port (1337);
 override it for all three at once with `--port`.
 
-**Physics backend.** `--physics mujoco` (needs the `mujoco` extra:
-`pip install 'franka-sim[mujoco]'`) runs the same scene on MuJoCo instead of
-Genesis. Genesis' per-call kernel-launch overhead caps the scene at ~0.4x real
-time at its 2.5 ms step; MuJoCo holds **1.00x real time at a 1 ms step** — the
-rate the FCI bridges actually serve — using about a third of one core. The
-protocol surface, the joint and link names, the initial pose and the reported
-state are identical between the two, so a client cannot tell them apart.
-Contacts are disabled on the MuJoCo path (the chassis' URDF collision meshes
-interpenetrate as authored, and nothing in this scene depends on contact: the
-base pose is integrated kinematically and both arms are servo-driven).
+**Physics backend.** MuJoCo is the default (`--physics mujoco`, or just omit
+the flag) and is installed as a core dependency. `--physics genesis` runs the
+same scene on Genesis instead, and needs the `genesis` extra:
+`pip install 'franka-sim[genesis]'`. Genesis' per-call kernel-launch overhead
+caps the scene at ~0.4x real time at its 2.5 ms step; MuJoCo holds **1.00x
+real time at a 1 ms step** — the rate the FCI bridges actually serve — using
+about a third of one core. The protocol surface, the joint and link names,
+the initial pose and the reported state are identical between the two, so a
+client cannot tell them apart. Contacts are disabled on the MuJoCo path (the
+chassis' URDF collision meshes interpenetrate as authored, and nothing in
+this scene depends on contact: the base pose is integrated kinematically and
+both arms are servo-driven).
 
 **Generating `--scene-urdf`.** `scripts/generate_mobile_duo_urdf.sh
 <franka_description_dir> <output.urdf>` runs the upstream xacro with the
@@ -245,7 +256,7 @@ python -m franka_sim.run_server --mobile-duo \
 
 The spine stub also runs standalone via the `run-franka-spine-stub` console
 script (installed with the package), useful for exercising just the REST
-device without a Genesis scene:
+device without a physics scene:
 
 ```bash
 run-franka-spine-stub --host 127.0.0.13 --port 443
@@ -265,13 +276,19 @@ torque path.
 
 ### Troubleshooting
 
-If you encounter issues related to missing asset files, make sure you have the correct version of `genesis-world` installed:
+If you're running the Genesis backend (`--physics genesis`) and encounter
+issues related to missing asset files, make sure you have the `genesis`
+extra installed with the correct version of `genesis-world`:
 
 ```bash
-pip install genesis-world==0.2.1
+pip install 'franka-sim[genesis]'
 ```
 
-The simulator now automatically uses the assets provided by the Genesis package, so no additional asset files are needed.
+The simulator automatically uses the assets provided by the Genesis package,
+so no additional asset files are needed. Note that `genesis-world==0.2.1`
+also needs `libigl<2.6` (newer libigl changes `igl.signed_distance`'s return
+arity); install that pin alongside the extra if Genesis import fails with an
+unpacking error.
 
 ## Configuration
 
