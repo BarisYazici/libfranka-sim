@@ -23,6 +23,7 @@ import mujoco
 import numpy as np
 
 from franka_sim.franka_genesis_sim import ControlMode, resolve_fr3_joint_damping
+from franka_sim.menagerie_visuals import apply_fr3v2_visuals
 from franka_sim.mobile_duo_sim import (
     ARM_EE_LINKS,
     ARM_INITIAL_Q,
@@ -376,10 +377,15 @@ class MobileDuoMujocoScene:
         base pose is integrated kinematically and the arms are servo-driven, so
         no contact in this scene is load-bearing for what the FCI bridges
         report; the teleop stack does its own collision avoidance.
+
+        The spec is also where both arms trade their flat merged-COLLADA visuals
+        for the Menagerie's per-material ones; see :meth:`_upgrade_arm_visuals`.
         """
         spec = mujoco.MjSpec.from_file(str(urdf_path))
         spec.option.timestep = self.dt
         spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+
+        self._upgrade_arm_visuals(spec)
 
         chassis = spec.worldbody.bodies[0]
         chassis.add_freejoint()
@@ -398,6 +404,27 @@ class MobileDuoMujocoScene:
         light.dir = [0.0, 0.0, -1.0]
 
         return spec.compile()
+
+    def _upgrade_arm_visuals(self, spec) -> bool:
+        """Give both arms the Menagerie FR3 v2 visuals, if they can be resolved.
+
+        Purely cosmetic, and optional by design: ``robot_descriptions`` fetches
+        the Menagerie over the network on first use, so a fresh or offline host
+        can fail here. That must never stop the scene from building -- the
+        converted-URDF visuals it falls back to are the same geometry, just flat
+        grey. See :mod:`franka_sim.menagerie_visuals`.
+        """
+        try:
+            apply_fr3v2_visuals(spec)
+        except Exception as exc:
+            logger.info(
+                "Keeping the converted-URDF arm visuals; the MuJoCo Menagerie FR3 v2 "
+                "model is unavailable (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        return True
 
     def _bind_model(self) -> None:
         """Resolve joint/body addresses once the model is compiled."""

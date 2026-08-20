@@ -18,6 +18,11 @@ import pytest
 mujoco = pytest.importorskip("mujoco")
 
 from franka_sim.franka_genesis_sim import ControlMode  # noqa: E402
+from franka_sim.menagerie_visuals import (  # noqa: E402
+    ASSET_PREFIX,
+    FR3V2_VISUAL_LINKS,
+    resolve_fr3v2_mjcf,
+)
 from franka_sim.mobile_duo_mujoco_sim import (  # noqa: E402
     COLLISION_GEOM_GROUP,
     DEFAULT_DT,
@@ -57,6 +62,28 @@ pytestmark = [
 
 #: Simulated seconds most tests settle for; 1 s at DEFAULT_DT.
 SETTLE_S = 1.0
+
+#: Menagerie ``fr3v2.xml``, or None when it is neither cached nor downloadable.
+#: The scene falls back to the converted-URDF visuals in that case, so only the
+#: tests that assert on the Menagerie visuals themselves are skipped.
+try:
+    MENAGERIE_MJCF = resolve_fr3v2_mjcf()
+except Exception:  # pragma: no cover - depends on the host's cache/network
+    MENAGERIE_MJCF = None
+
+requires_menagerie = pytest.mark.skipif(
+    MENAGERIE_MJCF is None,
+    reason="the MuJoCo Menagerie franka_fr3_v2 model is not available",
+)
+
+#: Visual geoms the Menagerie's ``fr3v2_link0..7`` carry, one per material the
+#: obj2mjcf split produced. Hard-coded rather than read back from the model so a
+#: silently truncated transplant fails the test instead of agreeing with itself.
+MENAGERIE_VISUALS_PER_LINK = (6, 1, 1, 1, 1, 1, 10, 7)
+
+#: What each arm link had before the swap: the one merged ``.obj`` that
+#: ``resolve_urdf_meshes`` writes per ``<visual>`` element.
+URDF_VISUALS_PER_LINK = (1,) * len(FR3V2_VISUAL_LINKS)
 
 
 @pytest.fixture
@@ -369,13 +396,122 @@ def test_the_ground_plane_stays_visible(scene):
     assert scene.model.geom_group[ground] in DEFAULT_VIEWER_GROUPS
 
 
+def expected_visuals_per_link(built):
+    """Per-link visual-geom counts for whichever visual set the scene got."""
+    swapped = any(
+        built.model.geom(geom).name.startswith("left_fr3v2_link0_visual")
+        for geom in geoms_of(built, "left_fr3v2_link0")
+    )
+    return MENAGERIE_VISUALS_PER_LINK if swapped else URDF_VISUALS_PER_LINK
+
+
+def arm_visual_geoms(built, prefix):
+    """Every visible geom of one arm, flattened across its eight links."""
+    return [
+        geom
+        for index in FR3V2_VISUAL_LINKS
+        for geom in visible_geoms_of(built, f"{prefix}_link{index}")
+    ]
+
+
 @pytest.mark.parametrize("prefix", ["left_fr3v2", "right_fr3v2"])
-def test_every_arm_link_is_drawn_exactly_once(scene, prefix):
-    """Both arms must render as arms: one visual mesh per link, no hull on top."""
-    for index in range(8):
+def test_every_arm_link_draws_its_visual_set_exactly_once(scene, prefix):
+    """Both arms render as arms: their visual set once per link, no hull on top."""
+    expected = expected_visuals_per_link(scene)
+    for index in FR3V2_VISUAL_LINKS:
         visible = visible_geoms_of(scene, f"{prefix}_link{index}")
-        assert len(visible) == 1, f"{prefix}_link{index} draws {len(visible)} geoms"
-        assert scene.model.geom_type[visible[0]] == mujoco.mjtGeom.mjGEOM_MESH
+        assert len(visible) == expected[index], f"{prefix}_link{index} draws {len(visible)} geoms"
+        for geom in visible:
+            assert scene.model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_MESH
+
+
+@requires_menagerie
+@pytest.mark.parametrize("prefix", ["left_fr3v2", "right_fr3v2"])
+def test_arm_links_wear_the_menagerie_material_palette(scene, prefix):
+    """The point of the swap: the arms are painted, not one flat default grey.
+
+    The merged ``.obj`` the URDF conversion produces carries no material at all,
+    so every arm geom used to fall back to MuJoCo's default grey ``geom_rgba``.
+    """
+    geoms = arm_visual_geoms(scene, prefix)
+    assert len(geoms) == sum(MENAGERIE_VISUALS_PER_LINK)
+
+    matids = scene.model.geom_matid[geoms]
+    assert np.all(matids >= 0), "an arm visual geom has no material"
+
+    colours = {tuple(np.round(scene.model.mat_rgba[matid], 6)) for matid in matids}
+    assert len(colours) > 1, f"{prefix} renders in a single colour: {colours}"
+    # White body panels and near-black joint rings both appear, so the palette
+    # is the FR3's and not a shade of the old uniform grey.
+    luminance = sorted(sum(colour[:3]) / 3.0 for colour in colours)
+    assert luminance[0] < 0.3 and luminance[-1] > 0.9
+
+
+@requires_menagerie
+def test_both_arms_get_the_same_menagerie_visual_set(scene):
+    """The swap is applied per arm prefix; neither may be skipped."""
+    left = arm_visual_geoms(scene, "left_fr3v2")
+    right = arm_visual_geoms(scene, "right_fr3v2")
+    assert len(left) == len(right) == sum(MENAGERIE_VISUALS_PER_LINK)
+
+    def signature(geoms):
+        return [
+            (
+                scene.model.geom(geom).name.split("_", 1)[1],
+                int(scene.model.geom_dataid[geom]),
+                int(scene.model.geom_matid[geom]),
+            )
+            for geom in geoms
+        ]
+
+    assert signature(left) == signature(right)
+
+
+@requires_menagerie
+def test_menagerie_mesh_assets_are_shared_between_the_two_arms(scene):
+    """One copy of each mesh serves both arms; duplicating them would double RAM."""
+    geoms = arm_visual_geoms(scene, "left_fr3v2") + arm_visual_geoms(scene, "right_fr3v2")
+    meshes = {int(scene.model.geom_dataid[geom]) for geom in geoms}
+    assert len(geoms) == 2 * sum(MENAGERIE_VISUALS_PER_LINK)
+    assert len(meshes) == sum(MENAGERIE_VISUALS_PER_LINK)
+
+    names = {scene.model.mesh(mesh).name for mesh in meshes}
+    assert all(name.startswith(ASSET_PREFIX) for name in names), names
+
+
+def test_scene_falls_back_to_the_urdf_visuals_without_the_menagerie(monkeypatch, scene):
+    """A missing (or un-downloadable) Menagerie must not stop the scene building.
+
+    The fallback is also the reference for "visual only": the two models differ
+    in their visual geoms and in nothing the physics reads.
+    """
+
+    def unavailable():
+        raise RuntimeError("no menagerie for you")
+
+    monkeypatch.setattr(
+        "franka_sim.menagerie_visuals.resolve_fr3v2_mjcf",
+        unavailable,
+    )
+    fallback = MobileDuoMujocoScene(SCENE_URDF, mesh_root=MESH_ROOT)
+    fallback.initialize_simulation()
+    try:
+        for index in FR3V2_VISUAL_LINKS:
+            for prefix in ("left_fr3v2", "right_fr3v2"):
+                visible = visible_geoms_of(fallback, f"{prefix}_link{index}")
+                assert len(visible) == URDF_VISUALS_PER_LINK[index]
+
+        assert (fallback.model.nq, fallback.model.nv) == (scene.model.nq, scene.model.nv)
+        assert fallback.model.body_mass == pytest.approx(scene.model.body_mass)
+        assert fallback.model.body_inertia == pytest.approx(scene.model.body_inertia)
+        assert fallback.model.body_ipos == pytest.approx(scene.model.body_ipos)
+        assert fallback.model.dof_damping == pytest.approx(scene.model.dof_damping)
+        assert fallback.model.dof_armature == pytest.approx(scene.model.dof_armature)
+        # Same collision set too: only non-colliding geoms were touched.
+        colliding = fallback.model.geom_contype != 0
+        assert int(colliding.sum()) == int((scene.model.geom_contype != 0).sum())
+    finally:
+        fallback.stop()
 
 
 def test_visual_geoms_are_rigidly_attached_to_their_link_frame(scene):
