@@ -140,12 +140,22 @@ class FrankaSimServer:
         self.connection_running = False  # New flag for per-connection state
         self.mobile_base = mobile_base
         # Latch so the mobile "motion finished" hold log fires once per
-        # transition, not once per datagram: unlike the arm path, the mobile
-        # branch's control_mode stays STEERING_DRIVE (never becomes POSITION),
-        # so the `if self.control_mode != ControlMode.POSITION` guard around
-        # _switch_to_hold_position() never latches on its own. Mirrors
+        # transition, not once per datagram, for callers that drive
+        # _switch_to_hold_position() directly rather than through the
+        # once-per-session _engage_idle_hold(). Mirrors
         # SwerveBase._twist_rejected.
         self._mobile_hold_logged = False
+
+        # Idle hold (see _engage_idle_hold): True once this session's control
+        # has ended and the simulator has been recaptured, cleared by the next
+        # Move. Guarded by _hold_lock together with the UDP dispatch, because
+        # session teardown runs on the TCP thread (or the accept thread's
+        # finally) while the ~1 kHz UDP command thread may still be applying an
+        # in-flight datagram: whichever wins must win completely, or a command
+        # applied *after* the hold would leave the arm driven by a dead
+        # session's last torque.
+        self._hold_lock = threading.Lock()
+        self._idle_hold = False
 
         # Build the physics backend unless one was injected.
         if genesis_sim is None:
@@ -196,6 +206,10 @@ class FrankaSimServer:
         self.control_mode = ControlMode.NONE
         self.connection_running = False
         self._mobile_hold_logged = False
+        # The hold itself is *not* undone here -- the simulator keeps holding
+        # the pose it was recaptured at until the next Move commands something
+        # else. Only the once-per-session latch is rearmed.
+        self._idle_hold = False
         self.robot_state = RobotState()  # Create fresh robot state for new connection
 
     def receive_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
@@ -416,8 +430,7 @@ class FrankaSimServer:
                     # both -- otherwise the client hangs waiting for the stop to
                     # be acknowledged.
                     if command["motion_generation_finished"] or command["torque_command_finished"]:
-                        if self.control_mode != ControlMode.POSITION:
-                            self._switch_to_hold_position()
+                        self._engage_idle_hold("motion finished")
 
                         # Update state to idle modes
                         self.robot_state.state["motion_generator_mode"] = 0  # kIdle
@@ -446,59 +459,74 @@ class FrankaSimServer:
                             self.current_motion_id = 0  # Reset motion ID after sending response
                         continue
 
-                    # Update Genesis simulator based on control mode
-                    if (
-                        self.robot_state.state["controller_mode"]
-                        == LibfrankaControllerMode.kJointImpedance
-                        and self.robot_state.state["motion_generator_mode"]
-                        == LibfrankaMotionGeneratorMode.kJointPosition
-                    ):
-                        if self.control_mode is not ControlMode.POSITION:
-                            logger.info("Setting control mode to POSITION")
-                            self.genesis_sim.set_control_mode(ControlMode.POSITION)
-                            self.control_mode = ControlMode.POSITION
-                            # Initialize q_d to current q when first entering position mode
-                            self.robot_state.state["q_d"] = self.robot_state.state["q"]
-                        # Update q_d with commanded positions
-                        self.robot_state.state["q_d"] = list(command["q_c"])
-                        self.genesis_sim.update_joint_positions(command["q_c"])
-                        self.genesis_sim.update_torques([0.0] * 7)
-                    elif (
-                        self.robot_state.state["controller_mode"]
-                        == LibfrankaControllerMode.kJointImpedance
-                        and self.robot_state.state["motion_generator_mode"]
-                        == LibfrankaMotionGeneratorMode.kJointVelocity
-                    ):
-                        if self.control_mode is not ControlMode.VELOCITY:
-                            logger.info("Setting control mode to VELOCITY")
-                            self.genesis_sim.set_control_mode(ControlMode.VELOCITY)
-                            self.control_mode = ControlMode.VELOCITY
-                        # Update dq_d with commanded velocities
-                        self.robot_state.state["dq_d"] = list(command["dq_c"])
-                        self.genesis_sim.update_joint_velocities(command["dq_c"])
-                        self.genesis_sim.update_torques([0.0] * 7)
-                    elif (
-                        self.mobile_base
-                        and self.robot_state.state["motion_generator_mode"]
-                        == LibfrankaMotionGeneratorMode.kCartesianVelocity
-                        and self.robot_state.state["controller_mode"]
-                        != LibfrankaControllerMode.kExternalController
-                    ):
-                        self._handle_cartesian_velocity(command)
-                    elif (
-                        self.robot_state.state["controller_mode"]
-                        == LibfrankaControllerMode.kExternalController
-                    ):
-                        if self.control_mode is not ControlMode.TORQUE:
-                            logger.info("Setting control mode to TORQUE")
-                            self.genesis_sim.set_control_mode(ControlMode.TORQUE)
-                            self.control_mode = ControlMode.TORQUE
-                        # Update tau_J_d with commanded torques
-                        self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
-                        self.genesis_sim.update_torques(command["tau_J_d"])
+                    self._dispatch_control_command(command)
 
         except Exception as e:
             logger.error(f"Error in read_step: {e}")
+
+    def _dispatch_control_command(self, command) -> None:
+        """Route one UDP RobotCommand to the simulator, unless the hold is on.
+
+        Split out of :meth:`_handle_commands` so the whole simulator-facing part
+        of a control cycle sits inside ``_hold_lock``: a datagram that was
+        already in flight when the session ended must not be applied *after*
+        :meth:`_engage_idle_hold` recaptured the arm, or the hold would be
+        immediately overwritten by a dead session's last torque.
+        """
+        with self._hold_lock:
+            if self._idle_hold:
+                return
+
+            # Update Genesis simulator based on control mode
+            if (
+                self.robot_state.state["controller_mode"]
+                == LibfrankaControllerMode.kJointImpedance
+                and self.robot_state.state["motion_generator_mode"]
+                == LibfrankaMotionGeneratorMode.kJointPosition
+            ):
+                if self.control_mode is not ControlMode.POSITION:
+                    logger.info("Setting control mode to POSITION")
+                    self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                    self.control_mode = ControlMode.POSITION
+                    # Initialize q_d to current q when first entering position mode
+                    self.robot_state.state["q_d"] = self.robot_state.state["q"]
+                # Update q_d with commanded positions
+                self.robot_state.state["q_d"] = list(command["q_c"])
+                self.genesis_sim.update_joint_positions(command["q_c"])
+                self.genesis_sim.update_torques([0.0] * 7)
+            elif (
+                self.robot_state.state["controller_mode"]
+                == LibfrankaControllerMode.kJointImpedance
+                and self.robot_state.state["motion_generator_mode"]
+                == LibfrankaMotionGeneratorMode.kJointVelocity
+            ):
+                if self.control_mode is not ControlMode.VELOCITY:
+                    logger.info("Setting control mode to VELOCITY")
+                    self.genesis_sim.set_control_mode(ControlMode.VELOCITY)
+                    self.control_mode = ControlMode.VELOCITY
+                # Update dq_d with commanded velocities
+                self.robot_state.state["dq_d"] = list(command["dq_c"])
+                self.genesis_sim.update_joint_velocities(command["dq_c"])
+                self.genesis_sim.update_torques([0.0] * 7)
+            elif (
+                self.mobile_base
+                and self.robot_state.state["motion_generator_mode"]
+                == LibfrankaMotionGeneratorMode.kCartesianVelocity
+                and self.robot_state.state["controller_mode"]
+                != LibfrankaControllerMode.kExternalController
+            ):
+                self._handle_cartesian_velocity(command)
+            elif (
+                self.robot_state.state["controller_mode"]
+                == LibfrankaControllerMode.kExternalController
+            ):
+                if self.control_mode is not ControlMode.TORQUE:
+                    logger.info("Setting control mode to TORQUE")
+                    self.genesis_sim.set_control_mode(ControlMode.TORQUE)
+                    self.control_mode = ControlMode.TORQUE
+                # Update tau_J_d with commanded torques
+                self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
+                self.genesis_sim.update_torques(command["tau_J_d"])
 
     def handle_move_command(self, client_socket, header: MessageHeader, payload: bytes) -> None:
         """Handle Move command received over TCP"""
@@ -543,8 +571,13 @@ class FrankaSimServer:
             self.robot_state.state["robot_mode"] = RobotMode.kMove
             self.current_motion_id = header.command_id
             # A new Move is a new motion: rearm the mobile hold-log latch so
-            # the next time it finishes logs again.
+            # the next time it finishes logs again, and release the idle hold so
+            # this motion's UDP commands are applied again. Released before the
+            # set_control_mode() calls below, which are what actually override
+            # the hold in the simulator.
             self._mobile_hold_logged = False
+            with self._hold_lock:
+                self._idle_hold = False
 
             # Set appropriate control mode in Genesis simulator
             if (
@@ -612,6 +645,44 @@ class FrankaSimServer:
         except Exception as e:
             logger.error(f"Error sending Move response: {e}", exc_info=True)
 
+    def _engage_idle_hold(self, reason: str) -> None:
+        """Recapture the robot when a control session ends, however it ended.
+
+        The real FR3 hands the joints back to its own internal controller the
+        instant external control stops -- normal motion completion, StopMove, a
+        client that dies mid-stream, a socket error, error recovery. The sim has
+        no such controller, so without this the simulator is simply left in
+        whatever mode the dead session set: TORQUE, still applying that
+        session's last ``tau_J_d`` (or nothing at all). Gravity is compensated
+        and the FR3 model's authored viscous damping is small, so an arm
+        carrying residual velocity then swings on like a frictionless pendulum
+        in zero-g -- the "robot goes bananas after Ctrl-C" bug.
+
+        Idempotent within a session (the latch is rearmed by the next Move and
+        by reset_state) so the 1 kHz finish burst holds once, and exception-safe
+        because most callers are teardown paths that must not raise.
+
+        Backend-agnostic on purpose: it only calls the simulator contract every
+        backend implements, so single-arm MuJoCo/Genesis and both mobile-duo
+        scenes (through SceneView) are covered by this one implementation.
+        """
+        with self._hold_lock:
+            if self._idle_hold:
+                return
+            # No motion ever started on this connection (a bare connect, or a
+            # Move whose mode combination this server does not serve): there is
+            # nothing to recapture, and holding would stomp on whatever pose the
+            # previous session was correctly left in.
+            if self.control_mode is ControlMode.NONE:
+                return
+            self._idle_hold = True
+            try:
+                self._switch_to_hold_position()
+            except Exception:
+                logger.exception("Failed to engage the idle hold after %s", reason)
+                return
+        logger.info("Control session ended (%s): idle hold engaged", reason)
+
     def _switch_to_hold_position(self):
         """Freeze the simulator when a motion finishes or StopMove arrives.
 
@@ -632,11 +703,16 @@ class FrankaSimServer:
             return
 
         logger.info("Motion finished: switching to position control and holding position")
+        # Target first, mode second. The physics thread reads both without a
+        # lock, so switching to POSITION before publishing the new target lets
+        # a step land in between and servo towards the *previous* position
+        # target (the initial pose, or the last q_c of an older motion) at
+        # kp=4500 -- a lurch, which is the opposite of a hold.
         current_joint_positions = self.genesis_sim.get_robot_state()["q"]
-        self.genesis_sim.set_control_mode(ControlMode.POSITION)
-        self.control_mode = ControlMode.POSITION
         self.genesis_sim.update_joint_positions(current_joint_positions)
         self.genesis_sim.update_torques([0.0] * 7)
+        self.genesis_sim.set_control_mode(ControlMode.POSITION)
+        self.control_mode = ControlMode.POSITION
 
     def _handle_cartesian_velocity(self, command):
         """Route a cartesian-velocity command to the mobile base.
@@ -678,8 +754,7 @@ class FrankaSimServer:
             client_socket.sendall(header_bytes + response_data)
             logger.info("Sent StopMove success response")
 
-            if self.control_mode != ControlMode.POSITION:
-                self._switch_to_hold_position()
+            self._engage_idle_hold("StopMove")
 
             # Send one final state with both modes set to idle
             if hasattr(self, "udp_socket") and self.udp_socket:
@@ -972,8 +1047,12 @@ class FrankaSimServer:
         """
         try:
             # AutomaticErrorRecovery has an empty request; nothing to parse.
-            # Clear any error/reflex state and return the arm to Idle.
+            # Clear any error/reflex state and return the arm to Idle. On the
+            # real robot recovery aborts whatever motion latched the reflex and
+            # leaves the internal controller holding, so recapture here too --
+            # the next Move releases the hold.
             self.robot_state.state["robot_mode"] = RobotMode.kIdle
+            self._engage_idle_hold("automatic error recovery")
 
             # Response is ResponseBase: a single uint8 status (kSuccess = 0).
             total_size = 12 + 4  # Header (12) + status (1) + padding (3)
@@ -1010,6 +1089,9 @@ class FrankaSimServer:
                     # Instead of breaking, reset state and continue
                     self.transmitting_state = False
                     self.connection_running = False
+                    # connection_running is cleared *first* so the UDP command
+                    # thread stops dispatching before the arm is recaptured.
+                    self._engage_idle_hold("client socket disconnected")
                     logger.info("Resetting state and waiting for new client...")
                     break  # Break only from the inner loop
 
@@ -1067,6 +1149,7 @@ class FrankaSimServer:
                 # Instead of breaking, reset state and continue
                 self.transmitting_state = False
                 self.connection_running = False
+                self._engage_idle_hold("client disconnected mid-session")
                 logger.info("Connection error: Resetting state and waiting for new client...")
                 break  # Break only from the inner loop
             except Exception as e:
@@ -1076,6 +1159,7 @@ class FrankaSimServer:
                 # For other errors, reset state and continue
                 self.transmitting_state = False
                 self.connection_running = False
+                self._engage_idle_hold("TCP error mid-session")
                 logger.info("Error occurred: Resetting state and waiting for new client...")
                 break  # Break only from the inner loop
 
@@ -1147,6 +1231,12 @@ class FrankaSimServer:
             logger.error(f"Error handling client: {e}", exc_info=True)
         finally:
             logger.info("Closing client connection")
+            # Catch-all for every way this connection can end that the TCP
+            # thread does not see: the UDP command socket erroring out, the
+            # handshake aborting, an exception above. Idempotent, so the common
+            # case (the TCP thread already held) costs nothing. Must run before
+            # reset_state(), which clears the control mode the hold keys off.
+            self._engage_idle_hold("client connection closed")
             if client_socket:
                 client_socket.close()
             # Clean up connection state

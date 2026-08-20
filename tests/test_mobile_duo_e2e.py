@@ -31,8 +31,15 @@ from franka_sim.franka_protocol import (
     MessageHeader,
     MotionGeneratorMode,
 )
+from franka_sim.control_modes import ControlMode
 from franka_sim.mobile_duo_runner import MobileDuoRunner
-from franka_sim.mobile_duo_sim import ROLE_BASE, ROLE_LEFT, ROLE_RIGHT, MobileDuoScene
+from franka_sim.mobile_duo_sim import (
+    ARM_INITIAL_Q as DUO_ARM_INITIAL_Q,
+    ROLE_BASE,
+    ROLE_LEFT,
+    ROLE_RIGHT,
+    MobileDuoScene,
+)
 from franka_sim.robot_state import _ROBOT_STATE_PACKER, RobotState
 from franka_sim.spine_stub import (
     SPINE_DEFAULT_HOST,
@@ -316,12 +323,75 @@ def test_arm_bridges_accept_torque_control_independently(duo_stack, role):
             client.send_command(message_id, tau_j_d=torques)
             client.read_state()
         time.sleep(0.2)
+        # Sampled while the session is still live: closing the socket ends the
+        # session, and the bridge then recaptures the arm into a position hold
+        # with zero torque (see test_idle_hold.py), which would erase this.
+        commanded = np.array(scene.arm_torques[role])
+        other = ROLE_RIGHT if role == ROLE_LEFT else ROLE_LEFT
+        idle = np.array(scene.arm_torques[other])
     finally:
         client.close()
 
-    assert scene.arm_torques[role] == pytest.approx(torques)
-    other = ROLE_RIGHT if role == ROLE_LEFT else ROLE_LEFT
-    assert scene.arm_torques[other] == pytest.approx(np.zeros(7))
+    assert commanded == pytest.approx(torques)
+    assert idle == pytest.approx(np.zeros(7))
+
+
+@pytest.mark.parametrize("role", [ROLE_LEFT, ROLE_RIGHT])
+def test_an_arm_bridge_holds_its_pose_when_the_client_dies(duo_stack, role):
+    """The idle hold reaches the duo arms through SceneView, unchanged.
+
+    Same recapture the single-arm server does, proving the fix is in the server
+    layer and not in one backend: kill a torque session and the arm must be
+    parked in POSITION at the joints it was killed at, not left driven by the
+    dead session's torque.
+    """
+    runner, scene = duo_stack
+    client = WireClient(BINDS[role])
+    try:
+        client.connect()
+        client.move(ControllerMode.kExternalController, MotionGeneratorMode.kNone)
+        client.read_state()
+        for message_id in range(1, 20):
+            client.send_command(message_id, tau_j_d=[1.0, -1.0, 1.0, -1.0, 0.5, -0.5, 0.5])
+            client.read_state()
+        time.sleep(0.2)
+        q_at_kill = np.array(scene.get_role_state(role)["q"])
+        client.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.tcp.close()
+        time.sleep(0.8)
+    finally:
+        client.close()
+
+    assert scene.arm_control_modes[role] == ControlMode.POSITION
+    assert scene.arm_joint_positions[role] == pytest.approx(q_at_kill)
+    assert scene.arm_torques[role] == pytest.approx(np.zeros(7))
+
+
+def test_the_base_bridge_stops_the_platform_when_the_client_dies(duo_stack):
+    """The base's stop is a zero twist -- never a joint hold on the wheels."""
+    runner, scene = duo_stack
+    client = WireClient(BINDS[ROLE_BASE])
+    try:
+        client.connect()
+        client.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
+        client.read_state()
+        for message_id in range(1, 30):
+            client.send_command(message_id, o_dp_ee_c=BASE_TWIST)
+            client.read_state()
+
+        client.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.tcp.close()
+        time.sleep(0.8)
+        x_at_stop = scene.swerve.x
+        time.sleep(0.3)
+    finally:
+        client.close()
+
+    assert scene.swerve.x == pytest.approx(x_at_stop, abs=1e-6)
+    # The wheels are not arm joints: neither arm may be touched by a base stop.
+    for arm in (ROLE_LEFT, ROLE_RIGHT):
+        assert scene.arm_control_modes[arm] == ControlMode.POSITION
+        assert scene.arm_joint_positions[arm] == pytest.approx(DUO_ARM_INITIAL_Q)
 
 
 def test_all_three_bridges_serve_the_robot_model(duo_stack):
