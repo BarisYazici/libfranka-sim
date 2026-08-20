@@ -9,8 +9,12 @@ bridges actually serve.
 
 Everything the two backends must agree on -- joint and link names, the initial
 arm pose, the actuator limits, the spine travel, the state-snapshot layout and
-the real-time-factor monitor -- is imported from ``mobile_duo_sim`` rather than
-restated here, so the two backends cannot drift apart.
+the real-time-factor monitor -- is imported from ``mobile_duo_common`` (the
+engine-agnostic constants and ``SceneView``) and ``sim_common`` (the pure-numpy
+helpers) rather than restated here, so the two backends cannot drift apart.
+Neither of those modules imports ``genesis``, and this module must not either:
+it is the ``--physics mujoco`` path, which has to work on a genesis-free
+install.
 """
 
 import logging
@@ -22,22 +26,25 @@ from typing import Dict, Optional, Sequence
 import mujoco
 import numpy as np
 
-from franka_sim.franka_genesis_sim import ControlMode, resolve_fr3_joint_damping
-from franka_sim.mobile_duo_sim import (
+from franka_sim.control_modes import ControlMode
+from franka_sim.mobile_duo_common import (
     ARM_EE_LINKS,
     ARM_INITIAL_Q,
     ARM_JOINT_NAMES,
     ARM_ROLES,
-    FR3_FORCE_LIMITS,
     ROLE_BASE,
     ROLES,
     SPINE_JOINT_NAME,
     SPINE_LIMITS_M,
-    RealtimeFactorMonitor,
     SceneView,
-    pose_to_column_major,
 )
 from franka_sim.mujoco_visuals import apply_dae_material_visuals, apply_fr3v2_visuals
+from franka_sim.sim_common import (
+    FR3_FORCE_LIMITS,
+    RealtimeFactorMonitor,
+    pose_to_column_major,
+    resolve_fr3_joint_damping,
+)
 from franka_sim.swerve_base import SwerveBase, yaw_to_quat_wxyz
 from franka_sim.urdf_assets import resolve_urdf_meshes
 
@@ -380,10 +387,24 @@ class MobileDuoMujocoScene:
 
         The spec is also where every link trades its flat merged-COLLADA visual
         for per-material ones; see :meth:`_upgrade_visuals`.
+
+        Gravity compensation is switched on here, before compiling, and not on
+        the compiled ``mjModel``: MuJoCo skips the gravcomp pass entirely
+        unless ``mjModel.ngravcomp`` is non-zero, and that count is fixed at
+        compile time, so assigning ``model.body_gravcomp`` afterwards is
+        silently a no-op (see :meth:`_configure_model`). This is the same trap
+        and the same fix as the single-arm backend's ``build_model``.
         """
         spec = mujoco.MjSpec.from_file(str(urdf_path))
         spec.option.timestep = self.dt
         spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+
+        # The real FR3 reports tau_J with gravity already removed, and the
+        # Genesis scene loads the whole entity with gravity_compensation=1.0.
+        # MuJoCo's per-body gravcomp is the exact analogue: it cancels weight
+        # only, leaving Coriolis and the joint damping intact.
+        for body in spec.bodies:
+            body.gravcomp = 1.0
 
         self._upgrade_visuals(spec)
 
@@ -473,12 +494,16 @@ class MobileDuoMujocoScene:
         self.swerve.reset_pose()
 
     def _configure_model(self) -> None:
-        """Apply gravity compensation, joint damping and arm armature."""
-        # The real FR3 reports tau_J with gravity already removed, and the
-        # Genesis scene loads the whole entity with gravity_compensation=1.0.
-        # MuJoCo's per-body gravcomp is the exact analogue: it cancels weight
-        # only, leaving Coriolis and the joint damping below intact.
-        self.model.body_gravcomp[:] = 1.0
+        """Apply the optional joint-damping override, and arm/wheel armature.
+
+        Gravity compensation is not set here: it has to be on before compiling
+        (see :meth:`_compile_model`) because ``mjModel.ngravcomp`` is fixed at
+        compile time -- assigning ``model.body_gravcomp`` on the compiled model
+        is silently a no-op, which is what this scene did before this check
+        existed.
+        """
+        if self.model.ngravcomp == 0:
+            raise RuntimeError("Model was compiled without gravity compensation")
 
         damping = resolve_fr3_joint_damping()
         logger.info("Arm joint damping (left + right): %s", damping)

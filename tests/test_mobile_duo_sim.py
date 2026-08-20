@@ -321,7 +321,9 @@ def test_repeated_misrouted_twists_log_once(scene, caplog):
     misconfigured bridge, so the misroute warning must latch, not flood.
     """
     view = scene.view(ROLE_LEFT)
-    with caplog.at_level("WARNING", logger="franka_sim.mobile_duo_sim"):
+    # SceneView (and the logger it warns through) now lives in
+    # mobile_duo_common, re-exported into mobile_duo_sim for backward compat.
+    with caplog.at_level("WARNING", logger="franka_sim.mobile_duo_common"):
         for _ in range(50):
             view.update_base_twist([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     assert len(caplog.records) == 1

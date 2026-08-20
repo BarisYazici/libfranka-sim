@@ -166,6 +166,24 @@ def test_gravity_is_compensated_on_every_body(scene):
     assert np.all(scene.model.body_gravcomp == 1.0)
 
 
+def test_gravity_compensation_actually_runs(scene):
+    """``body_gravcomp`` alone is not enough: MuJoCo only runs the gravcomp
+    pass when ``ngravcomp`` is non-zero at compile time (see
+    ``_compile_model``/``_configure_model``). This is the regression check for
+    the bug where ``_configure_model`` set ``body_gravcomp`` on the already-
+    compiled model, which is a silent no-op -- ``ngravcomp`` stayed 0 and
+    ``qfrc_gravcomp`` stayed all-zero no matter what.
+    """
+    assert scene.model.ngravcomp > 0
+    mujoco.mj_forward(scene.model, scene.data)
+    assert np.any(scene.data.qfrc_gravcomp != 0.0)
+    # At qvel == 0 (the held pose the fixture settles to), qfrc_bias is pure
+    # gravity (no Coriolis/centrifugal term), so gravcomp -- which cancels
+    # weight only -- reproduces it exactly.
+    assert scene.data.qvel == pytest.approx(np.zeros(scene.model.nv), abs=1e-6)
+    assert scene.data.qfrc_gravcomp == pytest.approx(scene.data.qfrc_bias, abs=1e-9)
+
+
 def test_view_returns_a_scene_view_per_role(scene):
     for role in ROLES:
         view = scene.view(role)
