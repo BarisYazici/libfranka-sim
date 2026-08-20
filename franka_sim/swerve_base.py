@@ -86,10 +86,22 @@ class SwerveBase:
         self.drive_dofs_idx = None
         #: DOFs of the entity's own root (floating) joint; see ``bind``/``apply``.
         self.root_dofs_idx: list = []
+        #: qpos entries of that same root joint; empty when the base is fixed.
+        self.root_qs_idx: list = []
 
         self._twist = np.zeros(6)
         self._steer_targets = np.zeros(2)
         self._drive_targets = np.zeros(2)
+
+        # Resolved by bind(); every one of them is a per-step fast path that
+        # needs the built entity's indices, so they only exist as placeholders
+        # until then.
+        self._steer_dofs_np = None
+        self._drive_dofs_np = None
+        self._last_steer_written = None
+        self._last_drive_written = None
+        self._root_qpos = None
+        self._root_zero_vel = np.zeros(0)
 
         # Latches so the two rejection paths log once per transition instead of
         # once per call. set_twist runs at ~1 kHz (UDP thread) and solve at
@@ -112,6 +124,20 @@ class SwerveBase:
             self.entity.get_joint(name).dof_idx_local for name in self.drive_joints
         ]
         self.root_dofs_idx = self._resolve_root_dofs()
+        self.root_qs_idx = self._resolve_root_qs()
+        self._steer_dofs_np = np.asarray(self.steer_dofs_idx, dtype=np.intp)
+        self._drive_dofs_np = np.asarray(self.drive_dofs_idx, dtype=np.intp)
+        self._last_steer_written = None
+        self._last_drive_written = None
+
+        # Scratch buffers for the per-step root write, allocated once: at ~400 Hz
+        # the allocations and the float64->float32 conversion Genesis does on
+        # every setter argument are not free. z and the two zero quaternion
+        # components never change, so only x, y and the yaw pair are rewritten.
+        self._root_qpos = np.zeros(7) if len(self.root_qs_idx) == 7 else None
+        if self._root_qpos is not None:
+            self._root_qpos[2] = self.base_height
+        self._root_zero_vel = np.zeros(len(self.root_dofs_idx))
 
     def _resolve_root_dofs(self) -> list:
         """DOF indices of the entity's root joint (empty when the base is fixed).
@@ -130,6 +156,27 @@ class SwerveBase:
         if dof_idx is None:
             return []
         return [int(idx) for idx in np.atleast_1d(dof_idx)]
+
+    def _resolve_root_qs(self) -> list:
+        """Generalised-coordinate indices of the root joint (empty when fixed).
+
+        A *free* root joint owns seven qpos entries, laid out
+        ``[x, y, z, qw, qx, qy, qz]`` -- that is what Genesis' own
+        ``set_links_pos``/``set_links_quat`` kernels write for a non-fixed base
+        link. ``apply`` writes all seven in one ``set_qpos`` when they are
+        present, because every Genesis setter runs a full forward-kinematics and
+        geometry pass after its write: the per-step cost is counted in setter
+        *calls*, not in values written, so folding the pose into one call halves
+        it. A fixed base has no qpos of its own (its pose lives directly in
+        ``links_state``) and falls back to ``set_pos``/``set_quat``.
+        """
+        base_joint = getattr(self.entity, "base_joint", None)
+        if base_joint is None:
+            return []
+        q_idx = getattr(base_joint, "q_idx_local", None)
+        if q_idx is None:
+            return []
+        return [int(idx) for idx in np.atleast_1d(q_idx)]
 
     def reset_pose(self, x: float = 0.0, y: float = 0.0, theta: float = 0.0) -> None:
         """Reset the integrated planar pose."""
@@ -199,22 +246,53 @@ class SwerveBase:
         return self.x, self.y, self.theta
 
     def apply(self, dt: float) -> None:
-        """One physics step: write wheel targets and the new base pose."""
+        """One physics step: write wheel targets and the new base pose.
+
+        Genesis control targets persist until overwritten, so the wheel
+        targets are rewritten only when the IK solution actually changes:
+        at ~400 Hz the kernel-launch overhead of redundant writes is what
+        dominates the physics loop, not the physics itself. The kinematic
+        root teleport below still runs every step so contact/reaction
+        forces can never drift the base between (sparse) twist updates.
+        """
         steer_targets, drive_targets = self.solve()
-        self.entity.control_dofs_position(steer_targets, self.steer_dofs_idx)
-        self.entity.control_dofs_velocity(drive_targets, self.drive_dofs_idx)
+        if not (
+            np.array_equal(steer_targets, self._last_steer_written)
+            and np.array_equal(drive_targets, self._last_drive_written)
+        ):
+            self.entity.control_dofs_position(steer_targets, self.steer_dofs_idx)
+            self.entity.control_dofs_velocity(drive_targets, self.drive_dofs_idx)
+            self._last_steer_written = steer_targets.copy()
+            self._last_drive_written = drive_targets.copy()
 
         x, y, theta = self.integrate_pose(dt)
-        # zero_velocity=False is load-bearing: Genesis' set_pos/set_quat default
-        # to zeroing EVERY DOF of the entity, so on the mobile-duo scene these
-        # two kinematic pose writes would zero both arms' joint velocities every
-        # physics step -- an effectively infinite damper that pins the arms while
-        # the (kinematically teleported) base still looks fine. Only the root's
-        # own DOFs are zeroed, which is what the teleport actually invalidates.
-        self.entity.set_pos(np.array([x, y, self.base_height]), zero_velocity=False)
-        self.entity.set_quat(yaw_to_quat_wxyz(theta), zero_velocity=False)
+        self._write_root_pose(x, y, theta)
+
+    def _write_root_pose(self, x: float, y: float, theta: float) -> None:
+        """Teleport the chassis root to the integrated planar pose.
+
+        ``zero_velocity=False`` is load-bearing: Genesis' pose setters default to
+        zeroing EVERY DOF of the entity, so on the mobile-duo scene these
+        kinematic writes would zero both arms' joint velocities every physics
+        step -- an effectively infinite damper that pins the arms while the
+        (kinematically teleported) base still looks fine. Only the root's own
+        DOFs are zeroed, which is what the teleport actually invalidates.
+
+        A free root's whole pose goes in one ``set_qpos`` rather than a
+        ``set_pos``/``set_quat`` pair; see :meth:`_resolve_root_qs` for the qpos
+        layout that relies on and why the call count is what costs.
+        """
+        if self._root_qpos is not None:
+            self._root_qpos[0] = x
+            self._root_qpos[1] = y
+            self._root_qpos[3] = math.cos(theta / 2.0)
+            self._root_qpos[6] = math.sin(theta / 2.0)
+            self.entity.set_qpos(self._root_qpos, self.root_qs_idx, zero_velocity=False)
+        else:
+            self.entity.set_pos(np.array([x, y, self.base_height]), zero_velocity=False)
+            self.entity.set_quat(yaw_to_quat_wxyz(theta), zero_velocity=False)
         if self.root_dofs_idx:
-            self.entity.set_dofs_velocity(np.zeros(len(self.root_dofs_idx)), self.root_dofs_idx)
+            self.entity.set_dofs_velocity(self._root_zero_vel, self.root_dofs_idx)
 
     def wheel_state(self) -> Tuple[np.ndarray, np.ndarray]:
         """Wheel ``(q, dq)`` as 4-element arrays in ``TMR_JOINT_ORDER``."""
@@ -222,6 +300,24 @@ class SwerveBase:
         steer_dq = self.entity.get_dofs_velocity(self.steer_dofs_idx).cpu().numpy()
         drive_q = self.entity.get_dofs_position(self.drive_dofs_idx).cpu().numpy()
         drive_dq = self.entity.get_dofs_velocity(self.drive_dofs_idx).cpu().numpy()
+
+        positions = np.array([steer_q[0], drive_q[0], steer_q[1], drive_q[1]])
+        velocities = np.array([steer_dq[0], drive_dq[0], steer_dq[1], drive_dq[1]])
+        return positions, velocities
+
+    def wheel_state_from(
+        self, q_all: np.ndarray, dq_all: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Wheel ``(q, dq)`` sliced from whole-entity DOF arrays.
+
+        Same ``TMR_JOINT_ORDER`` composition as :meth:`wheel_state`, but with
+        no Genesis reads of its own -- the mobile-duo loop already reads the
+        entity's full DOF state once per step and passes it in.
+        """
+        steer_q = q_all[self._steer_dofs_np]
+        steer_dq = dq_all[self._steer_dofs_np]
+        drive_q = q_all[self._drive_dofs_np]
+        drive_dq = dq_all[self._drive_dofs_np]
 
         positions = np.array([steer_q[0], drive_q[0], steer_q[1], drive_q[1]])
         velocities = np.array([steer_dq[0], drive_dq[0], steer_dq[1], drive_dq[1]])

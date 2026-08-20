@@ -198,6 +198,48 @@ def test_position_control_still_tracks_a_target(duo_scene, arm):
     assert error.max() < 0.05, f"position tracking error too large: {np.round(error, 4)}"
 
 
+def test_the_base_link_lands_where_the_integrated_pose_says(duo_scene, arm):
+    """Guards the qpos layout the one-call base-pose write relies on.
+
+    ``SwerveBase`` writes a free root joint's whole pose as a single ``set_qpos``
+    over ``[x, y, z, qw, qx, qy, qz]``. Nothing in the fake-entity tests can tell
+    that layout from a wrong one -- only real Genesis forward kinematics can, so
+    drive the base and compare the base link against the pose the swerve
+    integrator thinks it commanded.
+    """
+    duo_scene.swerve.reset_pose()
+    duo_scene.update_base_twist(TEST_TWIST)
+
+    arm.run(steps=400)
+
+    pos = duo_scene.robot.get_pos().cpu().numpy()
+    quat = duo_scene.robot.get_quat().cpu().numpy()
+    yaw = 2.0 * np.arctan2(quat[3], quat[0])
+
+    assert pos[0] == pytest.approx(duo_scene.swerve.x, abs=1e-4)
+    assert pos[1] == pytest.approx(duo_scene.swerve.y, abs=1e-4)
+    assert pos[2] == pytest.approx(duo_scene.base_height, abs=1e-4)
+    assert yaw == pytest.approx(duo_scene.swerve.theta, abs=1e-4)
+
+
+def test_the_lift_holds_its_height_against_the_arms(duo_scene, arm):
+    """The spine is written once per change, so its PD hold is what pins it.
+
+    Before the hold existed the joint free-ran between periodic re-teleports and
+    the carriage (and with it both flanges) jittered under arm reaction forces.
+    """
+    duo_scene.set_arm_control_mode(ROLE_LEFT, ControlMode.TORQUE)
+    torques = np.zeros(7)
+    torques[1] = TEST_TORQUE_NM
+    duo_scene.update_arm_torques(ROLE_LEFT, torques)
+    duo_scene.update_base_twist(TEST_TWIST)
+
+    arm.run(steps=800)
+
+    height = duo_scene.robot.get_dofs_position([duo_scene.spine_dof_idx]).cpu().numpy()[0]
+    assert height == pytest.approx(_StubSpine().position_m(), abs=1e-3)
+
+
 def test_the_other_arm_stays_put_while_one_is_torque_driven(duo_scene, arm):
     """Freeing the arm DOFs must not make the idle arm drift."""
     from franka_sim.mobile_duo_sim import ROLE_RIGHT
