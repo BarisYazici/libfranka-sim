@@ -5,18 +5,59 @@ All notable changes to **franka-sim** are documented here. The format is based o
 so per [Semantic Versioning](https://semver.org/) a minor (`0.x`) bump may include
 breaking changes — these are called out explicitly.
 
-## [Unreleased]
+## [0.4.0] - 2026-08-20
+
+### ⚠ Breaking
+
+- **MuJoCo is the default physics engine; Genesis is an optional extra.**
+  `pip install franka-sim` now ships MuJoCo (`mujoco>=3.2,<3.3`) and no longer
+  pulls `genesis-world`/`torch`/`numba`. To keep the Genesis engine, install
+  `pip install 'franka-sim[genesis]'` and pass `--physics genesis`. The
+  `--physics` flag now applies to the single-arm path too and defaults to
+  `mujoco` everywhere.
 
 ### Added
 
-- **MuJoCo physics backend for the mobile duo** (`--physics mujoco`, default
-  `genesis`): `MobileDuoMujocoScene` implements the same scene contract the
+- **Single-arm MuJoCo backend** (`MujocoFrankaSim`): the MuJoCo Menagerie
+  FR3 v2 model with the Franka Hand attached at the flange (same transform as
+  the Genesis graft), gravity-compensated PD control clipped to the FR3 torque
+  limits, contacts enabled, and a true 1 ms physics step at 1.00x real time.
+  Serves the physics gripper backend unchanged.
+- **Menagerie / COLLADA visuals for the mobile duo**: the arms render with the
+  fr3_v2 obj2mjcf visual set, the TMR base and lift are repainted from their
+  COLLADA materials (white shell, black skirt, red tail lights; lift in Franka
+  white), and collision geoms are hidden from the viewer.
+- **Documentation site** (MkDocs Material, deployed to GitHub Pages on push to
+  main): install guide, client compatibility, an evidence-based
+  RobotState/TCP-command fidelity reference, the mobile FR3 duo + Quest teleop
+  guide, and the backends guide.
+- **Genesis-free imports**: `import franka_sim` and the whole MuJoCo path
+  (single-arm and mobile-duo) work without Genesis installed.
+
+### Fixed
+
+- **Idle hold on session end.** A client dying mid-torque-stream left its last
+  commanded torques applied forever, flinging the gravity-compensated arm into
+  its joint limits. Every session-end path (motion finish, `StopMove`,
+  disconnect, error recovery) now engages a position hold at the measured
+  joint angles, matching the real robot's recapture behaviour.
+- **Four unanswered TCP commands.** `SetGuidingMode`, `SetEEToK`, `SetNEToEE`
+  and `SetLoad` had no handler, hanging real clients forever; they now reply
+  `kSuccess`, and the EE_T_K / NE_T_EE / load values are reflected in
+  `RobotState`.
+- **Mobile-duo gravity compensation was a silent no-op** (`body_gravcomp`
+  written after compile); it is now set at MjSpec level before compilation.
+- **Genesis mobile-duo performance**: batched whole-entity reads and
+  write-on-change control targets take the scene from 0.40x to ~1.0x real
+  time headless.
+
+- **MuJoCo physics backend for the mobile duo** (`--physics mujoco`): `MobileDuoMujocoScene` implements the same scene contract the
   runner and the three FCI bridges already consume, so the protocol surface,
   the joint and link names, the initial pose and the reported state are
   unchanged. Genesis' per-call kernel-launch overhead caps the scene at ~0.4x
   real time at its 2.5 ms step; MuJoCo holds **1.00x real time at a 1 ms
   step** — the rate the bridges actually serve — at about a third of one core.
-  Needs the new `mujoco` extra. Contacts are disabled on this path: the
+  Contacts are disabled on this path: the
   chassis' URDF collision meshes interpenetrate as authored, and nothing in
   the scene depends on contact (the base pose is integrated kinematically and
   both arms are servo-driven).
