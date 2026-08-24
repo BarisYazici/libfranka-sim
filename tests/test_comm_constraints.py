@@ -721,6 +721,31 @@ REFLEX_REASON_SLICE = slice(-43, -2)
 ROBOT_MODE_INDEX = -2
 SUCCESS_RATE_INDEX = -1
 
+#: Command id every motion in this file is started with, and therefore the id
+#: its terminal ``Move`` response comes back on.
+MOTION_COMMAND_ID = 2
+
+#: Total wire size of a plain status response: the 12-byte header plus
+#: ``<B3x>``, one status byte and three of padding. Both ``kSetGuidingMode``
+#: (``server/set_commands.py``) and the terminal ``kMove``
+#: (``server/motion_session.py``) answer in that shape.
+STATUS_RESPONSE_SIZE = 12 + 4
+
+
+def recv_exactly(sock, count):
+    """Read exactly ``count`` bytes off ``sock``, or fail saying how short it ran.
+
+    ``recv`` may legally return fewer bytes than asked for, and a reader that
+    treats a short read as a whole frame manufactures a desynchronisation of
+    its own -- which is the exact thing the tests here are trying to detect.
+    """
+    chunks = bytearray()
+    while len(chunks) < count:
+        piece = sock.recv(count - len(chunks))
+        assert piece, f"the TCP stream ended after {len(chunks)} of {count} bytes"
+        chunks += piece
+    return bytes(chunks)
+
 
 class WireClient:
     """A libfranka-shaped client: every state is answered, echoing its message_id.
@@ -742,6 +767,13 @@ class WireClient:
         self.udp_port = self.udp.getsockname()[1]
         self.server_udp_address = None
         self.last_message_id = 0
+        #: Every ``message_id`` this client has echoed. The server publishes on
+        #: its own 1 kHz thread, so "one state per :meth:`read_state`" is only
+        #: true while this single-threaded client keeps up -- on a loaded
+        #: machine :meth:`read_state`'s drain skips whole cycles. The ids it did
+        #: answer are the only exact record of the loss it injected; see
+        #: :func:`injected_loss`.
+        self.answered_ids = set()
 
     # -- TCP ---------------------------------------------------------------
 
@@ -754,7 +786,7 @@ class WireClient:
         status, _ = struct.unpack("<BH", self.tcp.recv(3))
         assert status == ConnectStatus.kSuccess
 
-    def move(self, controller_mode, motion_generator_mode, command_id=2):
+    def move(self, controller_mode, motion_generator_mode, command_id=MOTION_COMMAND_ID):
         """Send a Move and consume the kMotionStarted response."""
         payload = struct.pack(
             "<II3d3d",
@@ -818,6 +850,7 @@ class WireClient:
 
     def answer(self, **command_fields):
         """Send one command echoing the last state's id, as libfranka does."""
+        self.answered_ids.add(self.last_message_id)
         self.udp.sendto(
             pack_robot_command(self.last_message_id, **command_fields),
             self.server_udp_address,
@@ -925,6 +958,80 @@ def start_torque_motion(client_factory):
     # once the motion actually ends -- it does not, here.
     wire.stream(SUCCESS_RATE_WINDOW, tau_j_d=TORQUES)
     return wire
+
+
+#: How many of the cycles a client *did* answer may still be charged to it as
+#: lost before the accounting is considered broken. ``command_received``
+#: documents the bias deliberately: an answer that lands in the microseconds
+#: between :meth:`CommConstraintTracker.tick` and the ``sendto`` is late by the
+#: tracker's reckoning, and costs its own cycle as well as the one it lands in.
+#: That race is a photo finish on an idle machine and a real gap on a loaded
+#: one (CI runs these on two shared cores), so the *lower* bound on the
+#: reported rate has to leave room for a handful of them. It stays far away
+#: from the failure this bounds: an answered cycle counted as lost anyway would
+#: charge every one of the ~90 answered cycles in the window, not ten.
+LATE_ANSWER_SLACK_CYCLES = 10
+
+#: Half a cycle's worth of float32: ``control_command_success_rate`` crosses the
+#: wire as a 4-byte float, so 0.89 comes back as 0.8899999857 and reading the
+#: loss back out of it lands a rounding error away from a whole number.
+CYCLE_EPSILON = 0.01
+
+
+def injected_loss(wire, state):
+    """Cycles ``wire`` really failed to answer inside the window ``state`` reports on.
+
+    ``CommConstraintTracker.tick`` closes the cycle the *previous* state opened,
+    so the rate carried by the state with ``message_id`` F is the verdict on
+    cycles ``F - SUCCESS_RATE_WINDOW .. F - 1`` -- one cycle per published id.
+    The client answered exactly the ids in :attr:`WireClient.answered_ids`, so
+    counting the rest is the client's own arithmetic about its own packet loss,
+    which is what the reported rate has to agree with.
+
+    Deliberately not "the number of ``drop`` calls": that only equals the loss
+    while the client keeps up with the server's 1 kHz publish thread. On a
+    loaded machine it falls behind, genuinely loses extra cycles, and the sim is
+    right to charge for them -- so the expected value has to be measured, not
+    assumed.
+    """
+    newest = state[MESSAGE_ID_INDEX]
+    window = range(newest - SUCCESS_RATE_WINDOW, newest)
+    # Every cycle in the window has to be one the tracker was counting, or the
+    # denominator below is not SUCCESS_RATE_WINDOW (the window is divided by
+    # what it actually holds while it fills).
+    assert window.start >= min(wire.answered_ids), "the window reaches back past the motion"
+    return sum(1 for message_id in window if message_id not in wire.answered_ids)
+
+
+def charged_loss(state):
+    """Cycles the server is reporting as lost, read back out of the success rate."""
+    return (1.0 - state[SUCCESS_RATE_INDEX]) * SUCCESS_RATE_WINDOW
+
+
+def assert_loss_is_accounted_once(wire, state, at_least):
+    """The reported rate is the client's own packet-loss arithmetic, and nothing else.
+
+    Two bounds, and they fail for different reasons:
+
+    * ``charged >= injected`` -- exact, no slack. Every cycle the client did not
+      answer is charged for. This is the one that catches a substituted
+      command being mistaken for an answer: the sim would report a client's
+      packet loss back to it as perfect communication, and ``charged`` would
+      collapse towards zero while ``injected`` stayed where it was.
+    * ``charged <= injected + slack`` -- the other direction, a lost cycle
+      counted more than once (or an answered one counted as lost), with
+      :data:`LATE_ANSWER_SLACK_CYCLES` of room for the documented boundary bias.
+    """
+    injected = injected_loss(wire, state)
+    assert injected >= at_least, "the client did not inject the loss the test meant to"
+    charged = charged_loss(state)
+    assert charged >= injected - CYCLE_EPSILON, (
+        f"the sim charged {charged:.2f} of the {injected} cycles the client never answered: "
+        "an unanswered cycle was counted as a successful command"
+    )
+    assert charged <= injected + LATE_ANSWER_SLACK_CYCLES, (
+        f"the sim charged {charged:.2f} cycles for {injected} lost ones: loss counted twice"
+    )
 
 
 def test_a_streaming_client_reports_a_perfect_success_rate(serve, client):
@@ -1147,9 +1254,7 @@ def test_extrapolation_does_not_double_count_the_communication_accounting(serve,
     state = wire.drop(lost + 1)
 
     assert np.array(state[Q_D_SLICE]).mean() > np.array(before[Q_D_SLICE]).mean()
-    assert state[SUCCESS_RATE_INDEX] == pytest.approx(
-        (SUCCESS_RATE_WINDOW - lost) / SUCCESS_RATE_WINDOW, abs=0.02
-    )
+    assert_loss_is_accounted_once(wire, state, at_least=lost)
 
 
 def test_a_missed_cycle_still_costs_the_success_rate(serve, client):
@@ -1166,9 +1271,7 @@ def test_a_missed_cycle_still_costs_the_success_rate(serve, client):
     dropped = 10
     state = wire.drop(dropped + 1)
 
-    assert state[SUCCESS_RATE_INDEX] == pytest.approx(
-        (SUCCESS_RATE_WINDOW - dropped) / SUCCESS_RATE_WINDOW, abs=0.02
-    )
+    assert_loss_is_accounted_once(wire, state, at_least=dropped)
 
 
 def test_the_violation_aborts_the_motion_with_a_reflex(serve, client):
@@ -1533,6 +1636,24 @@ def test_concurrent_tcp_responses_never_interleave(serve, client):
     interrupted halfway does not lose a message, it corrupts every frame after
     it. Hammered with TCP commands while the UDP and publish threads are both
     live, every frame must still parse.
+
+    The pump replays one frozen ``message_id``, so every cycle of this motion is
+    lost and the violation trips about twenty publish cycles in. That is the
+    point rather than an accident: the abort's terminal ``Move`` response is
+    sent from the *publish* thread while the TCP thread is answering
+    ``SetGuidingMode``, and two threads writing one socket is exactly what the
+    send lock exists for. The hammering therefore runs until that response has
+    been read, so the second sender is guaranteed to have been in the stream
+    rather than merely likely to be.
+
+    What is pinned is **byte-level** non-interleaving. A whole, well-formed
+    response to a command this client still has outstanding does not violate
+    that -- it is the second sender doing its job, and it is what a loaded CI
+    runner surfaced by letting the abort land mid-loop. So the reader consumes
+    it, by command *and* command id, taking its payload length from its own
+    header. Anything that is not a complete response to a known outstanding
+    command still fails the test, and now nothing except real stream corruption
+    can produce one.
     """
     serve(enforce=True)
     wire = start_torque_motion(client)
@@ -1548,22 +1669,52 @@ def test_concurrent_tcp_responses_never_interleave(serve, client):
                 )
             except OSError:  # pragma: no cover - socket closed by teardown
                 return
+            # Five times the control rate: enough that the server's UDP thread
+            # is genuinely contending, without one unthrottled Python spinner
+            # holding the GIL away from the three threads this test needs live
+            # (CI runs it on two shared cores).
+            time.sleep(0.0002)
+
+    def read_response():
+        """One complete response off the stream: header, then its own payload."""
+        head = recv_exactly(wire.tcp, 12)
+        try:
+            reply = MessageHeader.from_bytes(head)
+        except ValueError as error:  # pragma: no cover - only on real corruption
+            raise AssertionError(f"the TCP stream desynchronised: {head.hex()} ({error})")
+        assert reply.size == STATUS_RESPONSE_SIZE, f"the TCP stream desynchronised: {reply}"
+        return reply, recv_exactly(wire.tcp, reply.size - 12)
 
     pump = threading.Thread(target=keep_streaming, daemon=True)
     pump.start()
     try:
         wire.tcp.settimeout(5.0)
-        for command_id in range(400, 440):
+        aborted = None
+        command_id = 400
+        deadline = time.time() + 30.0
+        while command_id < 440 or aborted is None:
+            assert time.time() < deadline, "the starved motion never sent its Move response"
             header = MessageHeader(Command.kSetGuidingMode, command_id, 12 + 7)
             wire.tcp.sendall(header.to_bytes() + struct.pack("<6?B", *([False] * 6), False))
-            reply = MessageHeader.from_bytes(wire.tcp.recv(12))
-            assert reply.command == Command.kSetGuidingMode, "the TCP stream desynchronised"
-            assert reply.command_id == command_id
-            assert reply.size == 16
-            assert len(wire.tcp.recv(reply.size - 12)) == 4
+            while True:
+                reply, payload = read_response()
+                if reply.command == Command.kSetGuidingMode:
+                    assert reply.command_id == command_id, f"desynchronised: {reply}"
+                    break
+                # The only other response outstanding on this stream, and only
+                # ever once: the starved motion's terminal Move.
+                assert (reply.command, reply.command_id) == (
+                    Command.kMove,
+                    MOTION_COMMAND_ID,
+                ), f"the TCP stream desynchronised: unsolicited {reply}"
+                assert aborted is None, "one motion answered twice"
+                aborted = struct.unpack("<B3x", payload)[0]
+            command_id += 1
     finally:
         stop.set()
         pump.join(timeout=2.0)
+
+    assert aborted == MoveStatus.kReflexAborted
 
 
 # --- layer 3: end to end over real physics -----------------------------------
