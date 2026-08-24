@@ -1,7 +1,8 @@
 """FCI limit tables, error indices and the sim-side tolerances built on them.
 
-Every number here is a constant lifted from libfranka or from Franka's smoke
-suite, together with the small helpers that read straight off those tables
+Every number here is a constant lifted from libfranka's client-side
+implementation or derived from observed FR3 hardware behaviour, together with
+the small helpers that read straight off those tables
 (the position-based joint-velocity envelope, the singular-configuration test
 and the enforcement environment switch).
 
@@ -172,16 +173,15 @@ MAX_TORQUE = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 #:
 #: **The safety controller's error, not the motion generator's.** Everything
 #: else in this block is Control judging the signal the *client* sent; this one
-#: is the robot watching what the arm is actually doing. It is the error
-#: Franka's own hardware smoke suite observes whenever *measured* joint velocity
+#: is the robot watching what the arm is actually doing. It is the error real
+#: hardware reports whenever *measured* joint velocity
 #: leaves the position-based envelope, whatever the client was commanding --
 #: including in pure torque control, where there is no commanded velocity to
-#: judge at all (``smoke_errors.cpp:773`` ``moveJointVelocityViolation``: a
-#: 3 Nm ramp on joint 6, expectation pinned in ``smoke_test_errors.cpp:173``).
-#: It also *outranks* the motion generator's own envelope check: the suite's
-#: ``JointMotionGeneratorVelocityLimitsViolationHardware``
-#: (``smoke_test_errors.cpp:135``) ramps ``dq_c`` past the envelope and records
-#: that hardware answers ``joint_velocity_violation`` rather than
+#: judge at all (observed with a 3 Nm torque ramp on joint 6, which raises
+#: ``joint_velocity_violation`` even though no velocity was ever commanded).
+#: It also *outranks* the motion generator's own envelope check: ramping
+#: ``dq_c`` past the envelope on real hardware answers
+#: ``joint_velocity_violation`` rather than
 #: ``joint_motion_generator_velocity_limits_violation`` -- the safety controller
 #: sees the arm cross the envelope before Control finishes objecting to the
 #: command that put it there.
@@ -196,11 +196,9 @@ JOINT_VELOCITY_VIOLATION_INDEX = 3
 #: armed in every control mode. See
 #: :meth:`MotionLimitChecker.check_measured_cartesian_velocity`.
 #:
-#: Franka's hardware smoke suite pins it with a test that exists only to make
-#: the EE frame the deciding factor: ``CartesianVelocityViolationHardware``
-#: (``smoke_test_errors.cpp:264``) first calls ``robot->setEE`` with an EE
-#: 0.5 m out along the flange z, *then* runs ``moveCartesianVelocityViolation``
-#: (``smoke_errors.cpp:793``) -- a joint-velocity motion ramping joints 2 and 4
+#: Hardware makes the EE frame the deciding factor. Take a run that first calls
+#: ``robot->setEE`` with an EE 0.5 m out along the flange z, *then* commands a
+#: joint-velocity motion ramping joints 2 and 4
 #: at +-3 rad/s^2 towards 4 rad/s. Without the 0.5 m lever the same ramp
 #: reaches the joint envelope first and hardware answers
 #: ``joint_velocity_violation``; with it the EE crosses the translational limit
@@ -233,22 +231,18 @@ JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX = 15
 
 #: ``kCartesianPositionMotionGeneratorStartPoseInvalid`` (``error.h:25``) --
 #: the first ``O_T_EE_c`` of a ``kCartesianPosition`` motion does not sit where
-#: the robot actually is. Franka's smoke suite pins it with a +10 m z offset
-#: from cycle 0 (``smoke_errors.cpp:242``
-#: ``moveCartesianPositionMotionGeneratorStartPoseInvalid``, expectation at
-#: ``smoke_test_errors.cpp:204``), and, exactly like the joint start-pose check,
+#: the robot actually is. Hardware reports it for a +10 m z offset
+#: held from cycle 0, and, exactly like the joint start-pose check,
 #: it **outranks** the discontinuity checks: a first command that is 10 m away
 #: is a start-pose error, not a velocity discontinuity.
 CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX = 16
 
 #: ``kCartesianMotionGeneratorElbowLimitViolation`` (``error.h:26``) -- the
-#: elbow's velocity, acceleration and jerk limits, all three. Franka's smoke
-#: suite pins the velocity one: ``moveCartesianMotionGeneratorElbowLimitViolation``
-#: (``smoke_errors.cpp:509``) holds the pose and ramps the elbow at a constant
+#: elbow's velocity, acceleration and jerk limits, all three. The velocity one
+#: is observable on hardware: hold the pose and ramp the elbow at a constant
 #: ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2, so elbow velocity grows linearly
 #: and crosses :data:`MAX_ELBOW_VELOCITY` (1.499 rad/s) after ~5 s while
-#: acceleration stays at 0.3, far inside :data:`MAX_ELBOW_ACCELERATION`. The
-#: expectation is recorded at ``smoke_test_errors.cpp:268``.
+#: acceleration stays at 0.3, far inside :data:`MAX_ELBOW_ACCELERATION`.
 CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX = 17
 
 #: ``kCartesianMotionGeneratorVelocityLimitsViolation`` (``error.h:27``).
@@ -256,11 +250,9 @@ CARTESIAN_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION_INDEX = 18
 
 #: ``kCartesianMotionGeneratorVelocityDiscontinuity`` (``error.h:28``) -- the
 #: acceleration limit **of a Cartesian pose generator** (``O_T_EE_c``).
-#: Franka's smoke suite is explicit about the pairing: a step in ``O_T_EE_c``
-#: gives ``cartesian_motion_generator_velocity_discontinuity``
-#: (``smoke_errors.cpp:88`` + ``smoke_test_errors.cpp:48``) while a step in
-#: ``O_dP_EE_c`` gives ``..._acceleration_discontinuity``
-#: (``smoke_errors.cpp:124`` + ``smoke_test_errors.cpp:64``).
+#: Hardware is explicit about the pairing: a step in ``O_T_EE_c``
+#: gives ``cartesian_motion_generator_velocity_discontinuity``, while a step in
+#: ``O_dP_EE_c`` gives ``..._acceleration_discontinuity``.
 CARTESIAN_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX = 19
 
 #: ``kCartesianMotionGeneratorAccelerationDiscontinuity`` (``error.h:29``) --
@@ -269,17 +261,15 @@ CARTESIAN_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX = 19
 CARTESIAN_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX = 20
 
 #: ``kCartesianMotionGeneratorElbowSignInconsistent`` (``error.h:30``) -- the
-#: ``elbow[1]`` branch flag (the sign of joint 4) flipped *mid-motion*. Franka's
-#: smoke suite pins it: ``moveCartesianMotionGeneratorElbowSignInconsistent``
-#: (``smoke_errors.cpp:308``) holds ``O_T_EE_d`` and negates ``elbow[1]`` at
-#: t > 0.5 s; expectation at ``smoke_test_errors.cpp:237``.
+#: ``elbow[1]`` branch flag (the sign of joint 4) flipped *mid-motion*.
+#: Reproduced on hardware by holding ``O_T_EE_d`` and negating ``elbow[1]``
+#: at t > 0.5 s.
 CARTESIAN_MOTION_GENERATOR_ELBOW_SIGN_INCONSISTENT_INDEX = 21
 
 #: ``kCartesianMotionGeneratorStartElbowInvalid`` (``error.h:31``) -- the first
 #: ``elbow_c`` of a Cartesian motion does not describe the elbow the robot is
-#: actually in. ``moveCartesianMotionGeneratorStartElbowInvalid``
-#: (``smoke_errors.cpp:342``) adds 0.5 rad to ``elbow[0]`` from cycle 0 with the
-#: pose left alone; expectation at ``smoke_test_errors.cpp:252``.
+#: actually in. Reproduced on hardware by adding 0.5 rad to ``elbow[0]`` from
+#: cycle 0 with the pose left alone.
 CARTESIAN_MOTION_GENERATOR_START_ELBOW_INVALID_INDEX = 22
 
 #: ``kStartElbowSignInconsistent`` (``error.h:33``) ->
@@ -290,13 +280,14 @@ CARTESIAN_MOTION_GENERATOR_START_ELBOW_INVALID_INDEX = 22
 #: :data:`CARTESIAN_MOTION_GENERATOR_ELBOW_SIGN_INCONSISTENT_INDEX`, so a first
 #: ``elbow_c[1]`` disagreeing with ``sign(q[3])`` is arguably *this* error
 #: rather than :data:`CARTESIAN_MOTION_GENERATOR_START_ELBOW_INVALID_INDEX`.
-#: Nothing pins it: Franka's smoke suite has no test that opens a motion with a
-#: wrong elbow sign (its start-elbow test perturbs ``elbow[0]`` and leaves the
-#: sign alone), and libfranka refuses to *send* an elbow whose flag is not
-#: exactly +-1 (``checkElbow`` -> ``isValidElbow``, ``control_tools.h``), so no
-#: libfranka client can produce the ambiguous case at all. With no evidence,
-#: both halves of the start-elbow check report 22, the one index the suite does
-#: pin for "the elbow you opened with is not the elbow you are in". Kept in
+#: Nothing pins it: no hardware observation is available for a motion opened
+#: with a wrong elbow *sign* (the observable start-elbow case perturbs
+#: ``elbow[0]`` and leaves the sign alone), and libfranka refuses to *send* an
+#: elbow whose flag is not exactly +-1 (``checkElbow`` -> ``isValidElbow``,
+#: ``control_tools.h``), so no libfranka client can produce the ambiguous case
+#: at all. With no evidence, both halves of the start-elbow check report 22, the
+#: one index hardware is confirmed to report for "the elbow you opened with is
+#: not the elbow you are in". Kept in
 #: :data:`ERROR_NAMES` so the vocabulary stays complete.
 START_ELBOW_SIGN_INCONSISTENT_INDEX = 24
 
@@ -306,10 +297,9 @@ START_ELBOW_SIGN_INCONSISTENT_INDEX = 24
 #:
 #: On hardware this is a *client-side* refusal: libfranka's ``checkMatrix``
 #: (``include/franka/control_tools.h``) throws ``std::invalid_argument`` before
-#: the datagram is ever packed, which is why the smoke suite's
-#: ``CartesianPositionMotionGeneratorInvalidFrame`` expects
-#: ``std::invalid_argument`` and not a ``ControlException``
-#: (``smoke_test_errors.cpp:221``). A simulator cannot rely on that -- the
+#: the datagram is ever packed, which is why a stock libfranka client sees
+#: ``std::invalid_argument`` and not a ``ControlException`` for an invalid
+#: frame. A simulator cannot rely on that -- the
 #: client on the other end need not be libfranka -- so the same test is done
 #: server-side and the enum's own name for the condition is what gets reported.
 CARTESIAN_POSITION_MOTION_GENERATOR_INVALID_FRAME_INDEX = 31
@@ -393,18 +383,14 @@ ERROR_NAMES = {
 #   O_dP_EE_c           acceleration -> 20 jerk -> 20
 #   tau_J_d             rate -> 32         --
 #
-# Franka's hardware smoke suite is what pins this, and it pins it as a *pair*
-# of tests per family that differ only in the interface they command:
+# Hardware observation is what pins this, as a *pair* of runs per family that
+# differ only in the interface they command:
 #
-# * ``moveJointMotionGeneratorVelocityDiscontinuity`` steps ``q_c`` by 1.0 rad
-#   mid-motion and hardware answers ``joint_motion_generator_velocity_``
-#   ``discontinuity`` (14) -- ``smoke_errors.cpp:15`` / ``smoke_test_errors.cpp:16``.
-# * ``moveJointMotionGeneratorAccelerationDiscontinuity`` steps ``dq_c`` by
-#   50 rad/s mid-motion and hardware answers ``joint_motion_generator_``
-#   ``acceleration_discontinuity`` (15) -- ``smoke_errors.cpp:51`` /
-#   ``smoke_test_errors.cpp:32``.
-# * the same pair exists for Cartesian pose (19) and Cartesian velocity (20) --
-#   ``smoke_errors.cpp:88`` and ``:124``.
+# * stepping ``q_c`` by 1.0 rad mid-motion, and hardware answers
+#   ``joint_motion_generator_velocity_discontinuity`` (14).
+# * stepping ``dq_c`` by 50 rad/s mid-motion, and hardware answers
+#   ``joint_motion_generator_acceleration_discontinuity`` (15).
+# * the same pair exists for Cartesian pose (19) and Cartesian velocity (20).
 #
 # Both joint steps are enormous: after libfranka's 100 Hz command low-pass
 # (gain 0.3859 on the first cycle) the 1.0 rad position step still implies
@@ -433,19 +419,16 @@ ERROR_NAMES = {
 #: jumps into a motion from a stale or hard-coded pose is caught. Override it
 #: per-instance if your client needs a different contract.
 #:
-#: **Checked against both revisions of Franka's smoke suite, which agree.**
-#: ``moveJointPositionMotionGeneratorStartPoseInvalid`` opens with
-#: ``std::array<double, kNrJoints> discontinuity{{0.2}}`` -- +0.2 rad on joint 1,
-#: zero elsewhere -- added to ``state.q_d`` from cycle 0, and the code is
-#: byte-identical in the old ``libfranka/test/smoke/src/smoke_errors.cpp:194``
-#: and the current ``arm_smoke_tests/src/smoke_errors.cpp:211``. libfranka does
+#: **Checked against observed hardware behaviour.** The reference provocation is
+#: a motion that opens with **+0.2 rad on joint 1**, zero elsewhere, added to
+#: ``state.q_d`` from cycle 0. libfranka does
 #: not attenuate that opening step the way it attenuates a mid-motion one: on the
 #: first cycle ``initialized_filter_`` is false, so the command low-pass takes
 #: its reference from the command itself and is an identity
 #: (``ControlLoop<JointPositions>::convertMotion``). The sim therefore sees the
-#: full 0.2 rad in both suites, and 0.1 rad catches it with 2x margin. Neither
-#: suite constrains the tolerance from below -- every conforming motion in them
-#: opens from ``q_d`` exactly, at offset 0 -- so this is the tightest value that
+#: full 0.2 rad, and 0.1 rad catches it with 2x margin. Nothing observed
+#: constrains the tolerance from below -- every conforming motion opens from
+#: ``q_d`` exactly, at offset 0 -- so this is the tightest value that
 #: is evidenced rather than guessed.
 START_POSE_TOLERANCE = 0.1
 
@@ -462,8 +445,8 @@ START_POSE_TOLERANCE = 0.1
 #: rotational half simply reuses it; 0.05 m is its translational counterpart --
 #: loose enough that the simulator's own flange-pose reporting can never
 #: manufacture the error, tight enough to catch a client jumping in from a stale
-#: or hard-coded pose. Franka's own smoke test offsets by **10 m**
-#: (``smoke_errors.cpp:247``), three orders of magnitude clear of either
+#: or hard-coded pose. The reference hardware provocation offsets by **10 m**,
+#: three orders of magnitude clear of either
 #: number, so nothing about the pinned behaviour is sensitive to the choice.
 #: Override per-instance if your client needs a different contract.
 START_CARTESIAN_POSE_TRANSLATION_TOLERANCE = 0.05
@@ -473,8 +456,8 @@ START_CARTESIAN_POSE_ROTATION_TOLERANCE = 0.1
 #: elbow angle before it is ``cartesian_motion_generator_start_elbow_invalid``,
 #: in radians. Another sim choice, sized to the joint-space precedent
 #: (:data:`START_POSE_TOLERANCE`, 0.1 rad) because ``elbow[0]`` *is* a joint
-#: angle -- joint 3 of an FR3. The smoke suite offsets by 0.5 rad
-#: (``smoke_errors.cpp:350``), five times this.
+#: angle -- joint 3 of an FR3. The reference hardware provocation offsets by
+#: 0.5 rad, five times this.
 START_ELBOW_TOLERANCE = 0.1
 
 #: ``kOrthonormalThreshold`` from ``franka::isHomogeneousTransformation``
@@ -525,7 +508,7 @@ START_VELOCITY_TOLERANCE = 0.1
 #:
 #: 0.1 rad/s is ~4% of the *tightest* envelope value the FR3 has in free space
 #: (2.62 rad/s, joints 1-4), so it cannot mask a violation anyone cares about:
-#: the excursions the hardware suite provokes overshoot by whole rad/s (a 5
+#: the excursions that provoke it on hardware overshoot by whole rad/s (a 5
 #: rad/s^2 ramp crosses the envelope and keeps accelerating, and a 3 Nm torque
 #: ramp folds the arm through it). It is also far below the headroom a
 #: *conforming* motion keeps -- ``test_a_smooth_motion_never_trips_the_safety_``
@@ -544,12 +527,10 @@ MEASURED_JOINT_VELOCITY_MARGIN = 0.1
 #:
 #: **Translation only, and that is measured from hardware rather than assumed.**
 #: The obvious companion bound would be :data:`MAX_ROTATIONAL_VELOCITY`
-#: (2.5 rad/s) on the EE angular velocity, but the hardware smoke suite rules it
-#: out. Two of its tests spin *joint 6* -- whose axis is (near enough) the EE's
-#: own -- straight through the joint envelope: ``JointVelocityViolation``
-#: (``smoke_test_errors.cpp:132``, a 3 Nm torque ramp) and
-#: ``JointMotionGeneratorVelocityLimitsViolationHardware``
-#: (``smoke_test_errors.cpp:118``, a 5 rad/s^2 ``dq_c`` ramp). Joint 6's envelope
+#: (2.5 rad/s) on the EE angular velocity, but hardware behaviour rules it
+#: out. Two provocations spin *joint 6* -- whose axis is (near enough) the EE's
+#: own -- straight through the joint envelope: a 3 Nm torque ramp, and a
+#: 5 rad/s^2 ``dq_c`` ramp. Joint 6's envelope
 #: is 4.18 rad/s, so in both the EE angular speed passes 2.5 rad/s well before
 #: the joint limit -- and hardware still answers ``joint_velocity_violation``,
 #: never ``cartesian_velocity_violation``. A rotational term here would rename
@@ -562,7 +543,7 @@ MEASURED_JOINT_VELOCITY_MARGIN = 0.1
 #: That margin exists because ordinary motions ride right up against the joint
 #: envelope, where integrator noise alone can cross it; 3 m/s of end-effector
 #: travel is an order of magnitude beyond anything a conforming motion reaches
-#: (the suite's fastest point-to-point moves peak near 1 m/s), so there is no
+#: (the fastest point-to-point moves observed peak near 1 m/s), so there is no
 #: jitter at the boundary to absorb.
 MEASURED_CARTESIAN_VELOCITY_LIMIT = MAX_TRANSLATIONAL_VELOCITY
 
@@ -583,15 +564,15 @@ MEASURED_CARTESIAN_VELOCITY_LIMIT = MAX_TRANSLATIONAL_VELOCITY
 #: 0.05 is placed empirically, against the two things it has to separate on the
 #: sim's own FR3 model (``robot_descriptions`` ``fr3_v2``):
 #:
-#: * The pose Franka's suite calls singular, ``kSingularPose``
-#:   ``{0, 1.28, 0, -0.5415, 0, 2.74, 0}`` (``robot_test_fixture.h:73``), where
-#:   ``sigma_min`` = 0.0108 -- a factor 4.6 below the threshold. The fixture's
-#:   other documented singularities sit under it too
-#:   (``kSingularityJointPoses[1]``: 0.092).
-#: * Every start pose a *passing* Cartesian test opens a motion from. The whole
-#:   ``kInitPoses`` set spans 0.151..0.205, ``kStartPose`` 0.227,
-#:   ``kIkBugPose`` 0.139 -- the tightest of them still a factor 2.8 above the
-#:   threshold.
+#: * A known singular configuration of the FR3,
+#:   ``q = {0, 1.28, 0, -0.5415, 0, 2.74, 0}``, where
+#:   ``sigma_min`` = 0.0108 -- a factor 4.6 below the threshold. Other
+#:   near-singular configurations of the arm sit under it too (0.092 for a
+#:   second one measured on this model).
+#: * Every start pose from which a Cartesian motion is expected to open
+#:   *successfully*. The reference start configurations span 0.151..0.205, with
+#:   two further ones at 0.227 and 0.139 -- the tightest of them still a factor
+#:   2.8 above the threshold.
 #:
 #: The gap between 0.011 and 0.139 is two orders of magnitude wide in the ratio
 #: sense; 0.05 is the geometric middle of it.

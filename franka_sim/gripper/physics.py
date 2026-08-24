@@ -1,11 +1,11 @@
-"""Physics-backed gripper backend that drives the shared Genesis finger DOFs."""
+"""Physics-backed gripper backend that drives a scene's shared finger DOFs."""
 
 import logging
 import time
 
 import numpy as np
 
-from franka_sim.gripper_backend import (
+from franka_sim.gripper.backend import (
     DEFAULT_TEMPERATURE,
     FRANKA_HAND_MAX_WIDTH,
     GripperBackend,
@@ -15,8 +15,13 @@ from franka_sim.gripper_backend import (
 logger = logging.getLogger(__name__)
 
 
-class GenesisFrankaHand(GripperBackend):
-    """Physics-backed Franka Hand: drives the shared FrankaGenesisSim finger DOFs.
+class FrankaHandPhysics(GripperBackend):
+    """Physics-backed Franka Hand: drives the finger DOFs of a loaded sim scene.
+
+    Engine-agnostic: it only calls ``update_finger_positions``/``get_finger_state``
+    on the sim handed to it, so it works unchanged against
+    :class:`~franka_sim.mujoco_franka_sim.MujocoFrankaSim` and
+    :class:`~franka_sim.franka_genesis_sim.FrankaGenesisSim` alike.
 
     Command methods run on the gripper server's TCP handler thread and BLOCK,
     polling the sim's finger snapshot until the fingers settle (velocity ~0) or a
@@ -24,19 +29,19 @@ class GenesisFrankaHand(GripperBackend):
     ``get_state`` only reads the lock-free snapshot, so it is safe to call from
     the UDP broadcaster thread concurrently. ``is_grasped``/``is_stuck`` come from
     finger-position stall (fingers settling above the commanded width = caught an
-    object), so no Genesis contact-force API is needed.
+    object), so no engine contact-force API is needed.
     """
 
     def __init__(
         self,
-        genesis_sim,
+        physics_sim,
         max_width: float = FRANKA_HAND_MAX_WIDTH,
         temperature: int = DEFAULT_TEMPERATURE,
         settle_timeout: float = 4.0,
         settle_velocity: float = 1e-3,
         poll_dt: float = 0.01,
     ):
-        self.sim = genesis_sim
+        self.sim = physics_sim
         self.max_width = max_width
         self.temperature = temperature
         self.settle_timeout = settle_timeout

@@ -1,7 +1,7 @@
 import numpy as np
 
-from franka_sim.gripper_backend import GripperStateData
-from franka_sim.gripper_physics import GenesisFrankaHand
+from franka_sim.gripper.backend import GripperStateData
+from franka_sim.gripper.physics import FrankaHandPhysics
 
 
 class FakeSim:
@@ -48,7 +48,7 @@ class StaleFirstPollSim(FakeSim):
 
 
 def _hand(sim):
-    return GenesisFrankaHand(sim, settle_timeout=2.0, settle_velocity=1e-3, poll_dt=0.0)
+    return FrankaHandPhysics(sim, settle_timeout=2.0, settle_velocity=1e-3, poll_dt=0.0)
 
 
 def test_move_opens_to_commanded_width():

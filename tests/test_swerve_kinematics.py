@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from franka_sim.swerve_kinematics import SwerveKinematics
+from franka_sim.mobile.swerve_kinematics import SwerveKinematics
 
 TOL = 1e-6
 L = 1.0

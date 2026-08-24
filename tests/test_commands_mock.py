@@ -79,7 +79,7 @@ def wait_for_udp_socket(sim_server, timeout=2.0, poll_interval=0.01):
     raise AssertionError("server's UDP socket never became ready (created and bound)")
 
 
-def test_move_command(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_move_command(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test sending and handling of Move command with mocked simulator"""
     assert perform_handshake(tcp_client)
 
@@ -145,11 +145,11 @@ def test_move_command(tcp_client, udp_client, sim_server, mock_genesis_sim):
         tcp_client.recv(16)
 
     # Verify simulator interactions
-    mock_genesis_sim.set_control_mode.assert_called()
+    mock_physics_sim.set_control_mode.assert_called()
 
 
 def test_no_unsolicited_move_reply_arrives_before_stop_move(
-    tcp_client, udp_client, sim_server, mock_genesis_sim
+    tcp_client, udp_client, sim_server, mock_physics_sim
 ):
     """Regression: the broadcast loop must not answer Move a second time.
 
@@ -242,7 +242,7 @@ def test_no_unsolicited_move_reply_arrives_before_stop_move(
         tcp_client.recv(16)
 
 
-def test_stop_move_command(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_stop_move_command(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test sending and handling of StopMove command with mocked simulator"""
     assert perform_handshake(tcp_client)
 
@@ -303,7 +303,7 @@ def test_stop_move_command(tcp_client, udp_client, sim_server, mock_genesis_sim)
 
 
 def test_second_move_after_stop_move_gets_live_state_on_same_connection(
-    tcp_client, udp_client, sim_server, mock_genesis_sim, field_indices
+    tcp_client, udp_client, sim_server, mock_physics_sim, field_indices
 ):
     """A StopMove ends the motion, not the session -- pinned end to end.
 
@@ -504,7 +504,7 @@ def field_indices():
     }
 
 
-def test_invalid_move_parameters(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_invalid_move_parameters(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test Move command with invalid parameters using mocked simulator"""
     assert perform_handshake(tcp_client)
 
@@ -534,7 +534,7 @@ def test_invalid_move_parameters(tcp_client, udp_client, sim_server, mock_genesi
     assert status == MoveStatus.kInvalidArgumentRejected
 
 
-def test_robot_state_updates(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_robot_state_updates(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test that robot state updates are correctly transmitted over UDP"""
     assert perform_handshake(tcp_client)
 
@@ -544,7 +544,7 @@ def test_robot_state_updates(tcp_client, udp_client, sim_server, mock_genesis_si
         "dq": np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07]),
         "tau_J": np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
     }
-    mock_genesis_sim.get_robot_state.return_value = test_state
+    mock_physics_sim.get_robot_state.return_value = test_state
 
     # Wait for state update with verification
     assert wait_for_state_update(
@@ -556,10 +556,10 @@ def test_robot_state_updates(tcp_client, udp_client, sim_server, mock_genesis_si
     ), "Failed to receive expected robot state"
 
     # Verify that the simulator was called to get state
-    mock_genesis_sim.get_robot_state.assert_called()
+    mock_physics_sim.get_robot_state.assert_called()
 
 
-def test_position_control_desired_states(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_position_control_desired_states(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test that desired joint positions (q_d) are correctly tracked in position control mode"""
     assert perform_handshake(tcp_client)
 
@@ -569,7 +569,7 @@ def test_position_control_desired_states(tcp_client, udp_client, sim_server, moc
         "dq": np.zeros(7),
         "tau_J": np.zeros(7),
     }
-    mock_genesis_sim.get_robot_state.return_value = initial_state
+    mock_physics_sim.get_robot_state.return_value = initial_state
 
     # Send Move command for position control
     move_cmd = MoveCommand(
@@ -617,7 +617,7 @@ def test_position_control_desired_states(tcp_client, udp_client, sim_server, moc
     assert np.allclose(sim_server.robot_state.state["q_d"], desired_positions)
 
 
-def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test that desired joint velocities (dq_d) are correctly tracked in velocity control mode"""
     assert perform_handshake(tcp_client)
 
@@ -663,7 +663,7 @@ def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, moc
     # communication-constraints emulation ramps the commanded velocity to a safe
     # stop; reading the state afterwards would read that ramp, not the echo.
     reported = []
-    mock_genesis_sim.update_joint_velocities.side_effect = lambda dq: reported.append(
+    mock_physics_sim.update_joint_velocities.side_effect = lambda dq: reported.append(
         list(sim_server.robot_state.state["dq_d"])
     )
 
@@ -677,7 +677,7 @@ def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, moc
     assert np.allclose(reported[0], desired_velocities)
 
 
-def test_torque_control_desired_states(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_torque_control_desired_states(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test that desired joint torques (tau_J_d) are correctly tracked in torque control mode"""
     assert perform_handshake(tcp_client)
 
@@ -727,7 +727,7 @@ def test_torque_control_desired_states(tcp_client, udp_client, sim_server, mock_
     assert np.allclose(sim_server.robot_state.state["tau_J_d"], desired_torques)
 
 
-def test_initial_desired_states(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_initial_desired_states(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test that desired states are correctly initialized"""
     assert perform_handshake(tcp_client)
 
@@ -737,7 +737,7 @@ def test_initial_desired_states(tcp_client, udp_client, sim_server, mock_genesis
         "dq": np.zeros(7),
         "tau_J": np.zeros(7),
     }
-    mock_genesis_sim.get_robot_state.return_value = initial_state
+    mock_physics_sim.get_robot_state.return_value = initial_state
 
     # Wait for first state update
     time.sleep(0.1)
@@ -750,7 +750,7 @@ def test_initial_desired_states(tcp_client, udp_client, sim_server, mock_genesis
     assert np.allclose(sim_server.robot_state.state["tau_J_d"], np.zeros(7))
 
 
-def test_set_collision_behavior(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_collision_behavior(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetCollisionBehavior command handling"""
     assert perform_handshake(tcp_client)
 
@@ -794,7 +794,7 @@ def test_set_collision_behavior(tcp_client, udp_client, sim_server, mock_genesis
     assert status == 0  # Success
 
 
-def test_automatic_error_recovery(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_automatic_error_recovery(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test AutomaticErrorRecovery command handling.
 
     Regression: without a response, libfranka (and franka_hardware, which calls
@@ -821,11 +821,11 @@ def test_automatic_error_recovery(tcp_client, udp_client, sim_server, mock_genes
     assert status == 0  # Success
 
 
-def _bare_server(mock_genesis_sim):
+def _bare_server(mock_physics_sim):
     """A ``FrankaSimServer`` with ``running`` set, but no socket ever opened.
 
     ``_wait_for_standstill`` only touches ``self.running``, ``self.mobile_base``
-    and ``genesis_sim.get_robot_state()`` -- no networking -- so exercising it
+    and ``physics_sim.get_robot_state()`` -- no networking -- so exercising it
     does not need :func:`run_server` or any of the ``sim_server`` fixture's
     real sockets. Going through those anyway (as an earlier version of these
     tests did) hit a spurious ``accept()`` failure in this environment
@@ -833,12 +833,12 @@ def _bare_server(mock_genesis_sim):
     test for reasons unrelated to settling, which is exactly the kind of
     incidental coupling a unit test of one internal method should not have.
     """
-    server = FrankaSimServer(enable_vis=False, genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(enable_vis=False, physics_sim=mock_physics_sim, enable_gripper=False)
     server.running = True
     return server
 
 
-def test_wait_for_standstill_blocks_until_dq_settles(mock_genesis_sim):
+def test_wait_for_standstill_blocks_until_dq_settles(mock_physics_sim):
     """``_wait_for_standstill`` genuinely waits: it does not return before the
     arm has actually settled, only once it has.
 
@@ -847,7 +847,7 @@ def test_wait_for_standstill_blocks_until_dq_settles(mock_genesis_sim):
     observed), which let the client start its next motion mid-deceleration
     and trip a "Performance threshold reached" a few milliseconds later.
 
-    Drives ``mock_genesis_sim.get_robot_state()`` -- the live physics query
+    Drives ``mock_physics_sim.get_robot_state()`` -- the live physics query
     the wait actually polls -- rather than ``robot_state.state["dq"]``. That
     distinction is the point of this test's shape: the publish loop (the only
     thing that ever copies the backend's ``dq`` into ``robot_state.state``)
@@ -861,13 +861,13 @@ def test_wait_for_standstill_blocks_until_dq_settles(mock_genesis_sim):
     stale "still moving" data -- this test would not catch that bug if it
     drove the same field the fix must not read.
     """
-    server = _bare_server(mock_genesis_sim)
+    server = _bare_server(mock_physics_sim)
     state = {
         "q": np.zeros(7),
         "dq": np.array([2.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         "tau_J": np.zeros(7),
     }
-    mock_genesis_sim.get_robot_state.side_effect = lambda: state
+    mock_physics_sim.get_robot_state.side_effect = lambda: state
 
     settle_delay = 0.08
 
@@ -891,7 +891,7 @@ def test_wait_for_standstill_blocks_until_dq_settles(mock_genesis_sim):
     assert elapsed < AUTOMATIC_ERROR_RECOVERY_TIMEOUT
 
 
-def test_wait_for_standstill_times_out_rather_than_hanging(mock_genesis_sim):
+def test_wait_for_standstill_times_out_rather_than_hanging(mock_physics_sim):
     """A caller that never settles gets the wait back at the timeout, not never.
 
     A sim can inject state (a mocked backend, a stalled physics thread) that
@@ -899,8 +899,8 @@ def test_wait_for_standstill_times_out_rather_than_hanging(mock_genesis_sim):
     client on this forever, which is why the timeout replies success (see the
     warning it logs) rather than raising.
     """
-    server = _bare_server(mock_genesis_sim)
-    mock_genesis_sim.get_robot_state.return_value = {
+    server = _bare_server(mock_physics_sim)
+    mock_physics_sim.get_robot_state.return_value = {
         "q": np.zeros(7),
         "dq": np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),  # never settles
         "tau_J": np.zeros(7),
@@ -914,7 +914,7 @@ def test_wait_for_standstill_times_out_rather_than_hanging(mock_genesis_sim):
 
 
 def test_automatic_error_recovery_reply_waits_for_the_arm_to_settle(
-    tcp_client, udp_client, sim_server, mock_genesis_sim
+    tcp_client, udp_client, sim_server, mock_physics_sim
 ):
     """End to end over the wire: the TCP reply itself is what is deferred.
 
@@ -927,7 +927,7 @@ def test_automatic_error_recovery_reply_waits_for_the_arm_to_settle(
     settle_at = time.monotonic() + 0.1
     moving = {"q": np.zeros(7), "dq": np.array([2.6, 0.0, 0, 0, 0, 0, 0]), "tau_J": np.zeros(7)}
     settled = {"q": np.zeros(7), "dq": np.zeros(7), "tau_J": np.zeros(7)}
-    mock_genesis_sim.get_robot_state.side_effect = (
+    mock_physics_sim.get_robot_state.side_effect = (
         lambda: settled if time.monotonic() >= settle_at else moving
     )
 
@@ -949,7 +949,7 @@ def test_automatic_error_recovery_reply_waits_for_the_arm_to_settle(
     assert elapsed < 2.5, "the reply waited far longer than settling should have taken"
 
 
-def test_set_joint_impedance(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_joint_impedance(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetJointImpedance command handling"""
     assert perform_handshake(tcp_client)
 
@@ -978,7 +978,7 @@ def test_set_joint_impedance(tcp_client, udp_client, sim_server, mock_genesis_si
     assert status == 0  # Success
 
 
-def test_set_cartesian_impedance(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_cartesian_impedance(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetCartesianImpedance command handling"""
     assert perform_handshake(tcp_client)
 
@@ -1007,7 +1007,7 @@ def test_set_cartesian_impedance(tcp_client, udp_client, sim_server, mock_genesi
     assert status == 0  # Success
 
 
-def test_set_guiding_mode(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_guiding_mode(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetGuidingMode command handling.
 
     Regression: without a response, a real libfranka client's setGuidingMode()
@@ -1037,7 +1037,7 @@ def test_set_guiding_mode(tcp_client, udp_client, sim_server, mock_genesis_sim):
     assert status == 0  # Success
 
 
-def test_set_ee_to_k(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_ee_to_k(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetEEToK command handling.
 
     Request is a single ``std::array<double, 16> EE_T_K`` (128 bytes). The
@@ -1072,7 +1072,7 @@ def test_set_ee_to_k(tcp_client, udp_client, sim_server, mock_genesis_sim):
     assert np.allclose(sim_server.robot_state.state["EE_T_K"], ee_t_k)
 
 
-def test_set_ne_to_ee(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_ne_to_ee(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetNEToEE command handling.
 
     Request is a single ``std::array<double, 16> NE_T_EE`` (128 bytes). The
@@ -1106,7 +1106,7 @@ def test_set_ne_to_ee(tcp_client, udp_client, sim_server, mock_genesis_sim):
     assert np.allclose(sim_server.robot_state.state["NE_T_EE"], ne_t_ee)
 
 
-def test_set_load(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_set_load(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test SetLoad command handling.
 
     Request is ``double m_load`` + ``std::array<double, 3> F_x_Cload`` +
@@ -1166,7 +1166,7 @@ _GUARD_EXCLUDED_COMMANDS = {Command.kConnect, Command.kMove}
 
 
 @pytest.mark.parametrize("command", [c for c in Command if c not in _GUARD_EXCLUDED_COMMANDS])
-def test_no_command_hangs(command, tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_no_command_hangs(command, tcp_client, udp_client, sim_server, mock_physics_sim):
     """Regression guard: every non-interactive v10 command gets a real TCP reply.
 
     Before this fix, SetGuidingMode/SetEEToK/SetNEToEE/SetLoad had no handler
@@ -1198,7 +1198,7 @@ def test_no_command_hangs(command, tcp_client, udp_client, sim_server, mock_gene
         assert len(body) == remaining
 
 
-def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_genesis_sim):
+def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_physics_sim):
     """Test handling of motion_generation_finished flag"""
     assert perform_handshake(tcp_client)
 

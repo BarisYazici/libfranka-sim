@@ -18,7 +18,7 @@ import pytest
 mujoco = pytest.importorskip("mujoco")
 
 from franka_sim.franka_genesis_sim import ControlMode  # noqa: E402
-from franka_sim.mobile_duo_mujoco_sim import (  # noqa: E402
+from franka_sim.mobile.duo_mujoco_sim import (  # noqa: E402
     COLLISION_GEOM_GROUP,
     DEFAULT_DT,
     MAX_CATCHUP_LAG_S,
@@ -26,7 +26,7 @@ from franka_sim.mobile_duo_mujoco_sim import (  # noqa: E402
     log_gl_renderer,
     patch_urdf_for_mujoco,
 )
-from franka_sim.mobile_duo_sim import (  # noqa: E402
+from franka_sim.mobile.duo_sim import (  # noqa: E402
     ARM_INITIAL_Q,
     ARM_ROLES,
     FR3_FORCE_LIMITS,
@@ -43,7 +43,7 @@ from franka_sim.mujoco_visuals import (  # noqa: E402
     apply_dae_material_visuals,
     resolve_fr3v2_mjcf,
 )
-from franka_sim.swerve_base import TMR_WHEEL_RADIUS  # noqa: E402
+from franka_sim.mobile.swerve_base import TMR_WHEEL_RADIUS  # noqa: E402
 from franka_sim.urdf_assets import resolve_urdf_meshes  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

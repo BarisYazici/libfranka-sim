@@ -9,24 +9,75 @@ breaking changes — these are called out explicitly.
 
 ### Changed
 
-- **The mobile-robot modules moved into a `franka_sim.mobile` subpackage.**
-  Eight files that had accumulated at the top level of `franka_sim` are now
-  gathered under `franka_sim/mobile/`, so the top-level package reads as the
-  arm/FCI core it is: `mobile_duo_sim` → `mobile.duo_sim`,
-  `mobile_duo_mujoco_sim` → `mobile.duo_mujoco_sim`, `mobile_duo_common` →
-  `mobile.common`, `mobile_duo_runner` → `mobile.runner`, and `spine_stub`,
-  `swerve_base`, `swerve_kinematics`, `tmr_genesis_sim` keeping their names one
-  level down. **No API change:** the classes, functions and constants are
-  identical, `franka_sim.MobileDuoScene` and every other top-level export
-  resolves exactly as before, and each old dotted path is aliased to the moved
-  module *object* (via `sys.modules`, not a re-export copy) — so
-  `import franka_sim.spine_stub`, `from franka_sim.swerve_base import
-  SwerveBase` and even `monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", …)`
-  all keep working and keep pointing at the one live module. The
-  `run-franka-spine-stub` entry point now names the new path. Loggers whose
-  names callers configure against (`franka_sim.swerve_base`,
-  `franka_sim.mobile_duo_runner`, `franka_sim.mobile_duo_common`) are pinned to
-  their pre-move names, so existing logging config is unaffected.
+- **BREAKING: the mobile-robot modules moved into a `franka_sim.mobile`
+  subpackage, and the old top-level import paths are gone.** Eight files that
+  had accumulated at the top level of `franka_sim` are now gathered under
+  `franka_sim/mobile/`, so the top-level package reads as the arm/FCI core it
+  is: `mobile_duo_sim` → `mobile.duo_sim`, `mobile_duo_mujoco_sim` →
+  `mobile.duo_mujoco_sim`, `mobile_duo_common` → `mobile.common`,
+  `mobile_duo_runner` → `mobile.runner`, and `spine_stub`, `swerve_base`,
+  `swerve_kinematics`, `tmr_genesis_sim` keeping their names one level down.
+  The move first shipped with `sys.modules` aliases so the old dotted paths
+  kept resolving; those aliases are now deleted outright — `0.4`'s adoption
+  was negligible, so this repo is taking the breaking change ahead of `1.0.0`
+  rather than carrying dead compatibility shims into it. `import
+  franka_sim.spine_stub`, `from franka_sim.swerve_base import SwerveBase` and
+  `monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", …)` no longer work —
+  import from `franka_sim.mobile.spine_stub`, `franka_sim.mobile.swerve_base`,
+  `franka_sim.mobile.duo_sim`, and so on. The top-level class exports are
+  **unchanged**: `franka_sim.MobileDuoScene` and every other name in
+  `franka_sim.__all__` still resolve exactly as before — this only affects
+  imports that reached into the old submodule paths directly. The
+  `run-franka-spine-stub` entry point already names the new path. The three
+  loggers that were pinned to their pre-move dotted names for backward
+  compatibility (`franka_sim.swerve_base`, `franka_sim.mobile_duo_runner`,
+  `franka_sim.mobile_duo_common`) are un-pinned too, now `logging.getLogger(__name__)`
+  under their new `franka_sim.mobile.*` names — update any logging
+  configuration or `caplog` assertions that named them explicitly.
+
+- **BREAKING: the gripper modules moved into a `franka_sim.gripper`
+  subpackage, and the old top-level import paths are gone.** The four files
+  that made up the Franka Hand half of the package are now gathered under
+  `franka_sim/gripper/`, matching the `franka_sim.mobile` split above:
+  `gripper_backend` → `gripper.backend`, `gripper_physics` →
+  `gripper.physics`, `gripper_protocol` → `gripper.protocol`, and
+  `gripper_server` → `gripper.server`. No aliases were left at the old paths —
+  `import franka_sim.gripper_server`, `from franka_sim.gripper_protocol import
+  GRIPPER_COMMAND_PORT` and `monkeypatch.setattr("franka_sim.gripper_backend.…",
+  …)` now raise `ModuleNotFoundError`; import from `franka_sim.gripper.*`
+  instead. As with the mobile move, this repo is taking the clean break ahead
+  of `1.0.0` rather than carrying compatibility shims into it. The gripper
+  subpackage re-exports nothing, so `import franka_sim.gripper` stays light.
+  The loggers are unaffected: all four modules already used
+  `logging.getLogger(__name__)`, so their dotted names simply follow the files
+  to `franka_sim.gripper.*` — update any logging configuration or `caplog`
+  assertions that named `franka_sim.gripper_server` or
+  `franka_sim.gripper_backend` explicitly.
+
+- **BREAKING: `GenesisFrankaHand` is now `FrankaHandPhysics`, and the name in
+  `franka_sim.__all__` changed with it.** The class never touched Genesis — it
+  only calls `update_finger_positions`/`get_finger_state` on whatever sim it is
+  handed, and since the MuJoCo backend landed it has been used mostly against
+  MuJoCo scenes, so the old name actively misled about which engine it required.
+  The new name matches its new module, `franka_sim.gripper.physics`. No
+  deprecation alias is provided: `franka_sim.GenesisFrankaHand` and
+  `from franka_sim.gripper.physics import GenesisFrankaHand` both fail. The
+  constructor signature and behaviour are otherwise unchanged, and
+  `franka_sim.FrankaHandPhysics` resolves eagerly exactly as the old name
+  did. (Its first parameter, `genesis_sim` at the time of this rename, is
+  itself renamed to `physics_sim` below.)
+
+- **BREAKING: `FrankaSimServer`'s `genesis_sim` constructor kwarg (and the
+  `self.genesis_sim`/`FrankaHandPhysics(genesis_sim=...)` attribute it fed)
+  are renamed to `physics_sim`.** MuJoCo has been the default engine for two
+  releases, so `genesis_sim` was a naming fossil that misleadingly implied
+  Genesis specifically, even when injecting a MuJoCo backend or a test
+  double. No compatibility alias is provided ahead of `1.0.0`:
+  `FrankaSimServer(genesis_sim=...)` now raises `TypeError`, and code reading
+  `server.genesis_sim` raises `AttributeError` — use `physics_sim` in both
+  places. Genesis-specific names are unaffected: `FrankaGenesisSim`,
+  `TMRGenesisSim`, `MobileDuoScene`, and the `franka_genesis_sim`/
+  `tmr_genesis_sim` modules keep their names, since those really are Genesis.
 
 - **A second server on the same port now fails loudly with `EADDRINUSE`.**
   The TCP listeners (arm port 1337, gripper port 1338) no longer set
@@ -49,9 +100,9 @@ breaking changes — these are called out explicitly.
   per physics step.
   - The joint velocity that comes out is fed into the **existing** velocity
     servo, the same one a `kJointVelocity` motion drives, so every measured-side
-    safety check applies to a Cartesian motion unchanged. That is what makes
-    Franka's `CartesianMotionGeneratorJointPositionLimitsViolationHardware` pass:
-    the commanded trajectory drives joint 7 into its position stop, the
+    safety check applies to a Cartesian motion unchanged. That is what makes a
+    Cartesian motion driven into the joint position limits behave as hardware
+    does: the commanded trajectory drives joint 7 into its position stop, the
     position-based velocity envelope collapses to zero there, and the sim aborts
     with `joint_velocity_violation` — the error hardware records.
   - **The command-stream checking layer is untouched.** IK tracking is a second
@@ -81,15 +132,16 @@ breaking changes — these are called out explicitly.
   half.** The measured end-effector speed is now watched against
   `franka::kMaxTranslationalVelocity` (3 − 1e−3 m/s) every cycle, in every
   control mode, computed from the MuJoCo Jacobian at the frame `F_T_EE` defines.
-  This is what Franka's `CartesianVelocityViolationHardware` is built to detect:
-  it moves the EE 0.5 m out along the flange with `setEE` *before* running an
-  ordinary joint-velocity ramp, and only that lever arm gets the EE past 3 m/s
+  This is the error hardware raises when the EE is moved 0.5 m out along the
+  flange with `setEE` *before* running an
+  ordinary joint-velocity ramp: only that lever arm gets the EE past 3 m/s
   before the joints reach their own envelope.
   - **Translation only, and it outranks `joint_velocity_violation` (3).** Both
-    are read off hardware rather than assumed: two suite tests spin joint 6
+    are read off hardware rather than assumed: a 3 Nm torque ramp and a
+    5 rad/s² `dq_c` ramp each spin joint 6
     through its 4.18 rad/s envelope — so the EE angular speed passes 2.5 rad/s
     first — and hardware still answers `joint_velocity_violation`, which rules a
-    rotational term out; and `CartesianVelocityViolationHardware` reports
+    rotational term out; and with the 0.5 m lever hardware reports
     `cartesian_velocity_violation` *alone*, which fixes the precedence.
   - `F_T_EE` is now **derived and published** as `F_T_NE · NE_T_EE`, libfranka's
     own decomposition, instead of being a permanent identity. `setEE` therefore
@@ -99,15 +151,15 @@ breaking changes — these are called out explicitly.
   `Move::Status::kStartAtSingularPoseRejected`, which libfranka turns into
   "Move command rejected: cannot start at singular pose!". The test is the
   smallest singular value of the EE Jacobian at the arm's measured `q` against
-  0.05 — placed between Franka's own `kSingularPose` (σ_min ≈ 0.011) and the
-  tightest start pose any passing Cartesian test uses (≈ 0.139).
+  0.05 — placed between a known singular FR3 configuration (σ_min ≈ 0.011) and
+  the tightest start pose a Cartesian motion is expected to open from (≈ 0.139).
   - Delivered as the motion's **terminal** response, after `kMotionStarted`,
     because libfranka's `executeCommand<Move>` handles the first response
     outside any try/catch: a rejection delivered there escapes as a bare
     `CommandException`, and only the mode-wait loop that follows converts one
-    into the `ControlException` the hardware test catches.
-  - Joint interfaces are **not** refused: Franka's own test reaches the singular
-    configuration by joint motion, and driving out of a singularity is the only
+    into the `ControlException` a client sees on hardware.
+  - Joint interfaces are **not** refused: a singular configuration is reached in
+    the first place by joint motion, and driving out of a singularity is the only
     way to leave one.
 
 - **Packet-loss extrapolation — a missed motion-generator cycle now continues
@@ -190,7 +242,7 @@ breaking changes — these are called out explicitly.
     waypoint and the late datagram are the *same* step, one guessed and one
     measured, and differencing them against each other reports a reference that
     travelled nowhere followed by an enormous deceleration. Measured aborting a
-    conforming client's approach against Franka's own smoke suite at a
+    conforming client's approach with a stock libfranka client at a
     `control_command_success_rate` of 0.99. The extrapolations a late datagram
     supersedes are now discarded and it is differenced against the last command
     that actually arrived, over the interval it really travelled. A replay or a
@@ -237,11 +289,11 @@ breaking changes — these are called out explicitly.
     standard millisecond. `docs/robot-state.md` documents both halves.
 - **Cartesian motion-generator checking — `kCartesianPosition` is no longer a
   silent hole.** The commanded pose stream was decoded off the wire and dropped,
-  so Franka's own `arm_smoke_tests` cases for Cartesian errors never got an abort
+  so a client provoking a Cartesian error never got an abort
   and hung forever. `O_T_EE_c` and `elbow_c` now route into the same checker,
   freshness and coalesced-cycle plumbing as the joint signals, and every error the
   pose interface can raise on hardware is raised here. The indices and their
-  precedence are pinned against the smoke suite, which passes on real robots:
+  precedence are pinned against observed FR3 hardware behaviour:
   - a step in `O_T_EE_c` is `cartesian_motion_generator_velocity_discontinuity`
     (19), **not** the envelope's 18 — the interface-relative naming rule the
     joint generators already followed, now on the Cartesian half: an
@@ -262,7 +314,7 @@ breaking changes — these are called out explicitly.
     only-1e-5-orthonormal commanded matrix can never hand `acos` a NaN.
   - **The arm still does not move on the pose interface.** There is no inverse
     kinematics stage; this is a checking layer, and the deliverable is the abort.
-    With enforcement *off* the checks only log, so a smoke test waiting for an
+    With enforcement *off* the checks only log, so a client waiting for an
     abort still hangs — that residual is documented in `docs/compatibility.md`.
 - **Arm-role `kCartesianVelocity` is checked too.** The twist checks existed but
   were reachable only from the mobile duo's base role; an arm-role Cartesian
@@ -289,21 +341,18 @@ breaking changes — these are called out explicitly.
     measured pose.
 
   This was not cosmetic. A libfranka Cartesian-pose motion generator initialises
-  and holds from `O_T_EE_d` (Franka's own smoke helpers open every pose motion
-  with `std::array<double, 16> cmd = state.O_T_EE_d;`) and libfranka's command
+  and holds from `O_T_EE_d` (the conventional opening for a pose motion is
+  `std::array<double, 16> cmd = state.O_T_EE_d;`) and libfranka's command
   low-pass filter blends each new command with `O_T_EE_c`
   (`ControlLoop<CartesianPose>::convertMotion`). With both stubbed to identity,
   *every* pose motion streamed a pose metres and a full rotation from the robot
   and tripped `cartesian_position_motion_generator_start_pose_invalid` on cycle 0
-  — a sim artifact that hid five of the smoke suite's real Cartesian checks
-  behind it. Against Franka's older `smoke_test_errors` suite this takes the
-  error binary from 10/21 to 15/21, turning
-  `CartesianMotionGeneratorVelocityDiscontinuity`,
-  `CartesianPositionMotionGeneratorInvalidFrame`,
-  `CartesianMotionGeneratorElbowSignInconsistent`,
-  `CartesianMotionGeneratorStartElbowInvalid` and
-  `CartesianMotionGeneratorElbowLimitViolationHardware` from false start-pose
-  failures into real passes. **Arm roles only** — the mobile-duo base role's
+  — a sim artifact that masked every other Cartesian error behind it. With the
+  fields published faithfully, five distinct Cartesian error scenarios go from
+  false start-pose failures to the errors hardware actually reports:
+  a velocity discontinuity on `O_T_EE_c`, an invalid frame matrix, an elbow
+  sign flip mid-motion, an invalid start elbow, and an elbow limit violation.
+  **Arm roles only** — the mobile-duo base role's
   `O_dP_EE_d`/`O_dP_EE_c` echo and its dead-reckoned `O_T_EE` are untouched,
   guarded by the same role check the rest of the commanded-field ownership uses.
 - **`elbow_c` joins `elbow_d`, and both now echo a commanded elbow.** Outside a
@@ -417,12 +466,11 @@ breaking changes — these are called out explicitly.
   error. This is a different error from
   `joint_motion_generator_velocity_limits_violation` (13), which judges the
   *command*; when 13 fires during a motion, 3 is latched alongside it in the
-  same abort rather than one preempting the other. That pairing is not a
-  verified hardware pin — it follows the dev comment sitting under a
-  `TODO(qu_zh): Verify the change` in Franka's hardware smoke suite ("Both error
-  can appear. However with the current RCU joint_velocity_violation appear much
-  early as we shape the limit", `smoke_test_errors.cpp:110-127`), which is a
-  developer's account of the behaviour and says itself that it is unverified.
+  same abort rather than one preempting the other. That pairing is a reported
+  hardware behaviour rather than one measured here: hardware raises both errors
+  for this pair, with `joint_velocity_violation` appearing much earlier because
+  the controller shapes the envelope down towards the current velocity. Treat it
+  as strong but not independently verified.
   Reporting is always on;
   aborting follows `--enforce-motion-limits` and is identical to every other
   violation (error bit, `kReflex`, `Move` answered `kReflexAborted`). A 0.1 rad/s
@@ -432,9 +480,12 @@ breaking changes — these are called out explicitly.
 
 ### Known issues
 
-- **Velocity-commanded motions are not run-to-run repeatable, and Franka's
-  `ControlMechanismParityTest.LoopMatchesActiveControl` flakes ~10–30% under host
-  load** (occasionally taking `CombinationParamHardware` with it). The physics
+- **Velocity-commanded motions are not run-to-run repeatable.** A client that
+  runs the same motion sequence twice — once through `robot->control()` and once
+  through the read/write active-control interface — and compares where the two
+  land will see ~0.01 rad of divergence, enough to fail a 5e-3 rad per-joint
+  comparison ~10–30% of the time under host load; a long multi-stage motion
+  sequence occasionally goes with it. The physics
   thread steps on the wall clock while the client's motion profile advances on
   the `message_id` clock of the published states, and the publish loop runs a few
   Hz under 1 kHz; every millisecond of slip is an extra step of the last
@@ -493,8 +544,8 @@ breaking changes — these are called out explicitly.
   that commands no pose, the cycle before the first command lands — they are now
   **frozen at the value the motion started from** instead of following the arm.
   libfranka builds every Cartesian command out of these fields (they are its
-  low-pass filter's reference and its rate limiter's baseline, and the smoke
-  suite's generators open with `franka::CartesianPose{state.O_T_EE_d,
+  low-pass filter's reference and its rate limiter's baseline, and the
+  conventional opening is `franka::CartesianPose{state.O_T_EE_d,
   state.elbow_d}`), so now that the arm is actually driven from those commands,
   reporting the measured value there closes a feedback loop through the client.
   Idle and joint motions are unchanged: they report the measured pose and elbow,
@@ -505,8 +556,8 @@ breaking changes — these are called out explicitly.
   robot uses.** Which discontinuity a violation is called depends on the channel
   the client commands, not on the derivative that broke its limit, and a
   discontinuity outranks the velocity-envelope check when one step breaks both.
-  Pinned against Franka's hardware smoke suite. If you match on error names, the
-  ones that changed are:
+  Pinned against observed FR3 hardware behaviour. If you match on error names,
+  the ones that changed are:
   - a mid-motion step in **`q_c`** now latches
     `joint_motion_generator_velocity_discontinuity` (14), previously
     `joint_motion_generator_velocity_limits_violation` (13);
@@ -604,9 +655,10 @@ breaking changes — these are called out explicitly.
   kink it caused. The gate now also waits on `_commands_in_flight`, a counter the
   receive thread holds up for the whole journey from socket to simulator.
 
-  Measured on Franka's old-wire `smoke_test_motion_control`, the two tests the
-  issue was reported against (`ElbowFromInitPoseHardware/pose_index_0`,
-  `CombinationParamHardware/pose_index_0`), on a host loaded with 12 spinning
+  Measured with a stock libfranka client on the two motion sequences the issue
+  was reported against — a Cartesian pose motion opened from an initial pose
+  with an elbow command, and a long multi-stage motion sequence — on a host
+  loaded with 12 spinning
   cores: **9 spurious aborts in 30 runs before, 0 in 50 runs after.** Every
   pre-fix abort was caught with a ring-buffer dump of the last cycles, and 8 of
   the 9 were this window (the ninth needed a receive-thread stall longer than the
@@ -662,8 +714,9 @@ breaking changes — these are called out explicitly.
     interval as any other command; a replay or reordered packet, whose id is no
     newer than the history's, still floors at one cycle.
 
-  Measured on the old-wire smoke suite (`smoke_test_errors`), two flakiest tests,
-  40 iterations on one idle host: **14 spurious aborts before, 1 after.** The
+  Measured with a stock libfranka client on the two most timing-sensitive error
+  scenarios, 40 iterations on one idle host: **14 spurious aborts before, 1
+  after.** The
   residual needed a stall long enough to freeze the whole process (10-40 ms
   observed) and was the hold-not-extrapolate divergence, which the packet-loss
   extrapolation entry at the top of this release closes.
@@ -688,15 +741,14 @@ breaking changes — these are called out explicitly.
   `handle_stop_move_command` and `docs/robot-state.md`.
 
 - **A commanded velocity-envelope violation now also latches
-  `joint_velocity_violation`.** `JointMotionGeneratorVelocityLimitsViolationHardware`
-  (and `JointMotionGeneratorPositionLimitsViolationHardware`, which crosses the
-  envelope the same way) expects `joint_velocity_violation` in the
-  `ControlException` message. That pairing is not a verified hardware pin --
-  it follows the dev comment sitting under a `TODO(qu_zh): Verify the change`
-  in Franka's hardware smoke suite ("Both error[s] can appear. However with
-  the current RCU joint_velocity_violation appear[s] much earl[ier]",
-  `smoke_test_errors.cpp:110-127`), which is a developer's account of the
-  behaviour and says itself that it is unverified. The commanded-envelope
+  `joint_velocity_violation`.** A `dq_c` ramp past the envelope -- and a `q_c`
+  motion that crosses the position limits the same way -- reports
+  `joint_velocity_violation` in the
+  `ControlException` message on hardware. That pairing is a reported hardware
+  behaviour rather than one measured here: hardware raises both errors, with
+  `joint_velocity_violation` appearing much earlier because the controller
+  shapes the envelope down towards the current velocity. Treat it as strong but
+  not independently verified. The commanded-envelope
   check now latches both 3 and 13 unconditionally whenever a motion is
   running, so either name a caller matches on is present; the pure
   safety-controller path (measured-only, e.g. torque mode with no commanded
@@ -941,7 +993,7 @@ breaking changes — these are called out explicitly.
   30 FPS) instead of letting the viewer throttle physics.
 - Environment overrides: `FR3_MJCF` (model path) and `FR3_JOINT_DAMPING` (a
   scalar or 7 comma-separated values).
-- Real libfranka v10 client integration smoke test.
+- Real libfranka v10 client integration test.
 - Headless mode (no `-v`) steps Genesis correctly (the TCP/UDP server runs in a
   background thread while physics steps in the main thread).
 

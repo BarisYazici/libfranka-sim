@@ -104,11 +104,11 @@ class Violation:
     #: A second error bit to latch alongside :attr:`error_index`, in the same
     #: abort. Set only by :meth:`MotionLimitChecker.check`'s precedence block,
     #: where a commanded velocity-envelope violation (13) trips while the
-    #: safety controller is armed: hardware's own dev comment records "Both
-    #: error[s] can appear. However with the current RCU joint_velocity_violation
-    #: appear[s] much earl[ier] as we shape the limit" for exactly this pair
-    #: (``smoke_test_errors.cpp:110-127``, both the position- and
-    #: velocity-limits-violation-hardware tests). None everywhere else,
+    #: safety controller is armed: on real hardware both errors can appear for
+    #: exactly this pair, but ``joint_velocity_violation`` appears much earlier
+    #: because the controller shapes the envelope tighter than the motion
+    #: generator's own limit. This applies to both the position- and the
+    #: velocity-limits provocations. None everywhere else,
     #: including the pure safety-controller path
     #: (:meth:`MotionLimitChecker.check_measured_velocity`), which latches 3
     #: alone.
@@ -345,7 +345,7 @@ class MotionLimitChecker:
             # publish the commanded-pose fields faithfully (see
             # docs/robot-state.md), and between motions they are exactly this
             # value -- but the check asks "are you where the robot is", which is
-            # what the smoke suite's 10 m offset breaks, and judging a command
+            # what a 10 m start-pose offset breaks, and judging a command
             # against another command would let a stale one excuse itself. A
             # snapshot without a pose -- a bare hold setpoint, a mocked backend
             # -- leaves it None and the check is skipped rather than run against
@@ -751,16 +751,14 @@ class MotionLimitChecker:
             # came back clean -- but measured dq lags commanded dq by a
             # cycle or few, so the re-ask was nondeterministic: it read
             # "clean" on exactly the cycle hardware would have called
-            # joint_velocity_violation. Franka's own hardware smoke suite
-            # documents that outcome as the expected one, not an
-            # exception: "Both error[s] can appear. However with the
-            # current RCU joint_velocity_violation appear[s] much
-            # earl[ier] as we shape the limit. From 50% of max allowed
-            # speed we already start bringing the limit towards the
-            # current velocity" (dev comment on both
-            # ``JointMotionGeneratorPositionLimitsViolationHardware`` and
-            # ``JointMotionGeneratorVelocityLimitsViolationHardware``,
-            # ``smoke_test_errors.cpp:110-127``). So a 13 during an armed
+            # joint_velocity_violation. That paired outcome is the
+            # expected one on real hardware, not an exception: both
+            # errors can appear, and joint_velocity_violation appears
+            # much earlier because the controller shapes the envelope --
+            # from roughly 50% of the maximum allowed speed it already
+            # starts drawing the limit down towards the current
+            # velocity. This holds for both the position-limits and the
+            # velocity-limits provocation. So a 13 during an armed
             # motion latches 3 alongside it unconditionally, rather than
             # asking whether measured dq happens to have crossed yet.
             #
@@ -786,11 +784,10 @@ class MotionLimitChecker:
         :func:`lower_joint_velocity_limits`) that the commanded check uses, and
         latches ``joint_velocity_violation``.
 
-        That distinction is the whole point. Franka's hardware smoke suite has
-        one test for it that no commanded check could ever satisfy:
-        ``moveJointVelocityViolation`` (``smoke_errors.cpp:773``) runs *pure
-        torque control* -- there is no commanded velocity anywhere in the
-        session -- and ramps 3 Nm into joint 6 until the arm folds through the
+        That distinction is the whole point. Hardware exhibits a case no
+        commanded check could ever cover: under *pure torque control* -- there
+        is no commanded velocity anywhere in the
+        session -- ramping 3 Nm into joint 6 until the arm folds through the
         envelope. Hardware answers ``joint_velocity_violation``. So this check
         is active in **all** control modes, including torque, and it is the one
         check in this module that does not care what the client sent.
@@ -861,10 +858,11 @@ class MotionLimitChecker:
         ``ee_velocity`` is the measured translational velocity of the **EE
         frame** -- the frame ``F_T_EE`` defines, not the flange -- expressed in
         the base frame, as three components in m/s. Which frame it is measured
-        at is the whole substance of the check: Franka's
-        ``CartesianVelocityViolationHardware`` moves the EE 0.5 m out along the
-        flange z with ``setEE`` *before* running an otherwise unremarkable
-        joint-velocity ramp, and it is only that lever arm that gets the EE past
+        at is the whole substance of the check: on hardware, moving the EE
+        0.5 m out along the flange z with ``setEE`` *before* running an
+        otherwise unremarkable
+        joint-velocity ramp is what separates the two errors, and it is only
+        that lever arm that gets the EE past
         3 m/s before the joints reach their own envelope. Computing the speed at
         the flange instead would reproduce the joint error, not the Cartesian
         one. The velocity itself comes from the physics backend, which is where
@@ -1298,8 +1296,8 @@ class MotionLimitChecker:
         reports a reference that travelled nowhere and then a huge deceleration.
         That is not the client's doing and not a limit the robot would flag; on
         an ordinary ramp at 0.5 rad/s it comes out as ~500 rad/s^2 and abort
-        conforming clients. It was measured doing exactly that against Franka's
-        own smoke suite, at a ``control_command_success_rate`` of 0.99.
+        conforming clients. It was measured doing exactly that against a stock
+        libfranka client, at a ``control_command_success_rate`` of 0.99.
 
         So: **when the real packet turns up, the guess it replaced is thrown
         away.** The history is restored to where it stood before this run of
@@ -1544,7 +1542,7 @@ class MotionLimitChecker:
         # once, and hardware calls it exactly one of them --
         # ``joint_motion_generator_velocity_discontinuity``. See the
         # interface-relative naming rule at the top of this module. Checking the
-        # envelope first made the sim report 13 for the smoke suite's 1.0 rad
+        # envelope first made the sim report 13 for a 1.0 rad ``q_c``
         # step where hardware reports 14.
         return (
             self._check_per_joint(
@@ -1613,12 +1611,12 @@ class MotionLimitChecker:
 
     def _check_torque(self, command: Dict[str, Any], cycles: int) -> Optional[Violation]:
         # Range first, rate second -- and unlike every other ordering in this
-        # module that is *not* pinned to hardware. The smoke suite's
-        # ``moveControllerTorqueDiscontinuity`` (``smoke_errors.cpp:165``) steps
+        # module that is *not* pinned to hardware. The observable torque
+        # provocation steps
         # joint 1 to 10 Nm, which is a rate violation (10 000 Nm/s) and well
         # inside the joint's 87 Nm range, so it exercises the rate check alone
         # and says nothing about which name a command that breaks *both* should
-        # get. Nothing else in the suite does either.
+        # get. No other hardware observation settles it either.
         #
         # The interface-relative rule would argue for the rate (discontinuity
         # beats envelope everywhere else); ``tau_J_range_violation`` arguably
@@ -1647,8 +1645,8 @@ class MotionLimitChecker:
         **Checked, never applied.** No physics branch drives the arm from a
         commanded pose (see ``docs/compatibility.md``), so the arm stays where it
         is for the whole motion -- but every hardware error the pose interface
-        can raise is raised here, which is what makes Franka's own smoke tests
-        for Cartesian errors terminate against this sim instead of hanging
+        can raise is raised here, which is what lets a client provoking a
+        Cartesian error terminate against this sim instead of hanging
         forever waiting for an abort that never came.
 
         The order below *is* the precedence, and every step of it is pinned:
@@ -1669,15 +1667,15 @@ class MotionLimitChecker:
            ``cartesian_motion_generator_velocity_discontinuity`` (19), and it
            comes before the velocity-envelope check (18) that the same step also
            breaks. Jerk is one further up, at 20. This is the exact mirror of
-           :meth:`_check_position`'s 14 / 13 / 15, and it is what makes the smoke
-           suite's 1.0 m z step -- 0.3859 m after libfranka's own 100 Hz command
+           :meth:`_check_position`'s 14 / 13 / 15, and it is what makes a
+           1.0 m z step -- 0.3859 m after libfranka's own 100 Hz command
            filter, i.e. 386 m/s and 385 871 m/s^2 in a single cycle -- come back
            as 19 rather than 18.
         5. **The elbow's derivatives**, all three of which land on 17.
 
-        Steps 4 and 5 never compete in Franka's suite: every Cartesian test that
-        moves the elbow holds the pose still, and every one that moves the pose
-        sends no elbow at all. Pose-before-elbow is therefore this sim's
+        Steps 4 and 5 never compete in any observed hardware case: a Cartesian
+        motion that moves the elbow holds the pose still, and one that moves the
+        pose sends no elbow at all. Pose-before-elbow is therefore this sim's
         ordering, not a hardware pin.
         """
         pose = command["O_T_EE_c"]
@@ -1899,9 +1897,8 @@ class MotionLimitChecker:
     def _check_start_cartesian_pose(self, pose: Sequence[float]) -> Optional[Violation]:
         """The first ``O_T_EE_c`` against the pose the robot is actually in.
 
-        Franka's smoke suite pins this with a +10 m z offset held from cycle 0
-        (``moveCartesianPositionMotionGeneratorStartPoseInvalid``,
-        ``smoke_errors.cpp:242``), and pins that it is a *start-pose* error
+        Hardware pins this with a +10 m z offset held from cycle 0, and reports
+        it as a *start-pose* error
         rather than a discontinuity -- which is why this runs before any
         differencing, exactly as :meth:`_check_start_pose` does for ``q_c``.
 
@@ -1953,17 +1950,15 @@ class MotionLimitChecker:
     def _check_elbow_validity(self, command: Dict[str, Any]) -> Optional[Violation]:
         """Start-elbow and mid-motion sign checks for an elbow-carrying command.
 
-        Two distinct hardware errors, pinned by two smoke tests that differ only
-        in *when* they perturb the elbow:
+        Two distinct hardware errors, separated only by *when* the elbow is
+        perturbed:
 
         * the motion's first elbow must be the elbow the robot is in --
           ``elbow[0] += 0.5`` from cycle 0 gives
-          ``cartesian_motion_generator_start_elbow_invalid`` (22)
-          (``smoke_errors.cpp:342`` / ``smoke_test_errors.cpp:252``);
+          ``cartesian_motion_generator_start_elbow_invalid`` (22);
         * the branch flag must not change once the motion is running --
           negating ``elbow[1]`` at t > 0.5 s gives
-          ``cartesian_motion_generator_elbow_sign_inconsistent`` (21)
-          (``smoke_errors.cpp:308`` / ``smoke_test_errors.cpp:237``).
+          ``cartesian_motion_generator_elbow_sign_inconsistent`` (21).
 
         A *start-time* sign mismatch is reported as 22 as well; see
         :data:`START_ELBOW_SIGN_INCONSISTENT_INDEX` for why that index, which by

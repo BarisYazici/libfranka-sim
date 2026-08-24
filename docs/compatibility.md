@@ -216,8 +216,8 @@ The checking layer is independent of whether the backend can *drive* the
 interface: it judges the stream the client sent, so it behaves identically on a
 backend that moves the arm from a Cartesian command and one that does not (see
 [Cartesian control](#cartesian-control)). The point of the checks is the
-*abort*, which is what makes Franka's own smoke tests for Cartesian errors
-terminate. With enforcement off they only log, and a smoke test waiting for an
+*abort*, which is what lets a client provoking a Cartesian error terminate.
+With enforcement off they only log, and a client waiting for an
 abort will still wait forever.
 
 Two things about the error *names* are worth knowing before you match on them,
@@ -234,8 +234,8 @@ because both cost people time on real hardware:
   The first is the safety controller watching *measured* velocity and fires in
   every mode, torque included; the second is Control judging your command. When
   the second trips during a motion, the sim now latches **both** — not a
-  verified hardware pin, but the dev comment sitting under an unverified
-  `TODO(qu_zh)` in Franka's own smoke suite describes the same pairing, so match
+  pin this project verified directly, but hardware is reported to raise the
+  same pair, so match
   on either name and expect to see both in the `ControlException`. See
   [the safety controller](robot-state.md#joint_velocity_violation-3-the-safety-controller).
 
@@ -422,22 +422,22 @@ physics step of the last commanded velocity than the client's own clock
 accounted for, integrated straight into the joint configuration and never
 corrected.
 
-**What you will see.** Franka's own `smoke_test_motion_control` has a test built
-on exactly this assumption — `ControlMechanismParityTest.LoopMatchesActiveControl`
-runs one motion sequence through `robot->control()` and again through the
-read/write active-control interface and asserts the two land within 5e-3 rad per
-joint. Against the sim it fails roughly 10–30% of the time depending on load,
-and `CombinationParamHardware` occasionally goes with it. **This is not new in
+**What you will see.** A client that runs one motion sequence through
+`robot->control()` and then the *same* sequence through the read/write
+active-control interface, and compares where the two land, will see them
+diverge. Held to a 5e-3 rad per-joint tolerance, that comparison fails against
+the sim roughly 10–30% of the time depending on load, and a long multi-stage
+motion sequence occasionally goes with it. **This is not new in
 the Cartesian release:** it reproduces on the release before it, where the
-failure enters at the `kJointVelocity` stage instead (0.044 rad observed), and an
+divergence enters at the `kJointVelocity` stage instead (0.044 rad observed), and an
 interleaved A/B of the two revisions does not separate them (4/12 vs 1/12 failures,
 Fisher p ≈ 0.32). Driving the Cartesian generators simply gave the same mechanism
 two more motions to accumulate in — an 8 s open-loop twist trajectory is the
-longest integration in the suite.
+longest integration involved.
 
 **What to do about it.** Nothing, if you are running a controller: this is a
-repeatability property, not a correctness one, and every other test in the suite
-passes. If you are diffing two runs of the same trajectory, difference the
+repeatability property, not a correctness one, and nothing else is affected.
+If you are diffing two runs of the same trajectory, difference the
 *commanded* stream rather than the measured configuration, or drive a position
 generator. The real fix is to step the physics once per published control cycle
 instead of once per wall millisecond, so that the robot's clock is the clock the
@@ -447,7 +447,7 @@ client sees — that is on the roadmap, not in this release.
 occasionally aborts mid-flight with
 `cartesian_motion_generator_velocity_discontinuity` at a few hundred to ~1500
 m/s² on `O_T_EE_c`, on a commanded stream that is smooth by construction (~1 in
-15 runs of the parity test observed). The commanded pose is echoed from the
+15 runs of that A/B comparison observed). The commanded pose is echoed from the
 client's own stream, so a stale echo would explain it — but that has not been
 demonstrated, and the mechanism above does not account for it. Treat an isolated
 Cartesian discontinuity abort as possibly the sim rather than your client, and

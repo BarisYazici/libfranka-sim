@@ -39,7 +39,7 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-def listening_server(mock_genesis_sim):
+def listening_server(mock_physics_sim):
     """A FrankaSimServer with its accept loop running on a private port.
 
     Yields ``(server, thread, port)``. The accept thread is deliberately
@@ -48,7 +48,7 @@ def listening_server(mock_genesis_sim):
     """
     port = _free_port()
     server = FrankaSimServer(
-        host="127.0.0.1", port=port, genesis_sim=mock_genesis_sim, enable_gripper=False
+        host="127.0.0.1", port=port, physics_sim=mock_physics_sim, enable_gripper=False
     )
     thread = threading.Thread(target=server.run_server, name="test-accept-loop")
     thread.start()
@@ -102,11 +102,11 @@ class RecordingSocket:
         self.close_called = True
 
 
-def test_cleanup_survives_client_socket_nulled_between_shutdown_and_close(mock_genesis_sim):
+def test_cleanup_survives_client_socket_nulled_between_shutdown_and_close(mock_physics_sim):
     """The exact race from the review: client_socket races cleanup(); server_socket
     (a stand-in for the still-listening SO_REUSEPORT socket) must still get closed.
     """
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     client_sock = RacyCloseSocket(server, "client_socket")
     server_sock = RecordingSocket()
     server.client_socket = client_sock
@@ -125,9 +125,9 @@ def test_cleanup_survives_client_socket_nulled_between_shutdown_and_close(mock_g
     assert server.server_socket is None
 
 
-def test_cleanup_survives_server_socket_nulled_between_shutdown_and_close(mock_genesis_sim):
+def test_cleanup_survives_server_socket_nulled_between_shutdown_and_close(mock_physics_sim):
     """The same race, but on server_socket itself (e.g. a concurrent restart)."""
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     server_sock = RacyCloseSocket(server, "server_socket")
     server.server_socket = server_sock
 
@@ -138,8 +138,8 @@ def test_cleanup_survives_server_socket_nulled_between_shutdown_and_close(mock_g
     assert server.server_socket is None
 
 
-def test_cleanup_survives_command_socket_nulled_between_shutdown_and_close(mock_genesis_sim):
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+def test_cleanup_survives_command_socket_nulled_between_shutdown_and_close(mock_physics_sim):
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     command_sock = RacyCloseSocket(server, "command_socket")
     server.command_socket = command_sock
 
@@ -150,11 +150,11 @@ def test_cleanup_survives_command_socket_nulled_between_shutdown_and_close(mock_
     assert server.command_socket is None
 
 
-def test_cleanup_survives_udp_socket_nulled_between_check_and_close(mock_genesis_sim):
+def test_cleanup_survives_udp_socket_nulled_between_check_and_close(mock_physics_sim):
     """udp_socket has no shutdown() call, but the same check-then-act race applies
     between the truthiness check and close() -- cache-before-use covers it too.
     """
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
 
     class RacyUdpSocket:
         def __init__(self, owner):
@@ -177,7 +177,7 @@ def test_cleanup_survives_udp_socket_nulled_between_check_and_close(mock_genesis
 
 
 def test_stale_command_thread_does_not_kill_the_next_sessions_connection_running(
-    mock_genesis_sim,
+    mock_physics_sim,
 ):
     """A dead session's UDP thread must not clear the NEW session's flag.
 
@@ -199,7 +199,7 @@ def test_stale_command_thread_does_not_kill_the_next_sessions_connection_running
     thread notices its fd died. The flag must survive, and the stale thread
     must still exit on its own (it is not allowed to spin on a dead fd).
     """
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     server.running = True
 
     old_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -244,22 +244,22 @@ def test_stale_command_thread_does_not_kill_the_next_sessions_connection_running
 # --------------------------------------------------------------------------
 
 
-def test_stop_is_idempotent(mock_genesis_sim):
+def test_stop_is_idempotent(mock_physics_sim):
     """A second stop() (i.e. a second Ctrl+C) must be a quiet no-op.
 
     It used to re-run the whole teardown, including a second gripper-thread
     join -- which is exactly where the user's second Ctrl+C landed.
     """
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
 
     server.stop()
     server.stop()
     server.stop()
 
-    assert mock_genesis_sim.stop.call_count == 1
+    assert mock_physics_sim.stop.call_count == 1
 
 
-def test_stop_does_not_raise_when_a_stage_fails(mock_genesis_sim, caplog):
+def test_stop_does_not_raise_when_a_stage_fails(mock_physics_sim, caplog):
     """One broken stage must not abort the rest of the shutdown.
 
     cleanup() runs first, so a simulator that raises used to be harmless --
@@ -267,8 +267,8 @@ def test_stop_does_not_raise_when_a_stage_fails(mock_genesis_sim, caplog):
     the viewer's GL context alive, which is what wedges the process on exit.
     Every stage is isolated now; the failure is logged, not propagated.
     """
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
-    mock_genesis_sim.stop.side_effect = RuntimeError("viewer already gone")
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
+    mock_physics_sim.stop.side_effect = RuntimeError("viewer already gone")
 
     with caplog.at_level(logging.ERROR):
         server.stop()  # must not raise
@@ -276,7 +276,7 @@ def test_stop_does_not_raise_when_a_stage_fails(mock_genesis_sim, caplog):
     assert any("simulator" in record.message for record in caplog.records)
 
 
-def test_cleanup_announces_itself_once(mock_genesis_sim, caplog):
+def test_cleanup_announces_itself_once(mock_physics_sim, caplog):
     """The accept loop's finally clause calls cleanup() after stop() already did.
 
     Both runs are harmless (every step is None-guarded), but two "Cleaning up
@@ -284,7 +284,7 @@ def test_cleanup_announces_itself_once(mock_genesis_sim, caplog):
     is what made the reported log look as though a client disconnect had
     triggered one.
     """
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
 
     with caplog.at_level(logging.INFO, logger="franka_sim.franka_sim_server"):
         server.cleanup()
@@ -376,7 +376,7 @@ def test_stop_returns_promptly_with_a_client_connected(listening_server):
     assert not thread.is_alive(), "the accept loop outlived stop()"
 
 
-def test_stop_leaves_no_non_daemon_threads(mock_genesis_sim):
+def test_stop_leaves_no_non_daemon_threads(mock_physics_sim):
     """Nothing the server starts may be able to keep the process alive.
 
     Serving threads are daemons on purpose: every join in stop() is bounded,
@@ -386,7 +386,7 @@ def test_stop_leaves_no_non_daemon_threads(mock_genesis_sim):
     before = set(threading.enumerate())
 
     server = FrankaSimServer(
-        host="127.0.0.1", port=_free_port(), genesis_sim=mock_genesis_sim, enable_gripper=True
+        host="127.0.0.1", port=_free_port(), physics_sim=mock_physics_sim, enable_gripper=True
     )
     server.start_gripper_server()
     thread = threading.Thread(target=server.run_server, name="test-accept-loop", daemon=True)

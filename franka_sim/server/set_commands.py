@@ -383,7 +383,7 @@ class SetCommandsMixin:
         promptly (see the loop condition below) and so the timeout path can log
         and bail rather than oversleeping a caller that will never settle.
 
-        Queries ``genesis_sim.get_robot_state()`` directly on every poll rather
+        Queries ``physics_sim.get_robot_state()`` directly on every poll rather
         than reading the cached ``dq`` off :attr:`RobotState.state`.
 
         **That distinction is not cosmetic, even though the publish loop now
@@ -421,7 +421,7 @@ class SetCommandsMixin:
         settled_cycles = 0
         while self.running and time.monotonic() < deadline:
             try:
-                dq = self.genesis_sim.get_robot_state().get("dq")
+                dq = self.physics_sim.get_robot_state().get("dq")
             except Exception:
                 # The backend erroring out here is not a reason to hang the
                 # client; fall through to "not settled" and let the timeout

@@ -3,7 +3,7 @@ import math
 import pytest
 from fakes import FakeEntity
 
-from franka_sim.swerve_base import (
+from franka_sim.mobile.swerve_base import (
     TMR_DRIVE_JOINTS,
     TMR_JOINT_ORDER,
     TMR_STEER_JOINTS,
@@ -79,14 +79,14 @@ def test_set_twist_ignores_non_finite_commands(swerve):
 
 def test_repeated_bad_twists_log_once(swerve, caplog):
     """1 kHz path: the warning must latch, or the log flood adds control jitter."""
-    with caplog.at_level("WARNING", logger="franka_sim.swerve_base"):
+    with caplog.at_level("WARNING", logger="franka_sim.mobile.swerve_base"):
         for _ in range(50):
             swerve.set_twist([math.inf, 0.0, 0.0, 0.0, 0.0, 0.0])
     assert len(caplog.records) == 1
 
 
 def test_the_bad_twist_latch_rearms_after_a_good_command(swerve, caplog):
-    with caplog.at_level("WARNING", logger="franka_sim.swerve_base"):
+    with caplog.at_level("WARNING", logger="franka_sim.mobile.swerve_base"):
         swerve.set_twist([math.inf, 0.0, 0.0, 0.0, 0.0, 0.0])
         swerve.set_twist([0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
         swerve.set_twist([math.inf, 0.0, 0.0, 0.0, 0.0, 0.0])

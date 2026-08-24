@@ -80,8 +80,8 @@ def _wait_until(pred, timeout=10.0, dt=0.05):
 def physics_gripper(real_genesis):
     """A running 9-DOF sim + gripper server with the physics backend."""
     from franka_sim.franka_genesis_sim import FrankaGenesisSim
-    from franka_sim.gripper_physics import GenesisFrankaHand
-    from franka_sim.gripper_server import FrankaGripperServer
+    from franka_sim.gripper.physics import FrankaHandPhysics
+    from franka_sim.gripper.server import FrankaGripperServer
 
     sim = FrankaGenesisSim(enable_vis=False, enable_hand=True)
     sim.initialize_simulation()
@@ -89,7 +89,7 @@ def physics_gripper(real_genesis):
     sim_thread = threading.Thread(target=sim.run_simulation, daemon=True)
     sim_thread.start()
 
-    server = FrankaGripperServer(host="127.0.0.1", port=0, backend=GenesisFrankaHand(sim))
+    server = FrankaGripperServer(host="127.0.0.1", port=0, backend=FrankaHandPhysics(sim))
     srv_thread = threading.Thread(target=server.run_server, daemon=True)
     srv_thread.start()
     assert _wait_until(lambda: server.running and server.server_socket is not None)

@@ -37,7 +37,7 @@ from franka_sim.comm_constraints import (
 )
 from franka_sim.control_modes import ControlMode
 from franka_sim.franka_protocol import COMMAND_PORT, MoveStatus
-from franka_sim.gripper_server import FrankaGripperServer
+from franka_sim.gripper.server import FrankaGripperServer
 from franka_sim.motion_limits import MotionLimitChecker
 from franka_sim.motion_limits import (
     enforcement_enabled_by_env as motion_limit_enforcement_enabled_by_env,
@@ -82,7 +82,7 @@ class FrankaSimServer(
         host="0.0.0.0",
         port=COMMAND_PORT,
         enable_vis=False,
-        genesis_sim=None,
+        physics_sim=None,
         urdf_path=None,
         enable_gripper=True,
         gripper_backend=None,
@@ -99,10 +99,9 @@ class FrankaSimServer(
             host: IP address to bind to (default: all interfaces)
             port: TCP port for command interface
             enable_vis: Enable visualization of the simulator
-            genesis_sim: Optional pre-configured simulator instance (any backend,
-                or a fake in tests). Kept under its historical name because
-                dozens of callers inject through it.
-            physics: Backend built when ``genesis_sim`` is not injected --
+            physics_sim: Optional pre-configured simulator instance (any backend,
+                or a fake in tests).
+            physics: Backend built when ``physics_sim`` is not injected --
                 ``mujoco`` (default) or ``genesis``.
             urdf_path: URDF served to the client via GetRobotModel. Defaults to the
                 bundled hand-less FR3 arm model.
@@ -262,14 +261,14 @@ class FrankaSimServer(
         self.motion_limits = MotionLimitChecker(enforce=self.enforce_motion_limits)
 
         # Build the physics backend unless one was injected.
-        if genesis_sim is None:
+        if physics_sim is None:
             logger.info("Initializing simulation (physics backend: %s)", physics)
-            self.genesis_sim = resolve_sim_class(physics)(
+            self.physics_sim = resolve_sim_class(physics)(
                 enable_vis=enable_vis, enable_hand=(gripper_physics and enable_gripper)
             )
             logger.info("Simulation initialized")
         else:
-            self.genesis_sim = genesis_sim
+            self.physics_sim = physics_sim
 
         #: Whether the physics backend can turn a Cartesian command into joint
         #: motion, i.e. whether it implements the differential-IK half of the
@@ -285,7 +284,7 @@ class FrankaSimServer(
         #: for the swerve kinematics, not an end-effector twist, and it has its
         #: own branch (:meth:`_handle_cartesian_velocity`).
         self.cartesian_tracking = not mobile_base and hasattr(
-            self.genesis_sim, "update_cartesian_pose"
+            self.physics_sim, "update_cartesian_pose"
         )
 
         self.robot_state = RobotState()
@@ -300,9 +299,9 @@ class FrankaSimServer(
         self.gripper_thread = None
         if enable_gripper:
             if gripper_physics:
-                from franka_sim.gripper_physics import GenesisFrankaHand
+                from franka_sim.gripper.physics import FrankaHandPhysics
 
-                backend = GenesisFrankaHand(self.genesis_sim)
+                backend = FrankaHandPhysics(self.physics_sim)
             else:
                 backend = gripper_backend
             self.gripper_server = FrankaGripperServer(host=host, backend=backend)

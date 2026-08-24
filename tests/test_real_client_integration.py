@@ -1,4 +1,4 @@
-"""Integration smoke test: a real libfranka_new (v10) client against the sim.
+"""Integration test: a real libfranka_new (v10) client against the sim.
 
 This compiles and runs a tiny C++ client (``_v10_real_client_probe.cpp``) linked
 against the prebuilt libfranka_new and points it at the simulator. It proves the
@@ -35,7 +35,7 @@ def _prereqs_available():
 
 pytestmark = pytest.mark.skipif(
     not _prereqs_available(),
-    reason="prebuilt libfranka_new + g++ + eigen3 are required for the real-client smoke test",
+    reason="prebuilt libfranka_new + g++ + eigen3 are required for the real-client test",
 )
 
 
@@ -63,7 +63,7 @@ def probe_binary(tmp_path_factory):
     return out
 
 
-def test_real_v10_client_connects_reads_and_gets_model(sim_server, mock_genesis_sim, probe_binary):
+def test_real_v10_client_connects_reads_and_gets_model(sim_server, mock_physics_sim, probe_binary):
     """A stock libfranka_new client completes Connect, reads state, and gets the URDF."""
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = f"{LIB_BUILD}:" + env.get("LD_LIBRARY_PATH", "")

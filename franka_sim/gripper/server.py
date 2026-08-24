@@ -8,8 +8,8 @@ import threading
 import time
 from typing import Optional
 
-from franka_sim.gripper_backend import FrankaHandSim, GripperBackend
-from franka_sim.gripper_protocol import (
+from franka_sim.gripper.backend import FrankaHandSim, GripperBackend
+from franka_sim.gripper.protocol import (
     GRIPPER_COMMAND_PORT,
     GRIPPER_HEADER_SIZE,
     GRIPPER_VERSION,

@@ -3,7 +3,7 @@ import struct
 import time
 
 from franka_sim.franka_sim_server import FrankaSimServer
-from franka_sim.gripper_protocol import (
+from franka_sim.gripper.protocol import (
     GRIPPER_COMMAND_PORT,
     GRIPPER_HEADER_SIZE,
     GRIPPER_VERSION,
@@ -28,19 +28,19 @@ def _wait_for_port(port, timeout=5.0):
     return False
 
 
-def test_gripper_server_constructed_when_enabled(mock_genesis_sim):
-    server = FrankaSimServer(enable_gripper=True, genesis_sim=mock_genesis_sim)
+def test_gripper_server_constructed_when_enabled(mock_physics_sim):
+    server = FrankaSimServer(enable_gripper=True, physics_sim=mock_physics_sim)
     assert server.gripper_server is not None
     assert server.gripper_server.port == GRIPPER_COMMAND_PORT
 
 
-def test_no_gripper_server_when_disabled(mock_genesis_sim):
-    server = FrankaSimServer(enable_gripper=False, genesis_sim=mock_genesis_sim)
+def test_no_gripper_server_when_disabled(mock_physics_sim):
+    server = FrankaSimServer(enable_gripper=False, physics_sim=mock_physics_sim)
     assert server.gripper_server is None
 
 
-def test_start_gripper_server_listens_and_handshakes(mock_genesis_sim):
-    server = FrankaSimServer(enable_gripper=True, genesis_sim=mock_genesis_sim)
+def test_start_gripper_server_listens_and_handshakes(mock_physics_sim):
+    server = FrankaSimServer(enable_gripper=True, physics_sim=mock_physics_sim)
     server.start_gripper_server()
     try:
         assert _wait_for_port(GRIPPER_COMMAND_PORT), "gripper server did not start"

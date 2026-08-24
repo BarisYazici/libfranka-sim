@@ -10,7 +10,7 @@ import socket
 import struct
 import threading
 
-from franka_sim.gripper_protocol import (
+from franka_sim.gripper.protocol import (
     GRIPPER_COMMAND_PORT,
     GRIPPER_HEADER_SIZE,
     GRIPPER_STATE_SIZE,

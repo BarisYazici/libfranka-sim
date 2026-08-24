@@ -1,12 +1,12 @@
 """The MuJoCo mobile-duo path must import and (where assets allow) run without
 Genesis installed at all.
 
-``franka_sim.mobile_duo_mujoco_sim`` used to import ``ControlMode`` and the
-shared constants from ``franka_sim.franka_genesis_sim``/``franka_sim.mobile_duo_sim``,
+``franka_sim.mobile.duo_mujoco_sim`` used to import ``ControlMode`` and the
+shared constants from ``franka_sim.franka_genesis_sim``/``franka_sim.mobile.duo_sim``,
 both of which import ``genesis`` at module level -- so ``--physics mujoco``
 would crash on import on a genesis-free (mujoco-only) install, even though it
 never touches Genesis at runtime.
-``franka_sim.mobile_duo_runner`` had the same problem one level up (it
+``franka_sim.mobile.runner`` had the same problem one level up (it
 imported the Genesis-flavoured ``MobileDuoScene`` just for a type reference).
 
 This is machine-verified in a real subprocess with a meta-path finder that
@@ -52,8 +52,8 @@ sys.meta_path.insert(0, _BlockGenesis())
 _IMPORT_ONLY_SCRIPT = (
     _BLOCK_GENESIS_PREAMBLE
     + """
-import franka_sim.mobile_duo_mujoco_sim as mujoco_mod
-import franka_sim.mobile_duo_runner as runner_mod
+import franka_sim.mobile.duo_mujoco_sim as mujoco_mod
+import franka_sim.mobile.runner as runner_mod
 import franka_sim.run_server as run_server_mod
 
 assert "genesis" not in sys.modules
@@ -94,7 +94,7 @@ import os
 
 import mujoco
 
-from franka_sim.mobile_duo_mujoco_sim import MobileDuoMujocoScene
+from franka_sim.mobile.duo_mujoco_sim import MobileDuoMujocoScene
 
 scene = MobileDuoMujocoScene(
     os.environ["MOBILE_DUO_TEST_SCENE_URDF"],

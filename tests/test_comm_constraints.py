@@ -605,16 +605,16 @@ def test_the_cli_flags_are_tri_state_and_can_force_enforcement_off():
     assert motion_limits_setting(parser.parse_args(["--no-enforce-motion-limits"])) is False
 
 
-def test_an_explicit_off_beats_the_environment(monkeypatch, mock_genesis_sim):
+def test_an_explicit_off_beats_the_environment(monkeypatch, mock_physics_sim):
     from franka_sim.franka_sim_server import FrankaSimServer
 
     monkeypatch.setenv("FRANKA_SIM_ENFORCE_COMM_CONSTRAINTS", "1")
 
     assert FrankaSimServer(
-        genesis_sim=mock_genesis_sim, enable_gripper=False
+        physics_sim=mock_physics_sim, enable_gripper=False
     ).enforce_comm_constraints is True
     assert FrankaSimServer(
-        genesis_sim=mock_genesis_sim, enable_gripper=False, enforce_comm_constraints=False
+        physics_sim=mock_physics_sim, enable_gripper=False, enforce_comm_constraints=False
     ).enforce_comm_constraints is False
 
 
@@ -867,7 +867,7 @@ def wait_for_server(port, timeout=5.0):
 
 
 @pytest.fixture
-def serve(mock_genesis_sim):
+def serve(mock_physics_sim):
     """Start a FrankaSimServer with a mocked simulator, enforcement as asked."""
     from franka_sim.franka_sim_server import FrankaSimServer
 
@@ -875,7 +875,7 @@ def serve(mock_genesis_sim):
 
     def _serve(enforce=False, sim=None, mobile_base=False):
         server = FrankaSimServer(
-            genesis_sim=sim if sim is not None else mock_genesis_sim,
+            physics_sim=sim if sim is not None else mock_physics_sim,
             enable_gripper=False,
             mobile_base=mobile_base,
             enforce_comm_constraints=enforce,
@@ -989,15 +989,15 @@ def test_a_lost_torque_cycle_reuses_the_last_torque(serve, client):
     # the receive path before the count is taken -- otherwise this asserts
     # against a datagram still in flight rather than against the gap.
     wire.drop(2)
-    commands_before = server.genesis_sim.update_torques.call_count
+    commands_before = server.physics_sim.update_torques.call_count
 
     state = wire.drop(3 * MAX_CONSECUTIVE_LOST_CYCLES)
 
     assert np.array(state[TAU_J_D_SLICE]) == pytest.approx(TORQUES, abs=1e-5)
-    assert np.array(server.genesis_sim.update_torques.call_args.args[0]) == pytest.approx(TORQUES)
+    assert np.array(server.physics_sim.update_torques.call_args.args[0]) == pytest.approx(TORQUES)
     # The idle hold writes zero torque once when the enforced abort fires; this
     # server is unenforced, so nothing at all should have been written.
-    assert server.genesis_sim.update_torques.call_count == commands_before
+    assert server.physics_sim.update_torques.call_count == commands_before
 
 
 def test_a_missed_cycle_extrapolates_the_commanded_position(serve, client):
@@ -1047,7 +1047,7 @@ def test_a_missed_cycle_extrapolates_the_commanded_position(serve, client):
     # ...and the arm was driven through the gap, not left behind at the last
     # real waypoint. Physics receives the extrapolated targets, exactly as it
     # receives the commanded ones.
-    applied = np.asarray(server.genesis_sim.update_joint_positions.call_args.args[0])
+    applied = np.asarray(server.physics_sim.update_joint_positions.call_args.args[0])
     assert applied == pytest.approx([published[-1]] * 7, abs=1e-9)
 
 
@@ -1082,7 +1082,7 @@ def test_the_extrapolation_stops_at_the_bound_and_the_violation_latches(serve, c
     published = np.array(state[Q_D_SLICE]).mean()
     assert published <= 20 * step + MAX_CONSECUTIVE_LOST_CYCLES * step + 1e-9
     assert server.control_mode is ControlMode.POSITION
-    assert server.genesis_sim.update_torques.call_args.args[0] == [0.0] * 7
+    assert server.physics_sim.update_torques.call_args.args[0] == [0.0] * 7
 
     # ...and it stays put: nothing publishes another waypoint after the abort.
     settled = [np.array(wire.drop(1)[Q_D_SLICE]).mean() for _ in range(10)]
@@ -1193,7 +1193,7 @@ def test_the_violation_aborts_the_motion_with_a_reflex(serve, client):
     assert server.robot_state.state["controller_mode"] == LibfrankaControllerMode.kOther
     # ...and the arm is back under the internal controller's hold.
     assert server.control_mode is ControlMode.POSITION
-    assert server.genesis_sim.update_torques.call_args.args[0] == [0.0] * 7
+    assert server.physics_sim.update_torques.call_args.args[0] == [0.0] * 7
 
 
 def test_the_success_rate_reads_zero_once_the_motion_is_aborted(serve, client):
@@ -1461,7 +1461,7 @@ def test_a_leftover_finish_from_a_normal_completion_cannot_disarm_the_next_motio
     assert server.comm.active is True, "the leftover finish switched the accounting off"
     assert state[SUCCESS_RATE_INDEX] > 0.5
     assert state[ROBOT_MODE_INDEX] == RobotMode.kMove
-    assert np.array(server.genesis_sim.update_torques.call_args.args[0]) == pytest.approx(TORQUES)
+    assert np.array(server.physics_sim.update_torques.call_args.args[0]) == pytest.approx(TORQUES)
 
 
 def test_a_motion_that_finishes_without_streaming_is_still_answered(serve, client):
@@ -1591,7 +1591,7 @@ def live_server():
         sim = MujocoFrankaSim()
         sim.initialize_simulation()
         server = FrankaSimServer(
-            genesis_sim=sim, enable_gripper=False, enforce_comm_constraints=enforce
+            physics_sim=sim, enable_gripper=False, enforce_comm_constraints=enforce
         )
         accept_thread = threading.Thread(target=server.run_server, daemon=True)
         accept_thread.start()

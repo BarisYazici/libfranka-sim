@@ -3,7 +3,7 @@ import struct
 
 import pytest
 
-from franka_sim.gripper_protocol import (
+from franka_sim.gripper.protocol import (
     GRIPPER_COMMAND_PORT,
     GRIPPER_HEADER_SIZE,
     GRIPPER_VERSION,

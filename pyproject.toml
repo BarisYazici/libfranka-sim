@@ -82,6 +82,7 @@ docs = [
 packages = [
     "franka_sim",
     "franka_sim.assets",
+    "franka_sim.gripper",
     "franka_sim.limits",
     "franka_sim.mobile",
     "franka_sim.server",

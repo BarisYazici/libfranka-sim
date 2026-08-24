@@ -7,8 +7,8 @@ through :class:`SceneView`, like the runner) can import this module without
 paying Genesis' multi-second native import cost -- or requiring it installed
 at all.
 
-``mobile_duo_sim`` re-exports the names it used to define, so every existing
-``from franka_sim.mobile.duo_sim import X`` keeps working.
+:mod:`franka_sim.mobile.duo_sim` re-exports the names it used to define, so
+every existing ``from franka_sim.mobile.duo_sim import X`` keeps working.
 """
 
 import logging
@@ -19,11 +19,7 @@ import numpy as np
 
 from franka_sim.control_modes import ControlMode
 
-#: Pinned to this module's pre-split path: the name is asserted on by
-#: ``caplog.at_level(..., logger=...)`` in the tests, and callers'
-#: logging configuration keys off it too. Moving the file must not
-#: silently rename the logger.
-logger = logging.getLogger("franka_sim.mobile_duo_common")
+logger = logging.getLogger(__name__)
 
 ROLE_LEFT = "left"
 ROLE_RIGHT = "right"
@@ -58,7 +54,7 @@ SPINE_LIMITS_M = (0.0, 0.85)
 class SceneView:
     """One role's view of a shared mobile-duo scene, shaped like a simulator.
 
-    Implements the interface ``FrankaSimServer`` calls on ``genesis_sim``.
+    Implements the interface ``FrankaSimServer`` calls on ``physics_sim``.
     ``initialize_simulation``/``start``/``stop`` are no-ops because the runner
     owns the shared scene's lifecycle. Engine-agnostic: it only calls methods
     on ``scene`` (either :class:`~franka_sim.mobile.duo_sim.MobileDuoScene` or

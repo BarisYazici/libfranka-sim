@@ -190,8 +190,7 @@ def pose(x=0.0, y=0.0, z=0.0, rotation=None):
 
     The layout matters and is easy to get backwards: ``O_T_EE``/``O_T_EE_c`` are
     column-major, which is why the translation lands at indices 12, 13, 14 --
-    and why Franka's own smoke tests perturb ``cmd.at(14)`` when they mean "move
-    in z" (``smoke_errors.cpp:100``).
+    and why a client perturbs ``cmd.at(14)`` when it means "move in z".
     """
     matrix = np.eye(4)
     if rotation is not None:
@@ -233,8 +232,8 @@ HOME_ELBOW = [HOME[2], -1.0]
 #:     gain = dt / (dt + 1 / (2 * pi * cutoff))
 #:     y = gain * sample + (1 - gain) * y_last
 #:
-#: 0.001 / (0.001 + 0.00159155) = 0.385871. This is why the smoke suite's step
-#: tests do not reach the simulator as steps: the FCI never sees the raw
+#: 0.001 / (0.001 + 0.00159155) = 0.385871. This is why a commanded step does
+#: not reach the simulator as a step: the FCI never sees the raw
 #: ``q_d + 1.0``, it sees a first-order approach to it, whose *first* cycle is
 #: still 0.3859 rad -- 386 rad/s of implied velocity.
 LOWPASS_GAIN = DELTA_T / (DELTA_T + 1.0 / (2.0 * 3.141592653589793 * 100.0))
@@ -244,7 +243,7 @@ def lowpass_step(start, target, cycles):
     """The sequence libfranka actually sends for a step from ``start`` to ``target``.
 
     Scalar in, list of ``cycles`` scalars out. Used to feed the checker the same
-    shape Franka's hardware smoke tests feed a real robot, rather than an
+    shape a real client feeds a real robot, rather than an
     idealised one-cycle jump the client could never emit.
     """
     sequence = []
@@ -640,18 +639,17 @@ def test_a_twist_jerk_step_is_a_cartesian_acceleration_discontinuity():
     assert violation.error_index == CARTESIAN_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX
 
 
-# -- the interface-relative naming rule, against the hardware smoke suite --
+# -- the interface-relative naming rule, against observed hardware behaviour --
 #
-# Franka's arm_smoke_tests are recorded against real robots, so what they assert
-# is what hardware does. Each test below replays one of them: the *commanded*
-# sequence a real client would emit (libfranka low-passes every command at
-# 100 Hz, so a "step" reaches the FCI as a first-order approach, not a jump) and
-# the one error name hardware answers with, even though the step breaks every
-# limit its interface has.
+# Each test below replays one scenario a real FR3 was observed to answer: the
+# *commanded* sequence a real client would emit (libfranka low-passes every
+# command at 100 Hz, so a "step" reaches the FCI as a first-order approach, not
+# a jump) and the one error name hardware answers with, even though the step
+# breaks every limit its interface has.
 
 
 def test_a_position_step_is_a_velocity_discontinuity_not_an_envelope_violation():
-    """``moveJointMotionGeneratorVelocityDiscontinuity``: q_d + 1.0 rad -> index 14.
+    """A mid-motion ``q_c`` step of +1.0 rad -> index 14.
 
     The step breaks the velocity envelope (13), the acceleration limit (14) and
     the jerk limit (15) on its very first smoothed cycle. Hardware names the
@@ -679,7 +677,7 @@ def test_a_position_step_is_a_velocity_discontinuity_not_an_envelope_violation()
 
 
 def test_a_velocity_step_is_named_for_the_acceleration_not_the_envelope():
-    """``moveJointMotionGeneratorAccelerationDiscontinuity``: dq_d + 50 -> index 15.
+    """A mid-motion ``dq_c`` step of +50 rad/s -> index 15.
 
     Same shape, one interface up, and hardware answers with a *different* name:
     on ``dq_c`` the first difference is already an acceleration, so it is 15 --
@@ -701,7 +699,7 @@ def test_a_velocity_step_is_named_for_the_acceleration_not_the_envelope():
 
 
 def test_a_twist_step_is_a_cartesian_acceleration_discontinuity():
-    """``moveCartesianMotionGeneratorAccelerationDiscontinuity``: a 10 m/s step -> 20.
+    """A mid-motion ``O_dP_EE_c`` step of 10 m/s -> index 20.
 
     The joint-velocity mapping mirrored onto the base's twist. Index 19 is the
     same limit on a commanded *pose*, and the pair is what pins the whole
@@ -732,8 +730,8 @@ def test_an_arm_role_twist_is_checked_exactly_like_the_base_one():
 
     The generator is the same generator; only the role differs. Before the
     gating was extended, an arm-role Cartesian-velocity Move was checked on
-    nothing at all -- the mode did not reach the checker, so the smoke suite's
-    twist step produced no error and the test hung waiting for one.
+    nothing at all -- the mode did not reach the checker, so a twist step
+    produced no error and a client provoking one hung waiting for it.
     """
     checker = MotionLimitChecker()
     checker.start_motion(ControlMode.CARTESIAN_VELOCITY, robot_state_at())
@@ -749,9 +747,9 @@ def test_an_arm_role_twist_is_checked_exactly_like_the_base_one():
 # -- cartesian pose generator (kCartesianPosition: checked, never applied) --
 #
 # Every test below drives a generator whose commands reach no physics at all.
-# That is the deliberate shape of the feature: Franka's smoke suite for
-# Cartesian errors needs the *abort*, not the motion, and an interface that
-# silently swallowed its stream left those tests waiting forever.
+# That is the deliberate shape of the feature: a client provoking a Cartesian
+# error needs the *abort*, not the motion, and an interface that
+# silently swallowed its stream left such a client waiting forever.
 
 
 def pose_checker(q=None, o_t_ee=None, **state_fields):
@@ -765,10 +763,10 @@ def pose_checker(q=None, o_t_ee=None, **state_fields):
 
 
 def test_a_pose_step_is_a_cartesian_velocity_discontinuity():
-    """``moveCartesianMotionGeneratorVelocityDiscontinuity``: a 1 m z step -> 19.
+    """A mid-motion ``O_T_EE_c`` step of 1 m in z -> index 19.
 
-    The interface-relative rule's Cartesian half, and the exact case Franka's
-    hardware suite pins (``smoke_errors.cpp:88`` / ``smoke_test_errors.cpp:48``).
+    The interface-relative rule's Cartesian half, and the exact case hardware
+    pins.
     The client asks for ``O_T_EE_d`` with ``+1.0`` on z; libfranka's own 100 Hz
     command filter is what the FCI actually receives, so the first cycle is
     0.3859 m -- 386 m/s and 385 871 m/s^2. That breaks the envelope, the
@@ -838,12 +836,12 @@ def test_a_smooth_conforming_pose_stream_produces_no_error():
 
 
 def test_a_ten_metre_first_pose_is_a_start_pose_error_not_a_discontinuity():
-    """``moveCartesianPositionMotionGeneratorStartPoseInvalid``: +10 m from cycle 0.
+    """A first ``O_T_EE_c`` +10 m away is a start-pose error, from cycle 0.
 
-    ``smoke_errors.cpp:242`` offsets z by 10 m and holds it there for the whole
-    motion; hardware answers
-    ``cartesian_position_motion_generator_start_pose_invalid``
-    (``smoke_test_errors.cpp:204``). The same precedence as the joint start-pose
+    Offsetting z by 10 m and holding it there for the whole
+    motion makes hardware answer
+    ``cartesian_position_motion_generator_start_pose_invalid``. The same
+    precedence as the joint start-pose
     check: a first command in the wrong place is a start-pose error, and the
     discontinuity it would also imply never gets computed.
     """
@@ -893,7 +891,7 @@ def test_a_state_without_a_measured_pose_skips_the_start_pose_check():
 @pytest.mark.parametrize(
     "matrix, why",
     [
-        ([0.0] * 16, "all zeros: the smoke suite's own invalid frame"),
+        ([0.0] * 16, "all zeros: the canonical invalid frame"),
         (pose()[:15] + [2.0], "bottom-right is not 1"),
         ([2.0] + pose()[1:], "first column is not a unit vector"),
         (pose(rotation=np.full((3, 3), 0.5)), "rotation block is not orthonormal"),
@@ -964,7 +962,7 @@ def drive_elbow_history(checker, angle, velocity, acceleration):
 
 
 def test_a_start_elbow_away_from_the_robots_own_is_start_elbow_invalid():
-    """``moveCartesianMotionGeneratorStartElbowInvalid``: elbow[0] += 0.5 -> 22."""
+    """A first ``elbow_c[0]`` 0.5 rad away from the robot's own -> 22."""
     checker = pose_checker()
 
     violation = checker.check(
@@ -975,8 +973,8 @@ def test_a_start_elbow_away_from_the_robots_own_is_start_elbow_invalid():
     assert violation.error_index == CARTESIAN_MOTION_GENERATOR_START_ELBOW_INVALID_INDEX
     assert violation.error_name == "cartesian_motion_generator_start_elbow_invalid"
 
-    # Just inside the tolerance is not an error; the smoke suite's 0.5 rad is
-    # five times it.
+    # Just inside the tolerance is not an error; the 0.5 rad hardware is
+    # provoked with is five times it.
     inside = pose_checker()
     nudged = HOME_ELBOW[0] + START_ELBOW_TOLERANCE / 2
     assert inside.check(elbow_command(1, nudged), HOME) is None
@@ -985,9 +983,9 @@ def test_a_start_elbow_away_from_the_robots_own_is_start_elbow_invalid():
 def test_a_start_elbow_sign_that_disagrees_with_joint_4_is_also_22():
     """The robot's elbow is ``(q[2], sign(q[3]))``, and both halves are checked.
 
-    Nothing in Franka's suite pins the *name* for a start-time sign mismatch --
+    No hardware observation pins the *name* for a start-time sign mismatch --
     see ``START_ELBOW_SIGN_INCONSISTENT_INDEX`` (24), which by its name would fit
-    better and which no test exercises. This pins the sim's choice so that
+    better and which nothing exercises. This pins the sim's choice so that
     changing it is deliberate.
     """
     checker = pose_checker()
@@ -1013,7 +1011,7 @@ def test_the_robots_own_elbow_opens_a_motion_cleanly():
 
 
 def test_an_elbow_sign_flip_mid_motion_is_elbow_sign_inconsistent():
-    """``moveCartesianMotionGeneratorElbowSignInconsistent``: negate elbow[1] -> 21."""
+    """Negating ``elbow_c[1]`` mid-motion -> 21."""
     checker = pose_checker()
     opening = command(O_T_EE_c=pose(), elbow_c=list(HOME_ELBOW), valid_elbow=True)
     assert checker.check(opening, HOME) is None
@@ -1034,25 +1032,24 @@ def test_an_elbow_sign_flip_mid_motion_is_elbow_sign_inconsistent():
 
 
 def test_an_elbow_ramp_past_its_velocity_limit_is_an_elbow_limit_violation():
-    """``moveCartesianMotionGeneratorElbowLimitViolation``: ddelbow = 0.3 -> 17.
+    """A constant elbow acceleration of 0.3 rad/s^2 -> 17.
 
-    ``smoke_errors.cpp:509`` holds the pose and integrates a constant
-    ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 into the elbow, so elbow velocity
-    grows linearly and crosses ``kMaxElbowVelocity`` (1.499 rad/s) after ~5 s
-    while acceleration stays at 0.3 -- two orders of magnitude inside
+    Holding the pose and integrating a constant
+    ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 into the elbow makes elbow
+    velocity grow linearly and cross ``kMaxElbowVelocity`` (1.499 rad/s) after
+    ~5 s while acceleration stays at 0.3 -- two orders of magnitude inside
     ``kMaxElbowAcceleration``. Hardware answers
-    ``cartesian_motion_generator_elbow_limit_violation``
-    (``smoke_test_errors.cpp:268``).
+    ``cartesian_motion_generator_elbow_limit_violation``.
 
     Five seconds is 5000 cycles, so the history is solved backwards to a point
     late on that same ramp rather than integrated from the start: the
-    acceleration is the smoke test's own 0.3 rad/s^2 and the velocity is set
+    acceleration is that same 0.3 rad/s^2 and the velocity is set
     1.5 cycles' worth below the cap, which puts the next cycle just inside it and
     the one after just outside. Both are asserted, so this pins the *boundary*
     and not merely that a large enough ramp eventually trips.
     """
     checker = pose_checker()
-    acceleration = 0.3  # the smoke test's ddelbow, exactly
+    acceleration = 0.3  # the ddelbow hardware is provoked with, exactly
     assert acceleration < MAX_ELBOW_ACCELERATION
 
     velocity = MAX_ELBOW_VELOCITY - 1.5 * acceleration * DELTA_T
@@ -1130,10 +1127,11 @@ def test_a_steering_drive_command_with_valid_elbow_latches_nothing():
 def test_a_torque_that_breaks_both_range_and_rate_reports_the_range():
     """Range before rate -- and this is the one ordering hardware does not pin.
 
-    ``moveControllerTorqueDiscontinuity`` steps joint 1 to 10 Nm: a rate
-    violation (10 000 Nm/s) comfortably inside the joint's 87 Nm range, so the
-    suite exercises the rate check alone and never sees a command that breaks
-    both. Nothing else in the suite does either. This pins what the sim does so
+    The observable hardware case steps joint 1 to 10 Nm: a rate
+    violation (10 000 Nm/s) comfortably inside the joint's 87 Nm range, so it
+    exercises the rate check alone and never covers a command that breaks
+    both. No other hardware observation settles it either. This pins what the
+    sim does so
     that changing it is a decision rather than an accident; see the comment on
     ``MotionLimitChecker._check_torque`` for why it could go either way.
     """
@@ -1231,19 +1229,18 @@ def test_a_smooth_motion_never_trips_the_safety_controller():
 
 
 def test_a_velocity_ramp_the_arm_follows_is_the_safety_controllers_error():
-    """``moveJointMotionGeneratorVelocityLimitsViolation`` -> both 13 and 3.
+    """A commanded velocity ramp past the envelope -> both 13 and 3.
 
     A 5 rad/s^2 ramp on joint 6 with no cap: no discontinuity anywhere, the
     commanded velocity simply walks out of the envelope and the arm walks out
     with it.
 
-    The suite itself expects ``joint_velocity_violation`` in the exception
-    message, but it does not *state* that both bits are latched: what it carries
-    is a dev comment, under a ``TODO(qu_zh): Verify the change``, reading "Both
-    error can appear. However with the current RCU joint_velocity_violation
-    appear much early as we shape the limit" (``smoke_test_errors.cpp:110-127``).
-    That is a developer's account of the hardware's behaviour, not a verified
-    pin -- the note says so. This sim takes it at its word and latches both bits
+    Hardware reports ``joint_velocity_violation`` in the exception
+    message for this scenario. Whether *both* bits are latched is a reported
+    behaviour rather than one measured here: hardware raises both errors, with
+    ``joint_velocity_violation`` appearing much earlier because the controller
+    shapes the envelope down towards the current velocity. Treat it as strong
+    but not independently verified. This sim latches both bits
     from the commanded envelope check (13) deterministically rather than picking
     one; see :attr:`franka_sim.motion_limits.Violation.extra_error_index`.
 
@@ -1293,7 +1290,7 @@ def test_a_velocity_ramp_the_arm_follows_is_the_safety_controllers_error():
 
 #: Effective inertia (kg m^2) the fake joint 6 below swings under the applied
 #: torque. Only the causality matters, not the number: it is picked so the arm
-#: is still inside the envelope when the ramp reaches the suite's full 3 Nm,
+#: is still inside the envelope when the ramp reaches the full 3 Nm,
 #: which is what makes "3 Nm folds the arm" the thing actually being measured.
 FAKE_JOINT_INERTIA = 0.5
 
@@ -1310,7 +1307,7 @@ def _torque_ramp_until_the_arm_folds(ramp_rate, cycles=1400):
 
     measured, tau = 0.0, 0.0
     for cycle in range(1, cycles):
-        tau = min(3.0, ramp_rate * cycle * DELTA_T)  # the suite's 5 Nm/s ramp, capped at 3 Nm
+        tau = min(3.0, ramp_rate * cycle * DELTA_T)  # a 5 Nm/s ramp, capped at 3 Nm
         outgoing = command(message_id=cycle, tau_J_d=spread(tau, index=5))
         assert checker.check(outgoing) is None, "the commanded torque itself is legal"
         checker.record(outgoing)
@@ -1322,7 +1319,7 @@ def _torque_ramp_until_the_arm_folds(ramp_rate, cycles=1400):
 
 
 def test_a_torque_ramp_that_folds_the_arm_is_the_safety_controllers_error():
-    """``moveJointVelocityViolation``: 3 Nm into joint 6, in *pure torque control*.
+    """3 Nm ramped into joint 6, in *pure torque control*.
 
     There is no commanded velocity anywhere in this session, so no commanded
     check could ever produce this error. Every torque sent is legal -- inside
@@ -1344,8 +1341,8 @@ def test_a_torque_ramp_that_folds_the_arm_is_the_safety_controllers_error():
     assert latched.error_index == JOINT_VELOCITY_VIOLATION_INDEX
     assert latched.value > cap
     assert tau_at_fold == pytest.approx(3.0), (
-        f"the arm folded at {tau_at_fold:.2f} Nm, before the ramp reached the "
-        "suite's 3 Nm -- the narrative and the numbers disagree"
+        f"the arm folded at {tau_at_fold:.2f} Nm, before the ramp reached its "
+        "3 Nm cap -- the narrative and the numbers disagree"
     )
 
     quiet, _ = _torque_ramp_until_the_arm_folds(0.0)
@@ -1361,14 +1358,13 @@ def test_a_commanded_envelope_violation_during_a_motion_latches_both_bits():
     re-ask came back clean. But measured ``dq`` lags commanded ``dq`` by a
     cycle or few, so the re-ask read "clean" on exactly the cycle hardware
     would call ``joint_velocity_violation`` -- nondeterministic in exactly the
-    way ``JointMotionGeneratorVelocityLimitsViolationHardware`` (the hardware
-    smoke suite) caught it. The suite's own dev comment, filed under a
-    ``TODO(qu_zh): Verify the change``, describes the outcome as expected
-    rather than exceptional: "Both error[s] can appear. However with the
-    current RCU joint_velocity_violation appear[s] much earl[ier] as we shape
-    the limit" (``smoke_test_errors.cpp:110-127``, on both the position- and
-    velocity-limits-violation-hardware tests). That is the comment's claim, not
-    a verified hardware pin -- the TODO says as much. Taking it at its word,
+    way a `dq_c` ramp past the envelope exposes it. On hardware the paired
+    outcome is the expected one rather than exceptional: both errors can
+    appear, and ``joint_velocity_violation`` appears much earlier because the
+    controller shapes the envelope down towards the current velocity. This
+    holds for both the position-limits and the velocity-limits provocation.
+    That is a reported behaviour rather than one measured here, so treat it as
+    strong but not independently verified. Taking it at its word,
     this now latches both unconditionally, whatever the measured safety check
     has or has not observed yet -- see :meth:`MotionLimitChecker.check`'s
     precedence block.
@@ -1453,7 +1449,7 @@ def test_the_first_waypoint_must_be_where_the_robot_already_is():
 
 
 def test_a_step_on_the_very_first_cycle_is_a_start_pose_error_not_a_discontinuity():
-    """``moveJointPositionMotionGeneratorStartPoseInvalid``: q_d + 0.2 on cycle 0.
+    """A first ``q_c`` of ``q_d + 0.2`` rad on cycle 0 is a start-pose error.
 
     Start-pose beats every discontinuity, whatever the magnitude: the client has
     not commanded a *trajectory* yet, it has commanded a place to begin, and
@@ -1745,7 +1741,7 @@ def test_a_late_command_is_judged_over_the_cycles_it_really_travelled():
 
 
 def test_the_drain_gate_waits_for_a_command_the_receive_path_has_not_read(
-    mock_genesis_sim,
+    mock_physics_sim,
 ):
     """A state must not go out while the client's last answer is still queued.
 
@@ -1759,7 +1755,7 @@ def test_the_drain_gate_waits_for_a_command_the_receive_path_has_not_read(
     """
     from franka_sim.franka_sim_server import FrankaSimServer
 
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     server.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.udp_socket.bind(("127.0.0.1", 0))
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1787,7 +1783,7 @@ def test_the_drain_gate_waits_for_a_command_the_receive_path_has_not_read(
 
 
 def test_the_drain_gate_waits_for_a_command_read_but_not_yet_applied(
-    mock_genesis_sim,
+    mock_physics_sim,
 ):
     """An empty socket is not the same as an applied command.
 
@@ -1805,13 +1801,13 @@ def test_the_drain_gate_waits_for_a_command_read_but_not_yet_applied(
     either. The reference simply freezes for one cycle; libfranka's 100 Hz
     command filter blends its next command toward the frozen value and emits a
     ``(1 - gain)`` x one-cycle step; and this server aborts the motion on the
-    discontinuity it manufactured. Measured against the smoke suite's elbow
+    discontinuity it manufactured. Measured against a Cartesian elbow
     motion, a 179 urad/cycle elbow ramp came back 110 urad short on exactly
     that cycle -- 110 rad/s^2 against a 10 rad/s^2 limit.
     """
     from franka_sim.franka_sim_server import FrankaSimServer
 
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     server.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.udp_socket.bind(("127.0.0.1", 0))
     try:
@@ -2392,9 +2388,9 @@ def test_a_datagram_that_turns_up_late_replaces_the_guess_it_stood_in_for():
     for cycle N already took one cycle's worth of motion, and the datagram that
     turns up for cycle N carries the *same* step, measured rather than guessed.
     Differencing the two against each other reports a reference that travelled
-    nowhere followed by an enormous deceleration -- and against Franka's own
-    smoke suite it did exactly that, aborting a conforming client's approach at
-    a ``control_command_success_rate`` of 0.99.
+    nowhere followed by an enormous deceleration -- and against a stock
+    libfranka client it did exactly that, aborting a conforming client's
+    approach at a ``control_command_success_rate`` of 0.99.
 
     So the guess is thrown away when the real answer arrives.
     """
@@ -3580,7 +3576,7 @@ def test_a_late_datagram_enforcement_refuses_leaves_the_extrapolation_standing()
     assert checker.rewind_extrapolation(command(message_id=last_id + 2)) is True
 
 
-def test_an_extrapolated_command_is_not_dispatched_under_a_newer_motion(mock_genesis_sim):
+def test_an_extrapolated_command_is_not_dispatched_under_a_newer_motion(mock_physics_sim):
     """A ``Move`` accepted mid-gap must not have the old motion's fields applied.
 
     ``_dispatch_control_command`` branches on ``motion_generator_mode`` and
@@ -3597,7 +3593,7 @@ def test_an_extrapolated_command_is_not_dispatched_under_a_newer_motion(mock_gen
     )
     from franka_sim.franka_sim_server import FrankaSimServer
 
-    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
     server.robot_state.set_controller_mode(LibfrankaControllerMode.kJointImpedance)
     server.robot_state.set_motion_generator_mode(LibfrankaMotionGeneratorMode.kJointPosition)
     server._motion_generation = 7
@@ -3624,7 +3620,7 @@ def test_an_extrapolated_command_is_not_dispatched_under_a_newer_motion(mock_gen
 def mock_arm_sim():
     """A mocked arm reporting a *valid* FR3 configuration.
 
-    The shared ``mock_genesis_sim`` reports ``q = 0``, which is not reachable on
+    The shared ``mock_physics_sim`` reports ``q = 0``, which is not reachable on
     an FR3 at all -- joint 4 lives in [-3.0481, -0.1458] and joint 6 in
     [0.5409, 4.5205] -- so an all-zeros command would trip the position-limit
     check before anything this file is about.
@@ -3658,7 +3654,7 @@ def serve(mock_arm_sim):
 
     def _serve(enforce=False, sim=None, mobile_base=False):
         server = FrankaSimServer(
-            genesis_sim=sim if sim is not None else mock_arm_sim,
+            physics_sim=sim if sim is not None else mock_arm_sim,
             enable_gripper=False,
             mobile_base=mobile_base,
             enforce_motion_limits=enforce,
@@ -3844,7 +3840,7 @@ def test_enforced_the_violating_command_never_reaches_the_simulator(serve, clien
         wire.answer(q_c=[HOME[0] + 0.5] + HOME[1:])
     wire.read_move_response()
 
-    commanded = [call.args[0] for call in server.genesis_sim.update_joint_positions.call_args_list]
+    commanded = [call.args[0] for call in server.physics_sim.update_joint_positions.call_args_list]
     assert commanded, "the simulator was never commanded at all"
     for target in commanded:
         # Everything the sim ever saw is the hold's own HOME target; the 0.5 rad
@@ -3973,26 +3969,26 @@ def test_a_cartesian_pose_motion_latches_no_joint_error(serve, client):
     # what must *not* happen is the joint branches claiming the datagram and
     # servoing to its zero-filled q_c.
     assert server.control_mode is ControlMode.CARTESIAN_POSE
-    assert server.genesis_sim.update_cartesian_pose.call_count > 0
+    assert server.physics_sim.update_cartesian_pose.call_count > 0
     # ...and the joint branch never saw a Cartesian datagram: its zero-filled
     # q_c would show up here as an all-zeros joint target, which is both the
     # original bug and a pose no FR3 can hold.
     assert not any(
         np.allclose(np.asarray(call.args[0], dtype=float), 0.0)
-        for call in server.genesis_sim.update_joint_positions.call_args_list
+        for call in server.physics_sim.update_joint_positions.call_args_list
     )
-    assert server.genesis_sim.update_base_twist.call_count == 0
+    assert server.physics_sim.update_base_twist.call_count == 0
 
 
 def test_enforced_a_cartesian_pose_step_aborts_over_the_wire(serve, client):
-    """The smoke suite's own Cartesian velocity discontinuity, over the wire.
+    """A Cartesian velocity discontinuity, over the wire.
 
-    ``moveCartesianMotionGeneratorVelocityDiscontinuity`` (``smoke_errors.cpp:88``)
-    holds ``O_T_EE_d`` and adds 1.0 m to z at t > 0.5 s. libfranka's 100 Hz
+    The provocation holds ``O_T_EE_d`` and adds 1.0 m to z at t > 0.5 s.
+    libfranka's 100 Hz
     command filter turns that into a 0.3859 m first cycle, which is what
     actually reaches the FCI -- and hardware answers
-    ``cartesian_motion_generator_velocity_discontinuity``
-    (``smoke_test_errors.cpp:48``). Without this abort the smoke test never
+    ``cartesian_motion_generator_velocity_discontinuity``. Without this abort a
+    client provoking it never
     terminates against the sim, which is the whole reason the pose interface is
     checked at all.
     """
@@ -4014,7 +4010,7 @@ def test_enforced_a_cartesian_pose_step_aborts_over_the_wire(serve, client):
 
 
 def test_enforced_a_ten_metre_first_pose_aborts_over_the_wire(serve, client):
-    """``moveCartesianPositionMotionGeneratorStartPoseInvalid``, over the wire.
+    """A first ``O_T_EE_c`` +10 m away aborts, over the wire.
 
     This is the one case that exercises the *seed* plumbing rather than the
     per-command plumbing: the checker has to have been handed the robot's own
@@ -4042,11 +4038,11 @@ def test_enforced_a_ten_metre_first_pose_aborts_over_the_wire(serve, client):
 def test_a_garbage_pose_matrix_is_refused_with_enforcement_off(serve, client, caplog):
     """``checkMatrix``'s test, server-side, and refused like a NaN.
 
-    ``moveCartesianPositionMotionGeneratorInvalidFrame`` (``smoke_errors.cpp:274``)
-    zero-fills ``O_T_EE`` mid-motion. On hardware libfranka refuses to *send* it
+    The provocation zero-fills ``O_T_EE`` mid-motion. On hardware libfranka
+    refuses to *send* it
     -- ``checkMatrix`` throws ``std::invalid_argument`` client-side, which is why
-    the smoke expectation is ``std::invalid_argument`` rather than a
-    ``ControlException`` (``smoke_test_errors.cpp:221``). A simulator cannot rely
+    a stock client sees ``std::invalid_argument`` rather than a
+    ``ControlException``. A simulator cannot rely
     on the client being libfranka, so the test is done here too, and like every
     other structurally-invalid command it is refused whether or not enforcement
     is on: an all-zeros matrix has no derivatives worth recording.
@@ -4071,10 +4067,9 @@ def test_a_garbage_pose_matrix_is_refused_with_enforcement_off(serve, client, ca
 def test_enforced_an_arm_role_cartesian_twist_step_aborts_over_the_wire(serve, client):
     """The twist checks reach an *arm* role, not only the mobile base.
 
-    ``moveCartesianMotionGeneratorAccelerationDiscontinuity`` (``smoke_errors.cpp:124``)
-    steps all six twist components to 10.0 at t > 0.5 s and hardware answers
-    ``cartesian_motion_generator_acceleration_discontinuity``
-    (``smoke_test_errors.cpp:64``). The base role already did this; before the
+    Stepping all six twist components to 10.0 at t > 0.5 s makes hardware answer
+    ``cartesian_motion_generator_acceleration_discontinuity``. The base role
+    already did this; before the
     gating was extended an arm-role ``kCartesianVelocity`` Move was checked on
     nothing at all.
     """
@@ -4094,12 +4089,10 @@ def test_enforced_an_arm_role_cartesian_twist_step_aborts_over_the_wire(serve, c
 
 
 def test_enforced_a_bad_start_elbow_aborts_over_the_wire(serve, client):
-    """``moveCartesianMotionGeneratorStartElbowInvalid``, over the wire.
+    """A first ``elbow_c[0]`` 0.5 rad away aborts, over the wire.
 
-    ``elbow[0] += 0.5`` from cycle 0 with the pose left alone
-    (``smoke_errors.cpp:342``); hardware answers
-    ``cartesian_motion_generator_start_elbow_invalid``
-    (``smoke_test_errors.cpp:252``).
+    ``elbow[0] += 0.5`` from cycle 0 with the pose left alone; hardware answers
+    ``cartesian_motion_generator_start_elbow_invalid``.
     """
     server = serve(enforce=True)
     wire = start_motion(
@@ -4149,7 +4142,7 @@ def test_enforced_the_safety_controller_aborts_on_measured_velocity(
 
     No commanded velocity exists anywhere here; the arm is simply reported to be
     moving faster than its position-based envelope allows, which is what the
-    hardware suite's ``moveJointVelocityViolation`` provokes with a 3 Nm ramp.
+    a 3 Nm torque ramp provokes on hardware.
     """
     server = serve(enforce=True)
     wire = start_motion(client, ControllerMode.kExternalController, MotionGeneratorMode.kNone)
@@ -4258,7 +4251,7 @@ def test_enforced_the_safety_controller_aborts_on_measured_ee_speed(
 ):
     """cartesian_velocity_violation over the wire, and nothing else with it.
 
-    Franka's ``CartesianVelocityViolationHardware`` records the whole point: with
+    Hardware records the whole point: with
     an EE 0.5 m out along the flange, the ramp crosses the *Cartesian* limit
     first and hardware reports that error **alone** -- no
     ``joint_velocity_violation`` beside it -- so the two halves of the safety
@@ -4291,9 +4284,8 @@ def test_enforced_the_ee_speed_check_outranks_the_joint_one(serve, client, mock_
 
     The precedence hardware records. Without it a motion that leaves both
     envelopes at once would report ``joint_velocity_violation``, which is what
-    the sim did before the Cartesian check existed -- and what the hardware
-    suite says is the wrong answer for
-    ``CartesianVelocityViolationHardware``.
+    the sim did before the Cartesian check existed -- and what hardware says is
+    the wrong answer once the EE is levered 0.5 m out.
     """
     server = serve(enforce=True)
     wire = start_motion(client, ControllerMode.kExternalController, MotionGeneratorMode.kNone)
@@ -4321,9 +4313,9 @@ def test_enforced_the_ee_speed_check_outranks_the_joint_one(serve, client, mock_
 def test_a_joint_only_excursion_still_reports_the_joint_error(serve, client, mock_arm_sim):
     """The other side of the precedence: a slow EE does not mask a fast joint.
 
-    The two hardware tests that must keep answering ``joint_velocity_violation``
-    (``JointVelocityViolation``,
-    ``JointMotionGeneratorVelocityLimitsViolationHardware``) both spin joint 6
+    The two hardware scenarios that must keep answering
+    ``joint_velocity_violation`` -- a 3 Nm torque ramp and a 5 rad/s^2 ``dq_c``
+    ramp -- both spin joint 6
     while the end effector barely travels; this is that shape in miniature.
     """
     serve(enforce=True)
@@ -4350,13 +4342,13 @@ def test_a_joint_only_excursion_still_reports_the_joint_error(serve, client, moc
 # -- singular start poses -----------------------------------------------------
 
 
-def test_the_singularity_threshold_separates_franka_s_own_poses():
-    """The threshold sits between the suite's singular pose and its start poses.
+def test_the_singularity_threshold_separates_singular_from_start_poses():
+    """The threshold sits between a singular configuration and ordinary start poses.
 
     The two numbers it has to keep apart, measured on the sim's own FR3 model
-    and quoted in SINGULAR_POSE_MIN_SINGULAR_VALUE: ``kSingularPose``
-    (sigma_min ~ 0.011) and the tightest pose a passing Cartesian test starts a
-    motion from (``kIkBugPose``, ~0.139).
+    and quoted in SINGULAR_POSE_MIN_SINGULAR_VALUE: a known singular FR3
+    configuration (sigma_min ~ 0.011) and the tightest pose a Cartesian motion
+    is expected to open from (~0.139).
     """
     assert 0.011 < SINGULAR_POSE_MIN_SINGULAR_VALUE < 0.139
     # ...and with a comfortable factor on both sides, not by a hair.
@@ -4401,8 +4393,8 @@ def test_a_cartesian_move_at_a_singular_pose_is_rejected(serve, client, mock_arm
     libfranka forces the shape: ``executeCommand<Move>`` handles the *first*
     response outside any try/catch, so a rejection delivered there escapes as a
     bare ``CommandException``; only the mode-wait loop that follows converts one
-    into the ``ControlException`` Franka's ``CartesianMotionInSingularPose``
-    catches. So the acknowledgement comes first and the rejection second.
+    into the ``ControlException`` a client actually catches. So the
+    acknowledgement comes first and the rejection second.
     """
     mock_arm_sim.get_robot_state.return_value = {
         "q": np.array(HOME),
@@ -4431,8 +4423,8 @@ def test_a_cartesian_move_at_a_singular_pose_is_rejected(serve, client, mock_arm
 def test_a_joint_move_at_a_singular_pose_is_accepted(serve, client, mock_arm_sim):
     """Only the Cartesian generators are refused.
 
-    Franka's own test *reaches* the singular configuration by joint motion
-    (``moveP2P`` to ``kSingularPose``), so a joint interface has to start there
+    A singular configuration is *reached* in the first place by a joint
+    point-to-point motion, so a joint interface has to start there
     -- and driving out of a singularity is the only way to leave one.
     """
     mock_arm_sim.get_robot_state.return_value = {
@@ -4586,7 +4578,7 @@ def test_a_non_finite_command_never_reaches_the_simulator(serve, client):
     poisoned = [float("nan")] + HOME[1:]
     state = wire.stream(20, q_c=poisoned)
 
-    for call in server.genesis_sim.update_joint_positions.call_args_list:
+    for call in server.physics_sim.update_joint_positions.call_args_list:
         assert np.all(np.isfinite(np.asarray(call.args[0]))), "NaN reached the simulator"
     assert np.all(np.isfinite(np.array(state[Q_D_SLICE]))), "NaN reached the wire"
     # Still permissive about everything else: nothing was latched or aborted.
@@ -4692,7 +4684,7 @@ def test_a_stale_echo_cannot_walk_a_step_past_enforcement(serve, client):
     assert wire.read_move_response() == MoveStatus.kReflexAborted
     assert any(server.robot_state.state["errors"])
     applied = [
-        call.args[0][0] for call in server.genesis_sim.update_joint_positions.call_args_list
+        call.args[0][0] for call in server.physics_sim.update_joint_positions.call_args_list
     ]
     assert max(applied) < HOME[0] + 0.1, "the 40 rad/s ramp reached physics"
 
@@ -4717,7 +4709,7 @@ def test_the_command_after_a_gap_cannot_teleport_into_physics(serve, client):
         wire.answer(q_c=teleport)
 
     assert wire.read_move_response() == MoveStatus.kReflexAborted
-    for call in server.genesis_sim.update_joint_positions.call_args_list:
+    for call in server.physics_sim.update_joint_positions.call_args_list:
         applied = np.asarray(call.args[0])
         assert abs(applied[0] - HOME[0]) < 0.05, "the teleport was applied"
 
@@ -4801,7 +4793,7 @@ def test_the_state_carrying_the_error_beats_the_tcp_response(serve, client):
     assert saw_error_state, "kReflexAborted arrived before any state carried the error"
 
 
-def test_a_deferred_abort_waits_for_a_state_packed_after_the_error(mock_genesis_sim):
+def test_a_deferred_abort_waits_for_a_state_packed_after_the_error(mock_physics_sim):
     """The wire race is microseconds wide, so drive the interleaving directly.
 
     An abort raised on the UDP thread can latch *between* the publish loop
@@ -4815,7 +4807,7 @@ def test_a_deferred_abort_waits_for_a_state_packed_after_the_error(mock_genesis_
     from franka_sim.franka_sim_server import FrankaSimServer
 
     server = FrankaSimServer(
-        genesis_sim=mock_genesis_sim, enable_gripper=False, enforce_motion_limits=True
+        physics_sim=mock_physics_sim, enable_gripper=False, enforce_motion_limits=True
     )
     sent = []
     server.client_socket = SimpleNamespace(sendall=sent.append)
@@ -4881,7 +4873,7 @@ def live_server():
         sim = MujocoFrankaSim()
         sim.initialize_simulation()
         server = FrankaSimServer(
-            genesis_sim=sim, enable_gripper=False, enforce_motion_limits=enforce
+            physics_sim=sim, enable_gripper=False, enforce_motion_limits=enforce
         )
         accept_thread = threading.Thread(target=server.run_server, daemon=True)
         accept_thread.start()

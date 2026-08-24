@@ -25,11 +25,7 @@ from franka_sim.mobile.common import ROLE_BASE, ROLES
 if TYPE_CHECKING:
     from franka_sim.mobile.duo_sim import MobileDuoScene
 
-#: Pinned to this module's pre-split path: the name is asserted on by
-#: ``caplog.at_level(..., logger=...)`` in the tests, and callers'
-#: logging configuration keys off it too. Moving the file must not
-#: silently rename the logger.
-logger = logging.getLogger("franka_sim.mobile_duo_runner")
+logger = logging.getLogger(__name__)
 
 
 def parse_bind_specs(values: Sequence[str]) -> Dict[str, str]:
@@ -86,7 +82,7 @@ class MobileDuoRunner:
             role: FrankaSimServer(
                 host=self.binds[role],
                 port=port,
-                genesis_sim=scene.view(role),
+                physics_sim=scene.view(role),
                 urdf_path=arm_urdf,
                 enable_gripper=False,
                 mobile_base=(role == ROLE_BASE),

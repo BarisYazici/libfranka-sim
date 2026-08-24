@@ -26,9 +26,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import franka_sim.mobile_duo_sim as mobile_duo_sim
+import franka_sim.mobile.duo_sim as mobile_duo_sim
 from franka_sim.franka_genesis_sim import ControlMode
-from franka_sim.mobile_duo_sim import ARM_INITIAL_Q, ROLE_LEFT, MobileDuoScene
+from franka_sim.mobile.duo_sim import ARM_INITIAL_Q, ROLE_LEFT, MobileDuoScene
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCENE_URDF = REPO_ROOT / "assets" / "mobile_duo" / "mobile_fr3_duo.urdf"
@@ -242,7 +242,7 @@ def test_the_lift_holds_its_height_against_the_arms(duo_scene, arm):
 
 def test_the_other_arm_stays_put_while_one_is_torque_driven(duo_scene, arm):
     """Freeing the arm DOFs must not make the idle arm drift."""
-    from franka_sim.mobile_duo_sim import ROLE_RIGHT
+    from franka_sim.mobile.duo_sim import ROLE_RIGHT
 
     right_dofs = duo_scene.arm_dofs_idx[ROLE_RIGHT]
     duo_scene.robot.set_dofs_position(ARM_INITIAL_Q, right_dofs)

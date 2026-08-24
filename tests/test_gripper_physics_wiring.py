@@ -1,23 +1,23 @@
 from unittest.mock import Mock
 
 from franka_sim.franka_sim_server import FrankaSimServer
-from franka_sim.gripper_backend import FrankaHandSim
-from franka_sim.gripper_physics import GenesisFrankaHand
+from franka_sim.gripper.backend import FrankaHandSim
+from franka_sim.gripper.physics import FrankaHandPhysics
 
 
 def test_physics_flag_selects_genesis_backend_bound_to_sim():
     sim = Mock()
     server = FrankaSimServer(
-        enable_vis=False, genesis_sim=sim, enable_gripper=True, gripper_physics=True
+        enable_vis=False, physics_sim=sim, enable_gripper=True, gripper_physics=True
     )
     backend = server.gripper_server.backend
-    assert isinstance(backend, GenesisFrankaHand)
+    assert isinstance(backend, FrankaHandPhysics)
     assert backend.sim is sim
 
 
 def test_default_keeps_kinematic_backend():
     sim = Mock()
-    server = FrankaSimServer(enable_vis=False, genesis_sim=sim, enable_gripper=True)
+    server = FrankaSimServer(enable_vis=False, physics_sim=sim, enable_gripper=True)
     assert isinstance(server.gripper_server.backend, FrankaHandSim)
 
 

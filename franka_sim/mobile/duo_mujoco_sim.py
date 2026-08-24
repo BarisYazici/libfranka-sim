@@ -9,9 +9,10 @@ bridges actually serve.
 
 Everything the two backends must agree on -- joint and link names, the initial
 arm pose, the actuator limits, the spine travel, the state-snapshot layout and
-the real-time-factor monitor -- is imported from ``mobile_duo_common`` (the
-engine-agnostic constants and ``SceneView``) and ``sim_common`` (the pure-numpy
-helpers) rather than restated here, so the two backends cannot drift apart.
+the real-time-factor monitor -- is imported from
+:mod:`franka_sim.mobile.common` (the engine-agnostic constants and
+``SceneView``) and ``sim_common`` (the pure-numpy helpers) rather than
+restated here, so the two backends cannot drift apart.
 Neither of those modules imports ``genesis``, and this module must not either:
 it is the ``--physics mujoco`` path, which has to work on a genesis-free
 install.

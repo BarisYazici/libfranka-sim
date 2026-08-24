@@ -209,19 +209,19 @@ def test_motion_finished_zeroes_the_base_twist(
 
 
 def test_cartesian_velocity_is_ignored_by_an_arm_server(
-    tcp_client, udp_client, sim_server, mock_genesis_sim
+    tcp_client, udp_client, sim_server, mock_physics_sim
 ):
     """A non-mobile server must drop the twist, not crash and not move the arm."""
     assert perform_handshake(tcp_client)
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
     send_robot_command(udp_client, sim_server, o_dp_ee_c=BASE_TWIST)
 
-    mock_genesis_sim.update_base_twist.assert_not_called()
+    mock_physics_sim.update_base_twist.assert_not_called()
     assert sim_server.control_mode is not ControlMode.STEERING_DRIVE
 
 
 def test_torque_dispatch_is_unchanged_on_an_arm_server(
-    tcp_client, udp_client, sim_server, mock_genesis_sim
+    tcp_client, udp_client, sim_server, mock_physics_sim
 ):
     """Regression guard: the existing external-controller path still wins."""
     assert perform_handshake(tcp_client)
@@ -233,7 +233,7 @@ def test_torque_dispatch_is_unchanged_on_an_arm_server(
     assert np.allclose(sim_server.robot_state.state["tau_J_d"], torques)
 
 
-def test_arm_server_ignores_a_cartesian_velocity_move(tcp_client, sim_server, mock_genesis_sim):
+def test_arm_server_ignores_a_cartesian_velocity_move(tcp_client, sim_server, mock_physics_sim):
     """A cartesian-velocity Move must not switch an arm server's control mode.
 
     FrankaGenesisSim's physics loop has no STEERING_DRIVE branch -- it would
@@ -243,7 +243,7 @@ def test_arm_server_ignores_a_cartesian_velocity_move(tcp_client, sim_server, mo
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
 
     assert sim_server.control_mode is not ControlMode.STEERING_DRIVE
-    for call in mock_genesis_sim.set_control_mode.call_args_list:
+    for call in mock_physics_sim.set_control_mode.call_args_list:
         assert call.args[0] is not ControlMode.STEERING_DRIVE
 
 
@@ -327,12 +327,12 @@ def test_hold_position_keeps_the_simulator_mode_in_lockstep(base_sim_server, moc
 # These four are the FCI layer's, not the physics backend's, exactly like
 # q_d/dq_d/ddq_d/tau_J_d (see COMMANDED_STATE_FIELDS). They were a permanent
 # identity / zero stub, and that was not harmless: a libfranka Cartesian-pose
-# motion generator initialises and holds from ``O_T_EE_d`` -- Franka's own smoke
-# helpers open every pose motion with ``std::array<double, 16> cmd =
+# motion generator initialises and holds from ``O_T_EE_d`` -- the conventional
+# opening is ``std::array<double, 16> cmd =
 # state.O_T_EE_d;`` -- so an identity there put the commanded stream ~10 m and a
 # full rotation away from the robot and tripped
 # ``cartesian_position_motion_generator_start_pose_invalid`` on cycle 0 of every
-# pose motion, hiding five of the suite's real Cartesian checks behind it.
+# pose motion, masking every other Cartesian error behind it.
 
 #: A measured flange pose that is nothing like identity, column-major as the
 #: wire wants it, so "tracks the measured pose" cannot pass by accident.
@@ -374,7 +374,7 @@ def _arm_server_with_pose():
         "tau_J": [0.0] * 7,
         "O_T_EE": list(MEASURED_POSE),
     }
-    return FrankaSimServer(enable_vis=False, genesis_sim=sim, enable_gripper=False), sim
+    return FrankaSimServer(enable_vis=False, physics_sim=sim, enable_gripper=False), sim
 
 
 def _publish_one_cycle(server, sim):
@@ -557,8 +557,8 @@ def test_the_base_role_publishes_no_commanded_pose_or_elbow(base_sim_server, moc
 # libfranka builds every Cartesian command out of these fields: they are the
 # reference its command low-pass filter blends the next command with and its rate
 # limiter differences against (``ControlLoop<CartesianPose>::convertMotion``,
-# ``ControlLoop<CartesianVelocities>::convertMotion``), and Franka's own smoke
-# generators open with ``franka::CartesianPose{state.O_T_EE_d, state.elbow_d}``.
+# ``ControlLoop<CartesianVelocities>::convertMotion``), and the conventional
+# opening is ``franka::CartesianPose{state.O_T_EE_d, state.elbow_d}``.
 # Now that the arm is actually driven from those commands, reporting the
 # *measured* pose or elbow there closes a positive feedback loop through the
 # client -- the command chases the lagging arm, the arm chases the command --
@@ -621,7 +621,7 @@ def test_a_twist_motion_freezes_the_commanded_pose():
     """``kCartesianVelocity`` commands no pose at all, so ``O_T_EE_d`` freezes.
 
     ``O_T_EE_c`` with it: on the twist interface libfranka's filter references
-    ``O_dP_EE_c``, but the suite's next pose motion opens from ``O_T_EE_d``, and
+    ``O_dP_EE_c``, but a following pose motion opens from ``O_T_EE_d``, and
     a field that walked with the arm through the twist motion would hand it a
     reference the robot never commanded.
     """

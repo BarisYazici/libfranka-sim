@@ -11,6 +11,6 @@ REST device (``spine_stub``).
 Docstring-only by design: it re-exports nothing, so importing this package
 pulls in no physics engine. Import the submodule you need -- or reach for the
 name through ``franka_sim`` itself, which resolves the engine-backed ones
-lazily. Each module's pre-split top-level path (``franka_sim.mobile_duo_sim``
-and friends) still resolves, aliased to the module object that lives here.
+lazily. The pre-1.0 top-level aliases for these modules (one package level up)
+were removed for the 1.0.0 release; import from ``franka_sim.mobile`` instead.
 """

@@ -164,7 +164,7 @@ python -m franka_sim.run_server -v --no-gripper
 | Flag | Gripper backend | Hand in viewer |
 | ---- | --------------- | -------------- |
 | *(default)* | `FrankaHandSim` (kinematic) | no |
-| `--gripper-physics` | `GenesisFrankaHand` (physics) | yes, fingers move |
+| `--gripper-physics` | `FrankaHandPhysics` (physics) | yes, fingers move |
 | `--no-gripper` | none (arm only) | no |
 
 ### Mobile duo (two arms + TMR base on one scene)

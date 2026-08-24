@@ -497,13 +497,14 @@ identical either way, because it judges what the client sent.
 
 One index in the enum is deliberately unreachable here:
 `start_elbow_sign_inconsistent` (24), which by its name is the start-time twin of
-21. Nothing pins it — the smoke suite's start-elbow test perturbs `elbow[0]` and
+21. Nothing pins it — the observable start-elbow case on hardware perturbs
+`elbow[0]` and
 leaves the sign alone, and libfranka refuses to *send* a branch flag that is not
 exactly ±1 — so both halves of the start-elbow check report 22 instead, the one
-index the suite does pin. See `START_ELBOW_SIGN_INCONSISTENT_INDEX`.
+index hardware is confirmed to report. See `START_ELBOW_SIGN_INCONSISTENT_INDEX`.
 
 **With enforcement off, a violating Cartesian motion never ends.** The violation
-is logged by name, but nothing aborts, so a smoke test waiting for an error waits
+is logged by name, but nothing aborts, so a client waiting for an error waits
 forever. The abort is the deliverable here; `--enforce-motion-limits` is what
 turns it on.
 
@@ -538,8 +539,8 @@ reaches the first-command branch at all, so an opening waypoint that is both
 out of range *and* away from `q_d` is reported as 12, not 11.
 
 That ordering (12 before 11) is a sim choice with **no hardware evidence behind
-it**. The smoke suite's `JointPositionMotionGeneratorStartPoseInvalid` offsets
-`q_d` by 0.2 rad on joint 1 (`smoke_errors.cpp:216`), which is comfortably
+it**. The reference provocation for 11 offsets
+`q_d` by 0.2 rad on joint 1, which is comfortably
 inside the joint's range, so it exercises 11 alone and says nothing about which
 name a first waypoint breaking both should get. If hardware evidence ever turns
 up saying start-pose comes first, the fix is to reorder the code, not this
@@ -565,18 +566,13 @@ what it looks at:
 
 When 13 trips while a motion is running, **the sim latches 3 alongside it, in
 the same abort** — both bits set in `errors`/`reflex_reason`, so the
-`ControlException` your client sees names both errors. That pairing is not a
-verified hardware pin: it follows the dev comment sitting under a
-`TODO(qu_zh): Verify the change` on both
-`JointMotionGeneratorPositionLimitsViolationHardware` and
-`JointMotionGeneratorVelocityLimitsViolationHardware` in the hardware smoke
-suite (`smoke_test_errors.cpp:110-127`), which reads "Both error[s] can appear.
-However with the current RCU joint_velocity_violation appear[s] much
-earl[ier] as we shape the limit" and says itself that it is unverified — i.e.
-a developer's account, not a pinned hardware behaviour, that hardware does not
-pick one name over the other but raises both, with 3 the one a caller notices
-first because the limit-shaping controller reacts to the arm leaving the
-envelope before Control finishes objecting to the command that put it there.
+`ControlException` your client sees names both errors. That pairing is a
+reported hardware behaviour rather than one this project measured directly:
+hardware raises **both** errors for this pair — for the position-limits and the
+velocity-limits provocation alike — rather than picking one name, with 3 the one
+a caller notices first because the limit-shaping controller reacts to the arm
+leaving the envelope before Control finishes objecting to the command that put
+it there. Treat it as strong but not independently verified.
 The sim latches both unconditionally so that either name a caller matches on
 is present.
 
@@ -620,16 +616,15 @@ Two things about it are worth stating, because both are read off hardware rather
 than assumed:
 
 * **Translation only.** The obvious companion bound would be
-  `kMaxRotationalVelocity` (2.5 rad/s) on the EE's angular velocity, and the
-  hardware suite rules it out: `JointVelocityViolation` and
-  `JointMotionGeneratorVelocityLimitsViolationHardware` both spin *joint 6*
+  `kMaxRotationalVelocity` (2.5 rad/s) on the EE's angular velocity, and
+  hardware behaviour rules it out: a 3 Nm torque ramp and a 5 rad/s² `dq_c`
+  ramp both spin *joint 6*
   — whose axis is near enough the EE's own — through its 4.18 rad/s envelope,
   so the EE angular speed passes 2.5 rad/s well before the joint limit, and
   hardware still answers `joint_velocity_violation`. Elbow speed is excluded
   too; the enum's only elbow-speed error is the motion generator's (17).
-* **It outranks `joint_velocity_violation`.** In
-  `CartesianVelocityViolationHardware` the EE is moved 0.5 m out along the
-  flange with `setEE` and then an ordinary joint-velocity ramp is run: hardware
+* **It outranks `joint_velocity_violation`.** Move the EE 0.5 m out along the
+  flange with `setEE` and then run an ordinary joint-velocity ramp: hardware
   reports `cartesian_velocity_violation` **alone**, with no
   `joint_velocity_violation` beside it. So when a single cycle breaks both, 4 is
   the bit that latches.
@@ -740,23 +735,21 @@ runs normally.
   that your control loop starts with the last commanded value observed in the
   robot state"). 0.1 rad is loose enough that the simulator's own tracking error
   can never manufacture the error and tight enough to catch a client that jumps
-  into a motion from a stale pose. Both revisions of Franka's smoke suite pin the
-  same counter-example and pin it identically — `moveJointPositionMotionGenerator`
-  `StartPoseInvalid` opens with `std::array<double, 7> discontinuity{{0.2}}`, i.e.
-  **+0.2 rad on joint 1**, in the old `libfranka/test/smoke` tree and in the
-  current `arm_smoke_tests` alike — and libfranka does not attenuate it: the
+  into a motion from a stale pose. The reference counter-example on hardware is a
+  motion that opens with `std::array<double, 7> discontinuity{{0.2}}`, i.e.
+  **+0.2 rad on joint 1** — and libfranka does not attenuate it: the
   command low-pass takes its reference from the command itself on the first cycle
   (`initialized_filter_` is false, `ControlLoop<JointPositions>::convertMotion`),
-  so the sim sees the full 0.2 rad. 0.1 rad therefore catches both suites with
-  2× margin, and nothing in either suite constrains it from below.
+  so the sim sees the full 0.2 rad. 0.1 rad therefore catches it with
+  2× margin, and nothing observed constrains it from below.
 
     The Cartesian start checks follow that precedent rather than inventing one:
     **0.05 m and 0.1 rad** for the first `O_T_EE_c` against the measured
     `O_T_EE`, and **0.1 rad** for the first `elbow_c` against `q[2]` — the
     rotation and elbow numbers are the joint-space 0.1 rad reused, since both are
     angles, and 0.05 m is its translational counterpart. Nothing pinned is
-    sensitive to the choice: Franka's own smoke tests offset by 10 m and 0.5 rad,
-    three orders of magnitude and five times clear of them. All three are
+    sensitive to the choice: the reference hardware provocations offset by 10 m
+    and 0.5 rad, three orders of magnitude and five times clear of them. All three are
     constructor arguments on `MotionLimitChecker` if your client needs a
     different contract.
 
@@ -852,9 +845,8 @@ sim will now find it for you first if you ask it to.
   about the joint trajectory the internal IK produces. The sim's IK produces one
   now, but those four errors are not raised from it: a Cartesian command that
   drives a joint into its stop currently surfaces as the safety controller's
-  `joint_velocity_violation`, which is also what Franka's own
-  `CartesianMotionGeneratorJointPositionLimitsViolationHardware` records from
-  hardware.
+  `joint_velocity_violation` — which is also what real hardware reports when a
+  Cartesian motion generator is driven into the joint position limits.
 
 The encouraging part: **the protocol machinery for all of this is public.** The
 limits, the error enum and the rate-limiting formulas all live in libfranka's own

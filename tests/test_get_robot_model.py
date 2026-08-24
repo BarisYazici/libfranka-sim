@@ -1,4 +1,4 @@
-"""Smoke tests for libfranka_new (protocol v10) wire compatibility.
+"""Wire-compatibility tests for libfranka_new (protocol v10).
 
 These verify the two things a stock libfranka_new client needs during
 ``franka::Robot`` construction:
@@ -49,7 +49,7 @@ def _connect(sock, command_id=1, version=PROTOCOL_VERSION, udp_port=1338):
     return _recv_message(sock)
 
 
-def test_connect_reports_protocol_v10(tcp_client, sim_server, mock_genesis_sim):
+def test_connect_reports_protocol_v10(tcp_client, sim_server, mock_physics_sim):
     """Connect response must use the v10 layout: status(uint8) + version(uint16)."""
     header, payload = _connect(tcp_client)
 
@@ -62,7 +62,7 @@ def test_connect_reports_protocol_v10(tcp_client, sim_server, mock_genesis_sim):
     assert server_version == PROTOCOL_VERSION
 
 
-def test_get_robot_model_returns_handless_fr3_urdf(tcp_client, sim_server, mock_genesis_sim):
+def test_get_robot_model_returns_handless_fr3_urdf(tcp_client, sim_server, mock_physics_sim):
     """Verify GetRobotModel returns a buildable, hand-less FR3 arm URDF."""
     _connect(tcp_client, command_id=1)
 

@@ -13,9 +13,9 @@ import importlib
 from franka_sim.control_modes import ControlMode
 from franka_sim.franka_protocol import Command, ConnectStatus, MessageHeader, RobotMode
 from franka_sim.franka_sim_server import FrankaSimServer
-from franka_sim.gripper_backend import FrankaHandSim, GripperBackend
-from franka_sim.gripper_physics import GenesisFrankaHand
-from franka_sim.gripper_server import FrankaGripperServer
+from franka_sim.gripper.backend import FrankaHandSim, GripperBackend
+from franka_sim.gripper.physics import FrankaHandPhysics
+from franka_sim.gripper.server import FrankaGripperServer
 from franka_sim.mobile.spine_stub import SpineModel, SpineStubServer
 from franka_sim.mobile.swerve_base import SwerveBase
 from franka_sim.mobile.swerve_kinematics import SwerveKinematics
@@ -61,7 +61,7 @@ __all__ = [
     "run_server_main",
     "GripperBackend",
     "FrankaHandSim",
-    "GenesisFrankaHand",
+    "FrankaHandPhysics",
     "FrankaGripperServer",
     "SwerveBase",
     "SwerveKinematics",

@@ -193,17 +193,17 @@ class MotionSessionMixin:
                 # q_c and turns this command into one huge dq_c on the next
                 # step. Publishing first makes the baseline this very command,
                 # which is exactly the no-spike invariant the reset is for.
-                self.genesis_sim.update_joint_positions(command["q_c"])
+                self.physics_sim.update_joint_positions(command["q_c"])
                 if self.control_mode is not ControlMode.POSITION:
                     logger.info("Setting control mode to POSITION")
-                    self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                    self.physics_sim.set_control_mode(ControlMode.POSITION)
                     self.control_mode = ControlMode.POSITION
                     # Initialize q_d to current q when first entering position mode
                     self.robot_state.state["q_d"] = self.robot_state.state["q"]
                 # Update q_d with commanded positions
                 self.robot_state.state["q_d"] = list(command["q_c"])
                 self._publish_commanded_derivatives("dq_d", "ddq_d")
-                self.genesis_sim.update_torques([0.0] * 7)
+                self.physics_sim.update_torques([0.0] * 7)
             elif (
                 self.robot_state.state["controller_mode"]
                 == LibfrankaControllerMode.kJointImpedance
@@ -212,13 +212,13 @@ class MotionSessionMixin:
             ):
                 if self.control_mode is not ControlMode.VELOCITY:
                     logger.info("Setting control mode to VELOCITY")
-                    self.genesis_sim.set_control_mode(ControlMode.VELOCITY)
+                    self.physics_sim.set_control_mode(ControlMode.VELOCITY)
                     self.control_mode = ControlMode.VELOCITY
                 # Update dq_d with commanded velocities
                 self.robot_state.state["dq_d"] = list(command["dq_c"])
                 self._publish_commanded_derivatives("ddq_d")
-                self.genesis_sim.update_joint_velocities(command["dq_c"])
-                self.genesis_sim.update_torques([0.0] * 7)
+                self.physics_sim.update_joint_velocities(command["dq_c"])
+                self.physics_sim.update_torques([0.0] * 7)
             elif (
                 self.mobile_base
                 and self.robot_state.state["motion_generator_mode"]
@@ -254,11 +254,11 @@ class MotionSessionMixin:
             ):
                 if self.control_mode is not ControlMode.TORQUE:
                     logger.info("Setting control mode to TORQUE")
-                    self.genesis_sim.set_control_mode(ControlMode.TORQUE)
+                    self.physics_sim.set_control_mode(ControlMode.TORQUE)
                     self.control_mode = ControlMode.TORQUE
                 # Update tau_J_d with commanded torques
                 self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
-                self.genesis_sim.update_torques(command["tau_J_d"])
+                self.physics_sim.update_torques(command["tau_J_d"])
 
     def _drive_cartesian_generator(self, command) -> None:
         """Hand one accepted Cartesian command to the backend's differential IK.
@@ -293,14 +293,14 @@ class MotionSessionMixin:
         # servos zero velocity.
         if self.control_mode is not mode:
             logger.info("Setting control mode to %s", mode.name)
-            self.genesis_sim.set_control_mode(mode)
+            self.physics_sim.set_control_mode(mode)
             self.control_mode = mode
         elbow_angle = command["elbow_c"][0] if command.get("valid_elbow") else None
         if pose_generator:
-            self.genesis_sim.update_cartesian_pose(command["O_T_EE_c"], elbow_angle)
+            self.physics_sim.update_cartesian_pose(command["O_T_EE_c"], elbow_angle)
         else:
-            self.genesis_sim.update_cartesian_velocity(command["O_dP_EE_c"], elbow_angle)
-        self.genesis_sim.update_torques([0.0] * 7)
+            self.physics_sim.update_cartesian_velocity(command["O_dP_EE_c"], elbow_angle)
+        self.physics_sim.update_torques([0.0] * 7)
 
     def _echo_commanded_cartesian(self, command) -> None:
         """Echo a Cartesian generator's commanded pose and elbow into the state.
@@ -387,8 +387,9 @@ class MotionSessionMixin:
         command low-pass filter blends the next command with, and its rate
         limiter differences against (``ControlLoop<CartesianPose>::
         convertMotion``, ``ControlLoop<CartesianVelocities>::convertMotion``,
-        ``src/control_loop.cpp``), and the smoke suite's own generators open
-        with ``franka::CartesianPose cmd{state.O_T_EE_d, state.elbow_d}``. Once
+        ``src/control_loop.cpp``), and the conventional way to open a Cartesian
+        motion is
+        ``franka::CartesianPose cmd{state.O_T_EE_d, state.elbow_d}``. Once
         the arm is actually driven from those commands, publishing the *measured*
         pose or elbow there closes a positive feedback loop through the client:
         the command chases the lagging arm, the arm chases the command, and the
@@ -400,8 +401,9 @@ class MotionSessionMixin:
         ``q_d``/``dq_d``/``ddq_d`` and never these fields, so there is no loop to
         break, and reporting the pose the arm is in stays the closest thing this
         sim has to the hardware's own ``O_T_EE_d = FK(q_d)``. Idle likewise --
-        and that is the behaviour the suite's "start from ``state.O_T_EE_d``"
-        generators depend on, since they read it on the motion's first cycle.
+        and that is the behaviour any "start from ``state.O_T_EE_d``"
+        generator depends on, since it reads the field on the motion's first
+        cycle.
         """
         return self.robot_state.state["motion_generator_mode"] in (
             LibfrankaMotionGeneratorMode.kCartesianPosition,
@@ -557,14 +559,14 @@ class MotionSessionMixin:
                     and move_cmd.motion_generator_mode == MotionGeneratorMode.kJointPosition
                 ):
                     logger.info("Setting control mode to POSITION")
-                    self.genesis_sim.set_control_mode(ControlMode.POSITION)
+                    self.physics_sim.set_control_mode(ControlMode.POSITION)
                     self.control_mode = generator_mode = ControlMode.POSITION
                 elif (
                     move_cmd.controller_mode == ControllerMode.kJointImpedance
                     and move_cmd.motion_generator_mode == MotionGeneratorMode.kJointVelocity
                 ):
                     logger.info("Setting control mode to VELOCITY")
-                    self.genesis_sim.set_control_mode(ControlMode.VELOCITY)
+                    self.physics_sim.set_control_mode(ControlMode.VELOCITY)
                     self.control_mode = generator_mode = ControlMode.VELOCITY
                 elif (
                     self.mobile_base
@@ -572,11 +574,11 @@ class MotionSessionMixin:
                     and move_cmd.controller_mode != ControllerMode.kExternalController
                 ):
                     logger.info("Setting control mode to STEERING_DRIVE")
-                    self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
+                    self.physics_sim.set_control_mode(ControlMode.STEERING_DRIVE)
                     self.control_mode = generator_mode = ControlMode.STEERING_DRIVE
                 elif move_cmd.controller_mode == ControllerMode.kExternalController:
                     logger.info("Setting control mode to TORQUE")
-                    self.genesis_sim.set_control_mode(ControlMode.TORQUE)
+                    self.physics_sim.set_control_mode(ControlMode.TORQUE)
                     self.control_mode = generator_mode = ControlMode.TORQUE
                 elif move_cmd.motion_generator_mode in (
                     MotionGeneratorMode.kCartesianPosition,
@@ -604,7 +606,7 @@ class MotionSessionMixin:
                     )
                     if self.cartesian_tracking:
                         logger.info("Setting control mode to %s", generator_mode.name)
-                        self.genesis_sim.set_control_mode(generator_mode)
+                        self.physics_sim.set_control_mode(generator_mode)
                         self.control_mode = generator_mode
                     else:
                         logger.info(
@@ -716,8 +718,8 @@ class MotionSessionMixin:
         responses picked up by the mode-wait loop that follows are converted --
         ``catch (const CommandException& e) { throw ControlException(e.what()); }``
         (``src/robot_impl.cpp:323-332``), and ``throwOnMotionError`` does the
-        same (``:96-111``). Franka's ``CartesianMotionInSingularPose``
-        (``smoke_test_errors.cpp:231``) catches ``ControlException``, so on
+        same (``:96-111``). A client starting a Cartesian motion from a singular
+        configuration sees a ``ControlException``, so on
         hardware the singular start is discovered *after* the ``Move`` was
         acknowledged -- Control accepts the command, looks at where the arm is
         standing, and terminates the motion. This method reproduces that shape:
@@ -725,8 +727,8 @@ class MotionSessionMixin:
         response, and the generator modes deliberately never leaving idle so the
         client stays in the loop that converts it.
 
-        **Cartesian generators only.** The very same test reaches the singular
-        configuration by *joint* motion (``moveP2P`` to ``kSingularPose``), so
+        **Cartesian generators only.** Reaching that singular configuration in
+        the first place is done by a *joint* point-to-point motion, so
         joint interfaces plainly start there quite happily -- as they must, since
         a joint generator has no Jacobian to invert and driving *out* of a
         singularity is the only way to leave one.
@@ -749,7 +751,7 @@ class MotionSessionMixin:
         ):
             return False
         try:
-            sim_state = self.genesis_sim.get_robot_state()
+            sim_state = self.physics_sim.get_robot_state()
         except Exception:  # pragma: no cover - a backend that cannot answer
             # Same posture as :meth:`_publish_hold_setpoint`: a backend that
             # cannot be read is a backend this check cannot be run against, and
@@ -943,7 +945,7 @@ class MotionSessionMixin:
             if not self._mobile_hold_logged:
                 logger.info("Motion finished: commanding zero base twist")
                 self._mobile_hold_logged = True
-            self.genesis_sim.update_base_twist([0.0] * 6)
+            self.physics_sim.update_base_twist([0.0] * 6)
             # The base is stopped, so the commanded twist the client reads back
             # has to say so -- and the next motion's limit checker seeds from
             # it, so a stale twist here would make a client that correctly
@@ -951,10 +953,10 @@ class MotionSessionMixin:
             self.robot_state.state["O_dP_EE_c"] = [0.0] * 6
             self.robot_state.state["O_dP_EE_d"] = [0.0] * 6
             # Keep the simulator's mode in lockstep with the server's: without
-            # this, a client that never re-Moves leaves genesis_sim's own
+            # this, a client that never re-Moves leaves physics_sim's own
             # control_mode wherever it was (e.g. still mid-transition), so
             # server and simulator could disagree about mode after a hold.
-            self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
+            self.physics_sim.set_control_mode(ControlMode.STEERING_DRIVE)
             self.control_mode = ControlMode.STEERING_DRIVE
             return
 
@@ -964,10 +966,10 @@ class MotionSessionMixin:
         # a step land in between and servo towards the *previous* position
         # target (the initial pose, or the last q_c of an older motion) at
         # kp=4500 -- a lurch, which is the opposite of a hold.
-        current_joint_positions = self.genesis_sim.get_robot_state()["q"]
-        self.genesis_sim.update_joint_positions(current_joint_positions)
-        self.genesis_sim.update_torques([0.0] * 7)
-        self.genesis_sim.set_control_mode(ControlMode.POSITION)
+        current_joint_positions = self.physics_sim.get_robot_state()["q"]
+        self.physics_sim.update_joint_positions(current_joint_positions)
+        self.physics_sim.update_torques([0.0] * 7)
+        self.physics_sim.set_control_mode(ControlMode.POSITION)
         self.control_mode = ControlMode.POSITION
         self._publish_hold_setpoint(current_joint_positions)
         # The Cartesian twin of the zero ``dq_d``/``tau_J_d`` that hold setpoint
@@ -1007,7 +1009,7 @@ class MotionSessionMixin:
             return dict(self.robot_state.state)
         if joint_positions is None:
             try:
-                joint_positions = self.genesis_sim.get_robot_state()["q"]
+                joint_positions = self.physics_sim.get_robot_state()["q"]
             except Exception:  # pragma: no cover - a backend that cannot answer
                 logger.exception("Could not read the simulator to publish the hold setpoint")
                 return dict(self.robot_state.state)
@@ -1037,7 +1039,7 @@ class MotionSessionMixin:
         motions it *is* the measured pose, so the two agree and the measured one
         is used directly. It is also the more honest of the two to seed from:
         the question the check asks is "are you where the robot is", which is
-        what the smoke suite's 10 m offset breaks, and answering it from a
+        what a 10 m start-pose offset breaks, and answering it from a
         commanded field would let a stale command excuse a stale command.
 
         Read out of the backend rather than ``self.robot_state.state`` for arm
@@ -1064,7 +1066,7 @@ class MotionSessionMixin:
         if "O_T_EE" not in seed:
             seed = dict(seed)
             try:
-                backend_pose = self.genesis_sim.get_robot_state().get("O_T_EE")
+                backend_pose = self.physics_sim.get_robot_state().get("O_T_EE")
             except Exception:  # pragma: no cover - a backend that cannot answer
                 logger.exception("Could not read the simulator to seed O_T_EE")
                 backend_pose = None
@@ -1192,8 +1194,8 @@ class MotionSessionMixin:
             # over it either -- the reference simply freezes for one cycle, the
             # client's own 100 Hz command filter blends toward the frozen value
             # and emits a (1 - gain) x one-cycle step, and this server aborts
-            # the motion on the discontinuity it manufactured. Measured on the
-            # smoke suite's elbow motion: a 179 urad/cycle elbow ramp came back
+            # the motion on the discontinuity it manufactured. Measured on a
+            # Cartesian elbow motion: a 179 urad/cycle elbow ramp came back
             # 110 urad short on exactly that cycle, i.e. 110 rad/s^2 against a
             # 10 rad/s^2 limit. So the gate waits for the datagram to be
             # *applied*, not merely read.
@@ -1478,13 +1480,12 @@ class MotionSessionMixin:
         commanded *is* the pose it is in. These fields were a permanent identity
         stub for as long as nothing read them, and that was not harmless: a
         libfranka Cartesian-pose motion generator initialises and holds from
-        ``O_T_EE_d`` (the smoke suite's own helpers open with
+        ``O_T_EE_d`` (the conventional opening is
         ``std::array<double, 16> cmd = state.O_T_EE_d;``), so an identity there
         made *every* pose motion open ten-ish metres and a full rotation away
         from the robot and trip
         ``cartesian_position_motion_generator_start_pose_invalid`` on cycle 0 --
-        a sim artifact that hid five of the suite's real Cartesian checks
-        behind it.
+        a sim artifact that masked every other Cartesian error behind it.
 
         During either Cartesian motion the two fields belong to that motion
         instead -- to the client's stream on the pose generator
@@ -1588,7 +1589,7 @@ class MotionSessionMixin:
         self.robot_state.state["F_T_EE"] = values
         # getattr on self too: reset_state() also runs from teardown paths, and
         # a half-built server has no backend yet.
-        setter = getattr(getattr(self, "genesis_sim", None), "update_ee_transform", None)
+        setter = getattr(getattr(self, "physics_sim", None), "update_ee_transform", None)
         if setter is None:
             return
         try:
@@ -1604,15 +1605,15 @@ class MotionSessionMixin:
         measured ``dq`` against the position-based velocity envelope and latches
         ``joint_velocity_violation``, and watches the measured end-effector
         speed against the Cartesian translational limit and latches
-        ``cartesian_velocity_violation`` -- both in every control mode. Franka's
-        hardware smoke suite pins the case no commanded check could ever cover:
+        ``cartesian_velocity_violation`` -- both in every control mode. Hardware
+        pins the case no commanded check could ever cover:
         a pure-torque session ramping 3 Nm into joint 6 until the arm folds
-        through the envelope, with no commanded velocity anywhere in the session
-        (``moveJointVelocityViolation``).
+        through the envelope, with no commanded velocity anywhere in the
+        session.
 
         **The Cartesian check is asked first, and that ordering is the
-        hardware's.** ``CartesianVelocityViolationHardware`` ramps joints 2 and
-        4 with an EE 0.5 m out along the flange and hardware reports
+        hardware's.** Ramping joints 2 and
+        4 with an EE 0.5 m out along the flange, hardware reports
         ``cartesian_velocity_violation`` *on its own* -- no
         ``joint_velocity_violation`` beside it -- so whichever cycle is the
         first to break both, the Cartesian error is the one that must latch.
@@ -1806,10 +1807,10 @@ class MotionSessionMixin:
         if self.control_mode is not ControlMode.STEERING_DRIVE:
             # Logged only on the transition, never per datagram.
             logger.info("Setting control mode to STEERING_DRIVE")
-            self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
+            self.physics_sim.set_control_mode(ControlMode.STEERING_DRIVE)
             self.control_mode = ControlMode.STEERING_DRIVE
 
-        self.genesis_sim.update_base_twist(twist)
+        self.physics_sim.update_base_twist(twist)
 
     def handle_stop_move_command(self, client_socket, header: MessageHeader):
         """Handle StopMove command received over TCP"""

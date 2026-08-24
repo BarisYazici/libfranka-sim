@@ -287,7 +287,7 @@ class StateStreamMixin:
                     cycle_start = time.time()
 
                     genesis_start = time.time()
-                    sim_state = self.genesis_sim.get_robot_state()
+                    sim_state = self.physics_sim.get_robot_state()
                     genesis_time = time.time() - genesis_start
                     total_genesis_time += genesis_time
 

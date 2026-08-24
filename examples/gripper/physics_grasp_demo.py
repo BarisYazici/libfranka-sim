@@ -13,8 +13,8 @@ import time
 
 from examples.gripper.gripper_wire_client import GripperWireClient
 from franka_sim.franka_genesis_sim import FrankaGenesisSim
-from franka_sim.gripper_physics import GenesisFrankaHand
-from franka_sim.gripper_server import FrankaGripperServer
+from franka_sim.gripper.physics import FrankaHandPhysics
+from franka_sim.gripper.server import FrankaGripperServer
 
 
 def main():
@@ -29,7 +29,7 @@ def main():
     # A graspable box placed between the fingers (fingers slide along the y axis).
     # Default config: fingers at x~0.554, z~0.566, y=±0.04 when fully open.
     # Box is 0.035 m wide in y (> 0.02 m grasp target) so fingers stall and
-    # report is_grasped=True (finger-position stall detection in GenesisFrankaHand).
+    # report is_grasped=True (finger-position stall detection in FrankaHandPhysics).
     # fixed=True keeps the box in place so it doesn't fall before the fingers close.
     box = gs.morphs.Box(size=(0.06, 0.035, 0.08), pos=(0.554, 0.0, 0.566), fixed=True)
     sim = FrankaGenesisSim(enable_vis=not args.headless, enable_hand=True, extra_morphs=[box])
@@ -39,7 +39,7 @@ def main():
     sim.sim_thread = sim_thread
     sim_thread.start()
 
-    server = FrankaGripperServer(backend=GenesisFrankaHand(sim))
+    server = FrankaGripperServer(backend=FrankaHandPhysics(sim))
     server_thread = threading.Thread(target=server.run_server, daemon=True)
     server_thread.start()
     time.sleep(0.5)

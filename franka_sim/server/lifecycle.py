@@ -75,7 +75,7 @@ class LifecycleMixin:
         the FCI port without an error on either side and the kernel
         load-balances incoming clients between them, silently corrupting
         both (observed as spurious connection timeouts and cross-talk in
-        the smoke suites). A second server must die here with
+        long-running client sessions). A second server must die here with
         ``EADDRINUSE`` instead. ``SO_REUSEADDR`` stays so a restart can
         rebind through a lingering TIME_WAIT.
         """
@@ -194,13 +194,13 @@ class LifecycleMixin:
             self._bind_listener()
 
             # Initialize Genesis simulator first
-            self.genesis_sim.initialize_simulation()
+            self.physics_sim.initialize_simulation()
             logger.info("Genesis simulation initialized")
 
             # Bring up the gripper server alongside the arm (port 1338).
             self.start_gripper_server()
 
-            if self.genesis_sim.enable_vis:
+            if self.physics_sim.enable_vis:
                 # Run server in a background thread when visualization is enabled
                 server_thread = threading.Thread(target=self.run_server)
                 server_thread.daemon = True
@@ -209,7 +209,7 @@ class LifecycleMixin:
 
                 # Start Genesis simulator (visualization) in main thread
                 logger.info("Starting Genesis simulator with visualization")
-                self.genesis_sim.start()
+                self.physics_sim.start()
             else:
                 # Without visualization, run the TCP/UDP server in a background
                 # thread and step the Genesis physics loop in the main thread.
@@ -221,7 +221,7 @@ class LifecycleMixin:
                 logger.info("Server running in background thread (headless)")
 
                 logger.info("Starting Genesis simulator (headless)")
-                self.genesis_sim.start()
+                self.physics_sim.start()
 
         except Exception as e:
             logger.error(f"Server start error: {e}", exc_info=True)
@@ -344,7 +344,7 @@ class LifecycleMixin:
         for stage, action in (
             ("socket cleanup", self.cleanup),
             ("gripper server", self._stop_gripper),
-            ("simulator", self.genesis_sim.stop),
+            ("simulator", self.physics_sim.stop),
         ):
             try:
                 action()

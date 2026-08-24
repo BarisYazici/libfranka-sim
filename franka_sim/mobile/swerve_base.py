@@ -16,11 +16,7 @@ import numpy as np
 
 from franka_sim.mobile.swerve_kinematics import SwerveKinematics
 
-#: Pinned to this module's pre-split path: the name is asserted on by
-#: ``caplog.at_level(..., logger=...)`` in the tests, and callers'
-#: logging configuration keys off it too. Moving the file must not
-#: silently rename the logger.
-logger = logging.getLogger("franka_sim.swerve_base")
+logger = logging.getLogger(__name__)
 
 #: Steering joints, module 0 (front) then module 1 (rear).
 TMR_STEER_JOINTS = ("tmrv0_2_joint_0", "tmrv0_2_joint_2")

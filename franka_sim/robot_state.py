@@ -210,11 +210,11 @@ class RobotState:
         the faithful value for this sim is ``theta = q``, ``dtheta = dq``.
 
         This matters because ``theta``/``dtheta`` are not decoration: they are
-        what an external torque controller closes its loop on. Franka's own
-        smoke-test controller (``test/smoke/src/smoke_common.cpp:272-276``)
+        what an external torque controller closes its loop on. A typical
+        external joint-impedance controller
         computes ``k_p * (q_d - theta) + k_d * (dq_d - filtered(dtheta))``, so
-        leaving ``theta`` at the zero it is initialised to made every
-        ``*ExternalController*`` test command ``k_p`` times the *whole* joint
+        leaving ``theta`` at the zero it is initialised to made every such
+        controller command ``k_p`` times the *whole* joint
         angle -- e.g. joint 6 at ``250 * 2.19 rad = 547 Nm`` against a 12 Nm
         limit -- and the motion died of ``tau_J_range_violation`` a few
         milliseconds after libfranka's torque rate limiter had ramped that far.

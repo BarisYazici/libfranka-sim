@@ -139,12 +139,13 @@ AUTOMATIC_ERROR_RECOVERY_POLL_PERIOD = 0.001  # s
 #: tcp_timeout = std::chrono::seconds(1), ...)``), and that is the client's
 #: own receive timeout on *every* TCP command response, ``AutomaticErrorRecovery``
 #: included -- there is no per-command override for it. A 3 s wait was tried
-#: against the real gtest smoke suite and reproduced exactly this: the reply
+#: against a stock libfranka client and reproduced exactly this: the reply
 #: arrived correctly, but ~1.000 s after the request the client had already
 #: decided the connection was dead (Poco's ``TimeoutException`` surfaces to
 #: the caller as "libfranka: TCP connection got interrupted" /
-#: "libfranka: UDP receive: Timeout"), and every later test on that connection
-#: then failed too as the client kept retrying against a server still mid-wait
+#: "libfranka: UDP receive: Timeout"), and every later motion on that
+#: connection then failed too as the client kept retrying against a server
+#: still mid-wait
 #: from the *previous* abort. Going over 1 s here is not "slower, but still
 #: correct" -- it silently breaks the wire protocol.
 #:

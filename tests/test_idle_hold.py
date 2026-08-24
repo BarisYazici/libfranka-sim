@@ -210,14 +210,14 @@ def assert_holds_at(mock_sim, q):
 
 
 @pytest.fixture
-def holding_sim(mock_genesis_sim):
+def holding_sim(mock_physics_sim):
     """The mocked arm simulator, reporting a distinctive current pose."""
-    mock_genesis_sim.get_robot_state.return_value = {
+    mock_physics_sim.get_robot_state.return_value = {
         "q": HELD_Q,
         "dq": np.zeros(7),
         "tau_J": np.zeros(7),
     }
-    return mock_genesis_sim
+    return mock_physics_sim
 
 
 def _start_torque_motion(tcp_client, udp_client, sim_server):
@@ -363,7 +363,7 @@ def test_the_hold_recaptures_a_fast_moving_mujoco_arm():
     """Physics, not mocks: the swinging arm is caught and stays caught."""
     sim = MujocoFrankaSim()
     sim.initialize_simulation()
-    server = FrankaSimServer(genesis_sim=sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=sim, enable_gripper=False)
     try:
         sim.set_control_mode(ControlMode.TORQUE)
         sim.update_torques([SPIN_UP_TORQUE] * 7)
@@ -456,7 +456,7 @@ def live_mujoco_server():
 
     sim = MujocoFrankaSim()
     sim.initialize_simulation()
-    server = FrankaSimServer(genesis_sim=sim, enable_gripper=False)
+    server = FrankaSimServer(physics_sim=sim, enable_gripper=False)
 
     accept_thread = threading.Thread(target=server.run_server, daemon=True)
     accept_thread.start()

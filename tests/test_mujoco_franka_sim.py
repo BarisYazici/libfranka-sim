@@ -283,7 +283,7 @@ def test_switching_into_position_mode_resets_the_feedforward_baseline(sim):
 def test_constant_velocity_ramp_stays_within_the_tracking_guard(sim):
     """A smooth streamed trajectory must not fail libfranka's tracking guard.
 
-    libfranka's own smoke-test rejects a motion whose measured joint
+    A conforming client rejects a motion whose measured joint
     positions stray from the *previous cycle's* commanded positions by more
     than 6e-3 rad RMSE at 1 kHz. The undamped-feedforward law fails this on an
     ordinary ramp because its damping term fights the commanded motion,
@@ -490,7 +490,7 @@ def test_the_duo_backend_shares_this_backends_feedforward(sim_factory):
     behaviour measured above is one implementation, not two. The duo runs its
     own physics-level beat test (``test_mobile_duo_mujoco_sim.py``).
     """
-    from franka_sim import mobile_duo_mujoco_sim
+    from franka_sim.mobile import duo_mujoco_sim as mobile_duo_mujoco_sim
 
     assert mobile_duo_mujoco_sim.PositionFeedforward is PositionFeedforward
     assert isinstance(sim_factory()._position_feedforward, PositionFeedforward)
@@ -582,10 +582,10 @@ def running_hand_sim(hand_sim):
 
 
 def test_genesis_franka_hand_drives_the_mujoco_fingers(running_hand_sim):
-    """The GenesisFrankaHand backend is sim-agnostic: it works unchanged here."""
-    from franka_sim.gripper_physics import GenesisFrankaHand
+    """The FrankaHandPhysics backend is sim-agnostic: it works unchanged here."""
+    from franka_sim.gripper.physics import FrankaHandPhysics
 
-    backend = GenesisFrankaHand(running_hand_sim)
+    backend = FrankaHandPhysics(running_hand_sim)
 
     assert backend.homing() is True
     assert backend.get_state().width == pytest.approx(0.08, abs=2e-3)
@@ -598,11 +598,11 @@ def test_genesis_franka_hand_drives_the_mujoco_fingers(running_hand_sim):
 def test_wire_client_move_drives_the_mujoco_fingers(running_hand_sim):
     """A libfranka-style wire client opens/closes the fingers and sees it over UDP."""
     from examples.gripper.gripper_wire_client import GripperWireClient
-    from franka_sim.gripper_physics import GenesisFrankaHand
-    from franka_sim.gripper_server import FrankaGripperServer
+    from franka_sim.gripper.physics import FrankaHandPhysics
+    from franka_sim.gripper.server import FrankaGripperServer
 
     server = FrankaGripperServer(
-        host="127.0.0.1", port=0, backend=GenesisFrankaHand(running_hand_sim)
+        host="127.0.0.1", port=0, backend=FrankaHandPhysics(running_hand_sim)
     )
     thread = threading.Thread(target=server.run_server, daemon=True)
     thread.start()

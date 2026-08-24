@@ -6,7 +6,7 @@ Imported as ``from fakes import ...``: pytest puts the ``tests`` directory on
 
 import numpy as np
 
-from franka_sim.swerve_base import TMR_JOINT_ORDER
+from franka_sim.mobile.swerve_base import TMR_JOINT_ORDER
 
 
 class FakeTensor:
@@ -130,7 +130,7 @@ class FakeDuoEntity:
     """A Genesis RigidEntity stand-in carrying the wheel and both arm joints."""
 
     def __init__(self):
-        from franka_sim.mobile_duo_sim import (
+        from franka_sim.mobile.duo_sim import (
             ARM_EE_LINKS,
             ARM_JOINT_NAMES,
             ROLE_LEFT,

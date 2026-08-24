@@ -32,8 +32,8 @@ from franka_sim.franka_protocol import (
     MotionGeneratorMode,
 )
 from franka_sim.control_modes import ControlMode
-from franka_sim.mobile_duo_runner import MobileDuoRunner
-from franka_sim.mobile_duo_sim import (
+from franka_sim.mobile.runner import MobileDuoRunner
+from franka_sim.mobile.duo_sim import (
     ARM_INITIAL_Q as DUO_ARM_INITIAL_Q,
     ROLE_BASE,
     ROLE_LEFT,
@@ -41,7 +41,7 @@ from franka_sim.mobile_duo_sim import (
     MobileDuoScene,
 )
 from franka_sim.robot_state import _ROBOT_STATE_PACKER, RobotState
-from franka_sim.spine_stub import (
+from franka_sim.mobile.spine_stub import (
     SPINE_DEFAULT_HOST,
     SPINE_DEFAULT_PORT,
     SpineStubServer,

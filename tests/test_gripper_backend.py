@@ -1,4 +1,4 @@
-from franka_sim.gripper_backend import FRANKA_HAND_MAX_WIDTH, FrankaHandSim
+from franka_sim.gripper.backend import FRANKA_HAND_MAX_WIDTH, FrankaHandSim
 
 
 def test_homing_opens_to_max_width():

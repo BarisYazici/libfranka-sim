@@ -49,7 +49,7 @@ def wait_for_server(port, max_retries=20, retry_delay=0.2):
 
 
 @pytest.fixture
-def mock_genesis_sim():
+def mock_physics_sim():
     """Fixture that provides a mocked Genesis simulator"""
     mock_sim = Mock()
     mock_sim.get_robot_state.return_value = MOCK_ROBOT_STATE
@@ -57,7 +57,7 @@ def mock_genesis_sim():
 
 
 @pytest.fixture
-def sim_server(mock_genesis_sim):
+def sim_server(mock_physics_sim):
     """Fixture that provides a server with mocked Genesis simulator"""
     # First ensure no existing server is running
     try:
@@ -71,7 +71,7 @@ def sim_server(mock_genesis_sim):
 
     from franka_sim.franka_sim_server import FrankaSimServer
 
-    server = FrankaSimServer(enable_vis=False, genesis_sim=mock_genesis_sim)
+    server = FrankaSimServer(enable_vis=False, physics_sim=mock_physics_sim)
     server_thread = threading.Thread(target=server.run_server)
     server_thread.daemon = True
 
@@ -180,7 +180,7 @@ def cleanup_sockets():
 @pytest.fixture
 def mock_base_sim():
     """A mocked mobile-base simulator: 7-element state plus update_base_twist."""
-    from franka_sim.tmr_genesis_sim import TMRGenesisSim
+    from franka_sim.mobile.tmr_genesis_sim import TMRGenesisSim
 
     mock_sim = Mock(spec=TMRGenesisSim)
     mock_sim.enable_vis = False
@@ -199,7 +199,7 @@ def base_sim_server(mock_base_sim):
 
     server = FrankaSimServer(
         enable_vis=False,
-        genesis_sim=mock_base_sim,
+        physics_sim=mock_base_sim,
         enable_gripper=False,
         mobile_base=True,
     )
@@ -224,7 +224,7 @@ def base_sim_server(mock_base_sim):
 @pytest.fixture
 def gripper_backend():
     """A fresh kinematic Franka Hand backend for gripper tests."""
-    from franka_sim.gripper_backend import FrankaHandSim
+    from franka_sim.gripper.backend import FrankaHandSim
 
     return FrankaHandSim()
 
@@ -232,8 +232,8 @@ def gripper_backend():
 @pytest.fixture
 def gripper_server(gripper_backend):
     """A started gripper server (port 1338) with an injected backend."""
-    from franka_sim.gripper_protocol import GRIPPER_COMMAND_PORT
-    from franka_sim.gripper_server import FrankaGripperServer
+    from franka_sim.gripper.protocol import GRIPPER_COMMAND_PORT
+    from franka_sim.gripper.server import FrankaGripperServer
 
     server = FrankaGripperServer(backend=gripper_backend)
     server_thread = threading.Thread(target=server.run_server, daemon=True)

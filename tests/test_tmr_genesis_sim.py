@@ -5,8 +5,8 @@ import pytest
 from fakes import FakeEntity
 
 from franka_sim.franka_genesis_sim import ControlMode
-from franka_sim.swerve_base import TMR_WHEEL_RADIUS
-from franka_sim.tmr_genesis_sim import TMRGenesisSim
+from franka_sim.mobile.swerve_base import TMR_WHEEL_RADIUS
+from franka_sim.mobile.tmr_genesis_sim import TMRGenesisSim
 
 
 @pytest.fixture
@@ -124,8 +124,10 @@ def test_initialize_simulation_unlinks_the_resolved_urdf_when_build_raises(tmp_p
     fake_scene.build = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
 
     sim = TMRGenesisSim(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.tmr_genesis_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.tmr_genesis_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.tmr_genesis_sim.gs", fake_gs)
+    monkeypatch.setattr(
+        "franka_sim.mobile.tmr_genesis_sim.resolve_urdf_meshes", lambda *a, **kw: resolved
+    )
 
     with pytest.raises(RuntimeError, match="boom"):
         sim.initialize_simulation()

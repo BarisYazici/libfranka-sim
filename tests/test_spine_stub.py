@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from franka_sim.spine_stub import SpineError, SpineModel, SpineStubServer
+from franka_sim.mobile.spine_stub import SpineError, SpineModel, SpineStubServer
 
 
 class FakeClock:
@@ -266,7 +266,7 @@ def test_https_mode_serves_a_self_signed_certificate(tmp_path):
     """franka_spine_server talks HTTPS with verify=False; prove the TLS path works."""
     import ssl
 
-    from franka_sim.spine_stub import make_self_signed_cert
+    from franka_sim.mobile.spine_stub import make_self_signed_cert
 
     certfile, keyfile = make_self_signed_cert(tmp_path)
     server = SpineStubServer(host="127.0.0.1", port=0, certfile=certfile, keyfile=keyfile)

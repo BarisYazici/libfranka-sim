@@ -65,18 +65,19 @@ from franka_sim.motion_limits import (
 #: **Not a libfranka constant** -- the robot's own IK is not published. 0.05 is
 #: chosen against the same measurement that placed
 #: :data:`franka_sim.motion_limits.SINGULAR_POSE_MIN_SINGULAR_VALUE`: the FR3's
-#: ``sigma_min`` sits around 0.15-0.23 in the whole working region Franka's
-#: smoke suite drives through, so at 0.05 the damping term is ~5% of the
+#: ``sigma_min`` sits around 0.15-0.23 across the whole working region a
+#: Cartesian motion ordinarily drives through, so at 0.05 the damping term is
+#: ~5% of the
 #: smallest singular value there and costs essentially nothing in tracking
-#: (measured: sub-millimetre and sub-milliradian on every Cartesian motion in
-#: that suite), while still bounding :math:`\dot q` at the 0.011 of a genuine
+#: (measured: sub-millimetre and sub-milliradian on every Cartesian motion
+#: exercised), while still bounding :math:`\dot q` at the 0.011 of a genuine
 #: singularity -- which a Cartesian ``Move`` is refused from anyway, but which a
 #: motion can still wander towards after it has started.
 DAMPING = 0.05
 
 #: Proportional gain on the *translational* pose error, in 1/s -- a 25 ms
 #: closed-loop time constant. Fast enough that the correction never accumulates
-#: (the measured error stays at ~1e-4 m through the suite's Cartesian motions),
+#: (the measured error stays at ~1e-4 m through ordinary Cartesian motions),
 #: slow enough to sit two orders of magnitude below the 1 kHz command rate, so
 #: it cannot interact with the arrival beat the way a near-deadbeat gain would.
 TRANSLATION_GAIN = 40.0
@@ -181,9 +182,9 @@ def resolved_rate(
 
     The result is deliberately **not** clamped to the joint velocity envelope.
     Driving the arm through that envelope is a real thing a Cartesian command
-    can ask for -- Franka's own
-    ``CartesianMotionGeneratorJointPositionLimitsViolationHardware`` asks for
-    exactly it, and hardware answers ``joint_velocity_violation`` -- so clamping
+    can ask for -- a Cartesian motion generator driven towards the joint
+    position limits does exactly that, and hardware answers
+    ``joint_velocity_violation`` -- so clamping
     here would hide the error the robot is supposed to raise. The bound that
     does apply is physical: the servo's torque is clipped to
     :data:`franka_sim.sim_common.FR3_FORCE_LIMITS`, as it is in every other

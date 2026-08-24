@@ -7,8 +7,8 @@ from fakes import FakeDuoEntity
 
 from franka_sim import run_server
 from franka_sim.franka_protocol import COMMAND_PORT
-from franka_sim.mobile_duo_runner import MobileDuoRunner, parse_bind_specs
-from franka_sim.mobile_duo_sim import ROLE_BASE, ROLE_LEFT, ROLE_RIGHT, MobileDuoScene
+from franka_sim.mobile.runner import MobileDuoRunner, parse_bind_specs
+from franka_sim.mobile.duo_sim import ROLE_BASE, ROLE_LEFT, ROLE_RIGHT, MobileDuoScene
 
 LOOPBACK = {ROLE_LEFT: "127.0.0.11", ROLE_RIGHT: "127.0.0.12", ROLE_BASE: "127.0.0.10"}
 
@@ -89,8 +89,8 @@ def test_runner_disables_the_fci_gripper_server(bound_scene):
 def test_runner_attaches_each_server_to_its_own_view(bound_scene):
     runner = MobileDuoRunner(bound_scene, LOOPBACK)
     for role, server in runner.servers.items():
-        assert server.genesis_sim.role == role
-        assert server.genesis_sim.scene is bound_scene
+        assert server.physics_sim.role == role
+        assert server.physics_sim.scene is bound_scene
 
 
 def test_runner_honours_a_custom_port(bound_scene):
@@ -220,7 +220,7 @@ class StubSpineServer:
     """Stands in for SpineStubServer: exposes .model, .start() and .stop()."""
 
     def __init__(self, position_m=0.0):
-        from franka_sim.spine_stub import SpineModel
+        from franka_sim.mobile.spine_stub import SpineModel
 
         self.model = SpineModel(position_m=position_m)
         self.port = 4430
@@ -336,7 +336,7 @@ def test_stop_isolates_a_failing_bridge_and_still_stops_the_scene(bound_scene, c
     scene_stop_calls = []
     bound_scene.stop = lambda: scene_stop_calls.append(True)
 
-    with caplog.at_level("ERROR", logger="franka_sim.mobile_duo_runner"):
+    with caplog.at_level("ERROR", logger="franka_sim.mobile.runner"):
         runner.stop()
 
     assert exploding.stopped is True
@@ -351,7 +351,7 @@ def test_stop_isolates_a_failing_spine_stub_and_still_stops_the_scene(bound_scen
 
     class ExplodingSpine:
         def __init__(self):
-            from franka_sim.spine_stub import SpineModel
+            from franka_sim.mobile.spine_stub import SpineModel
 
             self.model = SpineModel()
             self.stopped = False
@@ -374,7 +374,7 @@ def test_stop_isolates_a_failing_spine_stub_and_still_stops_the_scene(bound_scen
     scene_stop_calls = []
     bound_scene.stop = lambda: scene_stop_calls.append(True)
 
-    with caplog.at_level("ERROR", logger="franka_sim.mobile_duo_runner"):
+    with caplog.at_level("ERROR", logger="franka_sim.mobile.runner"):
         runner.stop()
 
     assert spine.stopped is True

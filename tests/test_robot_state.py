@@ -125,10 +125,10 @@ def test_theta_and_dtheta_report_the_measured_joint_state():
 
     Regression: they were left at their zero initialiser and never written, so
     every published state claimed the motors sat at 0 rad no matter where the
-    arm was. Franka's smoke-test external controller closes its PD loop on
-    theta (``test/smoke/src/smoke_common.cpp:272-276``), so a zero theta turned
+    arm was. An external torque controller closes its PD loop on
+    theta, so a zero theta turned
     ``k_p * (q_d - theta)`` into k_p times the whole joint angle and every
-    ``*ExternalController*`` motion aborted with ``tau_J_range_violation``.
+    external-controller motion aborted with ``tau_J_range_violation``.
     """
     state = RobotState()
     state.state["q"] = [0.1, 0.2, 0.3, -2.0, 0.5, 2.2, 0.7]

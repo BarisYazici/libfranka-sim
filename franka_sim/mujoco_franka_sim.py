@@ -1,7 +1,7 @@
 """MuJoCo backend for the single-arm FCI simulator (the default physics engine).
 
 Drop-in replacement for :class:`~franka_sim.franka_genesis_sim.FrankaGenesisSim`:
-``FrankaSimServer`` and :class:`~franka_sim.gripper_physics.GenesisFrankaHand`
+``FrankaSimServer`` and :class:`~franka_sim.gripper.physics.FrankaHandPhysics`
 call exactly the same methods on it, so nothing above the simulator changes when
 the engine does. Only the physics differs -- Genesis' per-call kernel-launch
 overhead forced the arm to a 2.5 ms step to hold real time, while MuJoCo's
@@ -529,8 +529,9 @@ class MujocoFrankaSim:
         What it changes is where :meth:`_read_and_publish_state` measures the
         arm's Cartesian velocity. The default identity measures at the flange;
         a client that mounts a tool 0.5 m out is measured 0.5 m out, and the
-        lever arm is real -- which is exactly the difference Franka's
-        ``CartesianVelocityViolationHardware`` is built to detect (see
+        lever arm is real -- which is exactly the difference that separates
+        ``cartesian_velocity_violation`` from ``joint_velocity_violation`` on
+        hardware (see
         :meth:`franka_sim.motion_limits.MotionLimitChecker.check_measured_cartesian_velocity`).
 
         Lock-free (see :meth:`update_torques`): a fresh array is bound in one

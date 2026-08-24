@@ -1,4 +1,4 @@
-"""Integration smoke test: a real libfranka_new ``franka::Gripper`` vs the sim.
+"""Integration test: a real libfranka_new ``franka::Gripper`` vs the sim.
 
 Compiles a tiny C++ probe linked against the prebuilt libfranka_new and points
 it at the kinematic gripper server. Skipped unless a prebuilt libfranka_new, a
@@ -30,7 +30,7 @@ def _prereqs_available():
 
 pytestmark = pytest.mark.skipif(
     not _prereqs_available(),
-    reason="prebuilt libfranka_new + g++ + eigen3 are required for the gripper smoke test",
+    reason="prebuilt libfranka_new + g++ + eigen3 are required for the gripper client test",
 )
 
 

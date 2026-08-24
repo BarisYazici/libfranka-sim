@@ -7,7 +7,7 @@ import pytest
 from franka_sim.franka_protocol import COMMAND_PORT, Command, ConnectStatus, MessageHeader
 
 
-def test_successful_handshake(tcp_client, sim_server, mock_genesis_sim):
+def test_successful_handshake(tcp_client, sim_server, mock_physics_sim):
     """Test successful handshake between client and server"""
     # Connect to server
     tcp_client.connect(("localhost", COMMAND_PORT))
@@ -45,11 +45,11 @@ def test_successful_handshake(tcp_client, sim_server, mock_genesis_sim):
     time.sleep(0.1)
 
     # Verify mock simulator was used
-    mock_genesis_sim.get_robot_state.assert_called()
+    mock_physics_sim.get_robot_state.assert_called()
 
 
 @pytest.mark.skip(reason="Version check feature disabled")
-def test_incompatible_version(tcp_client, sim_server, mock_genesis_sim):
+def test_incompatible_version(tcp_client, sim_server, mock_physics_sim):
     """Test handshake with incompatible version"""
     # Connect to server
     tcp_client.connect(("localhost", COMMAND_PORT))
@@ -78,7 +78,7 @@ def test_incompatible_version(tcp_client, sim_server, mock_genesis_sim):
         tcp_client.recv(1)
 
 
-def test_invalid_command(tcp_client, sim_server, mock_genesis_sim):
+def test_invalid_command(tcp_client, sim_server, mock_physics_sim):
     """Test sending invalid command during handshake"""
     # Connect to server
     tcp_client.connect(("localhost", COMMAND_PORT))
@@ -97,7 +97,7 @@ def test_invalid_command(tcp_client, sim_server, mock_genesis_sim):
     assert tcp_client.recv(1) == b""
 
 
-def test_malformed_payload(tcp_client, sim_server, mock_genesis_sim):
+def test_malformed_payload(tcp_client, sim_server, mock_physics_sim):
     """Test handshake with malformed payload"""
     # Connect to server
     tcp_client.connect(("localhost", COMMAND_PORT))

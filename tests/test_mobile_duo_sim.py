@@ -19,7 +19,7 @@ from franka_sim.franka_genesis_sim import (
     resolve_fr3_joint_damping,
     resolve_gs_backend,
 )
-from franka_sim.mobile_duo_sim import (
+from franka_sim.mobile.duo_sim import (
     ARM_EE_LINKS,
     ARM_INITIAL_Q,
     ARM_JOINT_NAMES,
@@ -35,7 +35,7 @@ from franka_sim.mobile_duo_sim import (
     SceneView,
     pose_to_column_major,
 )
-from franka_sim.swerve_base import TMR_JOINT_ORDER, TMR_WHEEL_RADIUS
+from franka_sim.mobile.swerve_base import TMR_JOINT_ORDER, TMR_WHEEL_RADIUS
 
 
 @pytest.fixture
@@ -250,8 +250,8 @@ def test_initialize_simulation_arms_the_spine_hold(tmp_path, monkeypatch):
     fake_gs, _ = _fake_gs(robot_entity=duo_entity)
 
     duo = MobileDuoScene(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
 
     duo.initialize_simulation()
 
@@ -329,8 +329,8 @@ def test_repeated_misrouted_twists_log_once(scene, caplog):
     """
     view = scene.view(ROLE_LEFT)
     # SceneView (and the logger it warns through) now lives in
-    # mobile_duo_common, re-exported into mobile_duo_sim for backward compat.
-    with caplog.at_level("WARNING", logger="franka_sim.mobile_duo_common"):
+    # franka_sim.mobile.common, re-exported into franka_sim.mobile.duo_sim.
+    with caplog.at_level("WARNING", logger="franka_sim.mobile.common"):
         for _ in range(50):
             view.update_base_twist([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     assert len(caplog.records) == 1
@@ -390,8 +390,8 @@ def test_initialize_simulation_unlinks_the_resolved_urdf_when_build_raises(tmp_p
     fake_scene.build = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
 
     duo = MobileDuoScene(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
 
     with pytest.raises(RuntimeError, match="boom"):
         duo.initialize_simulation()
@@ -402,7 +402,7 @@ def test_initialize_simulation_unlinks_the_resolved_urdf_when_build_raises(tmp_p
 
 # --- arm joint damping (FR3_JOINT_DAMPING) ----------------------------------
 #
-# mobile_duo_sim shares franka_genesis_sim.resolve_fr3_joint_damping with the
+# franka_sim.mobile.duo_sim shares franka_genesis_sim.resolve_fr3_joint_damping with the
 # single-arm sim, so both the pure-function contract and its wiring into both
 # arms of the duo scene are covered here.
 
@@ -461,8 +461,8 @@ def test_initialize_simulation_applies_default_damping_to_both_arms(tmp_path, mo
     fake_gs, _ = _fake_gs(robot_entity=duo_entity)
 
     duo = MobileDuoScene(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
     monkeypatch.delenv("FR3_JOINT_DAMPING", raising=False)
 
     duo.initialize_simulation()
@@ -487,8 +487,8 @@ def test_initialize_simulation_applies_env_override_identically_to_both_arms(tmp
     fake_gs, _ = _fake_gs(robot_entity=duo_entity)
 
     duo = MobileDuoScene(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
     monkeypatch.setenv("FR3_JOINT_DAMPING", "1.5")
 
     duo.initialize_simulation()
@@ -508,8 +508,8 @@ def test_initialize_simulation_propagates_malformed_damping_env(tmp_path, monkey
     fake_gs, _ = _fake_gs(robot_entity=duo_entity)
 
     duo = MobileDuoScene(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
     monkeypatch.setenv("FR3_JOINT_DAMPING", "1,2,3")
 
     with pytest.raises(ValueError, match="1 \\(scalar\\) or 7 comma-separated"):
@@ -532,7 +532,7 @@ def test_initialize_simulation_propagates_malformed_damping_env(tmp_path, monkey
 # Each call site passes resolve_gs_backend its *own* bound ``gs``
 # (``resolve_gs_backend(gs)``) rather than relying on
 # franka_genesis_sim's -- test_mobile_duo_physics.py's real-Genesis fixture
-# rebinds only ``mobile_duo_sim.gs`` (conftest.py otherwise stubs ``gs``
+# rebinds only ``franka_sim.mobile.duo_sim.gs`` (conftest.py otherwise stubs ``gs``
 # process-wide with a MagicMock), and resolving the backend attribute off
 # a *different* module's ``gs`` mixed a stub sentinel into a real
 # gs.init() call. The regression test below pins that down.
@@ -618,8 +618,8 @@ def test_initialize_simulation_initializes_genesis_with_the_resolved_backend(tmp
     fake_gs.init = fake_init
 
     duo = MobileDuoScene(urdf_path, enable_vis=False)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", fake_gs)
-    monkeypatch.setattr("franka_sim.mobile_duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.gs", fake_gs)
+    monkeypatch.setattr("franka_sim.mobile.duo_sim.resolve_urdf_meshes", lambda *a, **kw: resolved)
     monkeypatch.setenv("FRANKA_SIM_BACKEND", "gpu")
 
     duo.initialize_simulation()

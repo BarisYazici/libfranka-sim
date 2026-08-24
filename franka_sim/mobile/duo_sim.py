@@ -16,8 +16,8 @@ MuJoCo backend must agree on too -- and :class:`SceneView` itself live in
 below so every existing ``from franka_sim.mobile.duo_sim import X`` keeps
 working. This module imports ``genesis`` at module level, so it is *not* safe
 for a genesis-free install -- only the MuJoCo backend and the runner need to
-avoid that, and they import the shared names from ``mobile_duo_common``
-directly instead of from here.
+avoid that, and they import the shared names from
+:mod:`franka_sim.mobile.common` directly instead of from here.
 """
 
 import logging
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 #: Re-exported so every existing ``from franka_sim.mobile.duo_sim import X``
 #: keeps working now that the engine-agnostic names live in
-#: ``mobile_duo_common`` (see the module docstring).
+#: :mod:`franka_sim.mobile.common` (see the module docstring).
 __all__ = [
     "ROLE_LEFT",
     "ROLE_RIGHT",
