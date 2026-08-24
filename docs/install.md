@@ -191,6 +191,11 @@ run-franka-sim-server --mobile-duo -v \
     host address — if you skipped an `ip addr add`, two bridges collide on
     `127.0.0.1`.
 
+    This failure is deliberate and immediate: the server claims its port before
+    physics initialization and refuses to share it, because two servers on one
+    port would silently split incoming clients between them. Stop the other
+    server (or pick another port) and start again.
+
 ??? failure "The client connects but times out waiting for state"
 
     Check the libfranka version. franka-sim answers `Connect` with
