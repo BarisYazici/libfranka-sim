@@ -24,6 +24,31 @@ BASE_TWIST = [0.25, -0.1, 0.0, 0.0, 0.0, 0.4]
 #: test that outlives it has hit a bug, not a slow box.
 TCP_DEADLINE_S = 5.0
 
+#: Deadline for waiting on something the server must eventually do on one of its
+#: own threads -- a datagram dispatched into the simulator, a commanded field
+#: echoed back. Generous rather than tight on purpose: the wait returns the
+#: instant the observable appears, so a fast machine never pays it, and only a
+#: genuine hang pays it in full. A tight bound is paid instead by a *loaded*
+#: machine that was going to get there a moment later, which is a false failure.
+COMMAND_DEADLINE_S = 10.0
+
+#: How long an *absence* is given to disprove itself, where there is no positive
+#: observable to wait for instead. A poll cannot help here -- nothing ever
+#: becomes true -- so this is a genuine window rather than a guess at latency,
+#: and every caller that has a positive observable waits on that first, which
+#: makes this the settling time on top of a datagram known to be processed.
+ABSENCE_WINDOW_S = 0.2
+
+
+def wait_until(predicate, timeout=COMMAND_DEADLINE_S, poll_interval=0.005):
+    """Poll ``predicate`` until it holds; True if it did, False at the deadline."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll_interval)
+    return predicate()
+
 
 def recv_exactly(sock, size, deadline):
     """Read exactly ``size`` bytes before ``deadline``, or fail the test.
@@ -118,7 +143,7 @@ def pack_robot_command(message_id=1, o_dp_ee_c=None, tau_j_d=None, motion_finish
     return message
 
 
-def wait_for_udp_socket(server, timeout=2.0, poll_interval=0.01):
+def wait_for_udp_socket(server, timeout=COMMAND_DEADLINE_S, poll_interval=0.01):
     """Block until ``server.udp_socket`` exists *and* is bound to a real port.
 
     It is created on the broadcast thread, and -- since nothing in this
@@ -142,11 +167,24 @@ def wait_for_udp_socket(server, timeout=2.0, poll_interval=0.01):
 
 
 def send_robot_command(udp_client, server, **kwargs):
+    """Put one UDP RobotCommand on the wire; callers wait on their own observable.
+
+    This used to end in a bare ``time.sleep(0.2)`` and let callers assert
+    immediately afterwards, which is a guess about how fast the machine is: a
+    datagram's whole journey -- poll, decode, dispatch into the simulator, echo
+    into the commanded state fields -- happens on the server's threads, and on a
+    loaded two-core runner it can outlast the sleep, failing the assertion on a
+    sim that did nothing wrong.
+
+    Waiting for the observable instead is immune to that, and is the stronger
+    statement in the bargain: an *absence* check that follows a positive wait
+    knows the datagram was processed before it concludes that nothing happened,
+    where a sleep only knew that some time had passed.
+    """
     wait_for_udp_socket(server)
     udp_client.sendto(
         pack_robot_command(**kwargs), ("localhost", server.udp_socket.getsockname()[1])
     )
-    time.sleep(0.2)
 
 
 def test_move_with_cartesian_velocity_selects_steering_drive(
@@ -166,11 +204,15 @@ def test_cartesian_velocity_command_reaches_the_base(
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
     send_robot_command(udp_client, base_sim_server, o_dp_ee_c=BASE_TWIST)
 
-    # assert_any_call, not assert_called_with: this client sends one datagram
-    # and then goes quiet, so twenty cycles later the communication-constraints
-    # emulation ramps the commanded twist to a safe stop and the *last* call is
-    # a decelerating one. What this test is about is that the twist arrived.
-    mock_base_sim.update_base_twist.assert_any_call(BASE_TWIST)
+    # any call, not the last one: this client sends one datagram and then goes
+    # quiet, so twenty cycles later the communication-constraints emulation ramps
+    # the commanded twist to a safe stop and the *last* call is a decelerating
+    # one. What this test is about is that the twist arrived.
+    assert wait_until(
+        lambda: any(
+            call.args[0] == BASE_TWIST for call in mock_base_sim.update_base_twist.call_args_list
+        )
+    ), f"the twist never reached the base (calls: {mock_base_sim.update_base_twist.call_args_list})"
 
 
 def test_cartesian_velocity_is_echoed_in_the_reported_state(
@@ -190,7 +232,7 @@ def test_cartesian_velocity_is_echoed_in_the_reported_state(
 
     send_robot_command(udp_client, base_sim_server, o_dp_ee_c=BASE_TWIST)
 
-    assert echoed, "the twist never reached the base"
+    assert wait_until(lambda: bool(echoed)), "the twist never reached the base"
     assert echoed[0][0] == pytest.approx(BASE_TWIST)
     assert echoed[0][1] == pytest.approx(BASE_TWIST)
     assert state["motion_generator_mode"] == LibfrankaMotionGeneratorMode.kCartesianVelocity.value
@@ -202,9 +244,18 @@ def test_motion_finished_zeroes_the_base_twist(
     assert perform_handshake(tcp_client)
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
     send_robot_command(udp_client, base_sim_server, o_dp_ee_c=BASE_TWIST)
+    assert wait_until(
+        lambda: any(
+            call.args[0] == BASE_TWIST for call in mock_base_sim.update_base_twist.call_args_list
+        )
+    ), "the twist never reached the base, so the finish below proves nothing"
+
     send_robot_command(udp_client, base_sim_server, message_id=2, motion_finished=True)
 
-    mock_base_sim.update_base_twist.assert_called_with([0.0] * 6)
+    assert wait_until(
+        lambda: mock_base_sim.update_base_twist.call_args is not None
+        and mock_base_sim.update_base_twist.call_args.args[0] == [0.0] * 6
+    ), f"the finish never zeroed the twist (last: {mock_base_sim.update_base_twist.call_args})"
     mock_base_sim.update_joint_positions.assert_not_called()
 
 
@@ -215,6 +266,14 @@ def test_cartesian_velocity_is_ignored_by_an_arm_server(
     assert perform_handshake(tcp_client)
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
     send_robot_command(udp_client, sim_server, o_dp_ee_c=BASE_TWIST)
+
+    # Wait for proof the datagram was actually taken off the socket and
+    # dispatched (``_motion_has_commands`` is set for every control command the
+    # UDP thread accepts) before concluding the base was never touched -- an
+    # absence checked against a datagram that had not arrived yet proves
+    # nothing. Then a settling window on top, for the call that must not come.
+    assert wait_until(lambda: sim_server._motion_has_commands), "the twist datagram never arrived"
+    time.sleep(ABSENCE_WINDOW_S)
 
     mock_physics_sim.update_base_twist.assert_not_called()
     assert sim_server.control_mode is not ControlMode.STEERING_DRIVE
@@ -229,8 +288,10 @@ def test_torque_dispatch_is_unchanged_on_an_arm_server(
     torques = [1.0, -1.0, 1.0, -1.0, 0.5, -0.5, 0.5]
     send_robot_command(udp_client, sim_server, tau_j_d=torques)
 
+    assert wait_until(
+        lambda: np.allclose(sim_server.robot_state.state["tau_J_d"], torques)
+    ), "tau_J_d never echoed the commanded torques"
     assert sim_server.control_mode is ControlMode.TORQUE
-    assert np.allclose(sim_server.robot_state.state["tau_J_d"], torques)
 
 
 def test_arm_server_ignores_a_cartesian_velocity_move(tcp_client, sim_server, mock_physics_sim):
@@ -258,12 +319,63 @@ def test_external_controller_keeps_torque_even_with_a_cartesian_motion_generator
     torques = [2.0, -2.0, 2.0, -2.0, 1.0, -1.0, 1.0]
     send_robot_command(udp_client, base_sim_server, o_dp_ee_c=BASE_TWIST, tau_j_d=torques)
 
+    # The torque echo is this datagram's positive observable, so waiting for it
+    # is also what makes the twist's absence below a statement about a datagram
+    # that was definitely dispatched.
+    assert wait_until(
+        lambda: np.allclose(base_sim_server.robot_state.state["tau_J_d"], torques)
+    ), "tau_J_d never echoed the commanded torques"
     assert base_sim_server.control_mode is ControlMode.TORQUE
-    assert np.allclose(base_sim_server.robot_state.state["tau_J_d"], torques)
     mock_base_sim.update_base_twist.assert_not_called()
 
 
 # --- motion-finished hold-log latch (mobile path) ---------------------------
+
+
+@pytest.fixture
+def base_server(mock_base_sim):
+    """An unstarted mobile-base server: no listener, no accept loop, no sessions.
+
+    The same shape as :func:`_arm_server` below and for the same reason -- the
+    tests here drive ``_switch_to_hold_position`` and ``handle_move_command``
+    directly, in this thread, and never touch a socket, so a live server is not
+    setup but interference.
+
+    Concretely: ``base_sim_server`` runs a real accept loop, and the probe
+    connection ``conftest.wait_for_server`` opens and drops to detect the port
+    is answered has to be accepted and torn down by that loop, whenever it gets
+    round to it. Both halves of that teardown reach straight into the state
+    these tests count. ``reset_state`` (``server/lifecycle.py``) rearms
+    ``_mobile_hold_logged`` -- the very latch under test -- and clears
+    ``control_mode``/``_idle_hold``; ``_engage_idle_hold`` then calls
+    ``_switch_to_hold_position`` itself, which is the log site being counted.
+    On a quiet machine all of that finishes during fixture setup. On CI's loaded
+    two-core runner it landed inside the ``caplog`` window instead (the captured
+    log shows "New connection", "Robot state initialized", "Closing client
+    connection" and "Control session ended ... idle hold engaged" interleaved
+    through the test body), a rearm fell between two of the test's own hold
+    calls, and the count came out at three. Reproduced locally by opening one
+    bare connection mid-body: three, every time.
+
+    None of that is the sim misbehaving -- a session that ends after the control
+    mode has been set *should* engage the hold, and a new session *should* rearm
+    the latch. It is a second, uninvited session being counted alongside the
+    test's own. Removing the listener removes the second session, so the only
+    holds and the only rearms are the ones written down below.
+    """
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    return FrankaSimServer(
+        enable_vis=False,
+        physics_sim=mock_base_sim,
+        enable_gripper=False,
+        mobile_base=True,
+    )
+
+
+def _hold_log_count(caplog):
+    """How many "commanding zero base twist" lines have been logged so far."""
+    return sum(1 for record in caplog.records if "commanding zero base twist" in record.message)
 
 
 def _move_request(
@@ -287,39 +399,56 @@ def _move_request(
     return header, payload
 
 
-def test_repeated_motion_finished_holds_log_the_hold_once(base_sim_server, mock_base_sim, caplog):
+def test_repeated_motion_finished_holds_log_the_hold_once(base_server, mock_base_sim, caplog):
     """1 kHz hot path: libfranka's finishMotion burst calls this once per
     datagram, but the "commanding zero base twist" log must latch.
     """
     with caplog.at_level("INFO", logger="franka_sim.franka_sim_server"):
         for _ in range(5):
-            base_sim_server._switch_to_hold_position()
+            base_server._switch_to_hold_position()
 
-    hold_logs = [r for r in caplog.records if "commanding zero base twist" in r.message]
-    assert len(hold_logs) == 1
+    assert _hold_log_count(caplog) == 1
     # The actual hold command still goes out on every call -- only the log latches.
     assert mock_base_sim.update_base_twist.call_count == 5
 
 
-def test_a_new_move_rearms_the_hold_log_latch(base_sim_server, mock_base_sim, caplog):
-    header, payload = _move_request(command_id=42)
+def test_a_new_move_rearms_the_hold_log_latch(base_server, mock_base_sim, caplog):
+    """The latch is per hold-engaging session: one line each, rearmed by a Move.
+
+    Counted per session rather than as one total across the whole test, so what
+    is asserted is the property itself -- *exactly one* hold log per session
+    that engages a hold, however many holds that session commands -- rather than
+    an arithmetic total that quietly assumes nobody else on the box held the
+    base. Both halves have to hold: a latch that never rearmed would leave the
+    second session silent, and a latch that stopped latching would make either
+    session say it twice.
+    """
     client_socket = MagicMock()
 
     with caplog.at_level("INFO", logger="franka_sim.franka_sim_server"):
-        base_sim_server._switch_to_hold_position()
-        base_sim_server._switch_to_hold_position()
-        base_sim_server.handle_move_command(client_socket, header, payload)
-        base_sim_server._switch_to_hold_position()
+        # Session one: two holds, and the log must latch after the first.
+        base_server._switch_to_hold_position()
+        base_server._switch_to_hold_position()
+        first_session = _hold_log_count(caplog)
 
-    hold_logs = [r for r in caplog.records if "commanding zero base twist" in r.message]
-    assert len(hold_logs) == 2
+        # A new Move opens session two, which rearms the latch...
+        header, payload = _move_request(command_id=42)
+        base_server.handle_move_command(client_socket, header, payload)
+
+        # ...so this session gets its own line, and latches again after it.
+        base_server._switch_to_hold_position()
+        base_server._switch_to_hold_position()
+        second_session = _hold_log_count(caplog) - first_session
+
+    assert first_session == 1, "the hold log did not latch within one session"
+    assert second_session == 1, "a new Move did not rearm the hold log latch"
 
 
-def test_hold_position_keeps_the_simulator_mode_in_lockstep(base_sim_server, mock_base_sim):
+def test_hold_position_keeps_the_simulator_mode_in_lockstep(base_server, mock_base_sim):
     """Server and simulator must not disagree about control mode after a hold."""
-    base_sim_server._switch_to_hold_position()
+    base_server._switch_to_hold_position()
     mock_base_sim.set_control_mode.assert_called_with(ControlMode.STEERING_DRIVE)
-    assert base_sim_server.control_mode is ControlMode.STEERING_DRIVE
+    assert base_server.control_mode is ControlMode.STEERING_DRIVE
 
 
 # --- commanded Cartesian fields: O_T_EE_d / O_T_EE_c and the elbow ----------
@@ -526,25 +655,29 @@ def test_a_new_move_stops_echoing_the_previous_motions_pose():
     assert list(server.robot_state.state["O_T_EE_d"]) == pytest.approx(MEASURED_POSE)
 
 
-def test_the_base_role_publishes_no_commanded_pose_or_elbow(base_sim_server, mock_base_sim):
+def test_the_base_role_publishes_no_commanded_pose_or_elbow(base_server, mock_base_sim):
     """The mobile-duo base bridge is untouched by all of the above.
 
     Its commanded Cartesian fields are ``O_dP_EE_d``/``O_dP_EE_c`` (a twist),
     its ``O_T_EE`` is dead-reckoned from that twist, and its ``q`` is four
     swerve steer/drive joints with no elbow of any kind. Same role guard the
     rest of the commanded-field ownership uses.
+
+    On the socket-less server for the same reason as the hold-log tests: this
+    holds a reference to ``robot_state.state``, and a live accept loop's
+    ``reset_state`` would swap the object out from under it mid-test.
     """
     identity = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
-    state = base_sim_server.robot_state.state
+    state = base_server.robot_state.state
     state["O_T_EE_d"] = list(identity)
     state["O_T_EE_c"] = list(identity)
     state["elbow_d"] = [0.0, 0.0]
     state["elbow_c"] = [0.0, 0.0]
 
     sim_state = {"q": list(MEASURED_Q), "O_T_EE": list(MEASURED_POSE)}
-    base_sim_server._publish_commanded_pose(sim_state)
-    base_sim_server._publish_elbow(sim_state)
-    base_sim_server._echo_commanded_cartesian(_pose_command(COMMANDED_POSE, elbow=[0.42, -1.0]))
+    base_server._publish_commanded_pose(sim_state)
+    base_server._publish_elbow(sim_state)
+    base_server._echo_commanded_cartesian(_pose_command(COMMANDED_POSE, elbow=[0.42, -1.0]))
 
     assert list(state["O_T_EE_d"]) == pytest.approx(identity)
     assert list(state["O_T_EE_c"]) == pytest.approx(identity)
