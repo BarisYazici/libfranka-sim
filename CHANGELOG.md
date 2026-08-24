@@ -1,11 +1,11 @@
 # Changelog
 
 All notable changes to **franka-sim** are documented here. The format is based on
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project is pre-1.0,
-so per [Semantic Versioning](https://semver.org/) a minor (`0.x`) bump may include
-breaking changes — these are called out explicitly.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
+[Semantic Versioning](https://semver.org/): from 1.0.0 on, breaking changes only
+come with a major version bump.
 
-## [Unreleased]
+## [1.0.0] - 2026-08-24
 
 ### Changed
 
