@@ -52,7 +52,38 @@ def perform_handshake(tcp_client):
     return status == ConnectStatus.kSuccess
 
 
-def wait_for_udp_socket(sim_server, timeout=2.0, poll_interval=0.01):
+#: Deadline for every "wait until the server got there" poll in this file.
+#:
+#: Deliberately far larger than any of these transitions takes: they are all
+#: sub-millisecond on the server's own threads, and the wait returns the instant
+#: the observable appears, so a generous bound costs a fast machine nothing. It
+#: is only ever paid in full by a genuine hang -- which is a real failure worth
+#: fifteen seconds -- whereas a tight bound is paid by a *loaded* machine that
+#: was going to get there a moment later, which is a false failure worth twenty
+#: minutes of CI round-trip. Two shared cores under a parallel job is the case
+#: that has to work, not the case that has to be fast.
+STATE_TRANSITION_TIMEOUT = 15.0
+
+
+def wait_until(predicate, timeout=STATE_TRANSITION_TIMEOUT, poll_interval=0.005):
+    """Poll ``predicate`` until it holds; True if it did, False at the deadline.
+
+    The counterpart of :func:`wait_for_state_update` for observables that are
+    not fields of ``sim_server.robot_state.state`` -- what the simulator mock
+    was handed, say. Both exist so that no test in this file has to guess *how
+    long* the server needs: a fixed ``time.sleep`` before an assertion encodes
+    the speed of the machine it was written on, passes on a quiet laptop and
+    fails on a loaded two-core runner that had simply not got there yet.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll_interval)
+    return predicate()
+
+
+def wait_for_udp_socket(sim_server, timeout=STATE_TRANSITION_TIMEOUT, poll_interval=0.01):
     """Block until the broadcast thread's ``sim_server.udp_socket`` is usable.
 
     Two separate races, both on the broadcast thread:
@@ -132,7 +163,6 @@ def test_move_command(tcp_client, udp_client, sim_server, mock_physics_sim):
             state["motion_generator_mode"] == expected_libfranka_motion_mode.value
             and state["controller_mode"] == expected_libfranka_controller_mode.value
         ),
-        timeout=1.0,
     ), "Failed to receive expected state update"
 
     # No second Move response follows kMotionStarted: Move gets exactly one
@@ -271,7 +301,7 @@ def test_stop_move_command(tcp_client, udp_client, sim_server, mock_physics_sim)
 
     # Wait for move command to be processed
     assert wait_for_state_update(
-        sim_server, lambda state: state["robot_mode"] == RobotMode.kMove.value, timeout=1.0
+        sim_server, lambda state: state["robot_mode"] == RobotMode.kMove.value
     ), "Failed to enter move mode"
 
     # Send StopMove command
@@ -292,7 +322,7 @@ def test_stop_move_command(tcp_client, udp_client, sim_server, mock_physics_sim)
 
     # Wait for robot to enter idle mode
     assert wait_for_state_update(
-        sim_server, lambda state: state["robot_mode"] == RobotMode.kIdle.value, timeout=1.0
+        sim_server, lambda state: state["robot_mode"] == RobotMode.kIdle.value
     ), "Failed to enter idle mode after stop"
 
     # Second response should be Move (to break the waiting loop)
@@ -552,7 +582,6 @@ def test_robot_state_updates(tcp_client, udp_client, sim_server, mock_physics_si
         lambda state: np.allclose(state["q"], test_state["q"])
         and np.allclose(state["dq"], test_state["dq"])
         and np.allclose(state["tau_J"], test_state["tau_J"]),
-        timeout=1.0,
     ), "Failed to receive expected robot state"
 
     # Verify that the simulator was called to get state
@@ -610,11 +639,10 @@ def test_position_control_desired_states(tcp_client, udp_client, sim_server, moc
 
     udp_client.sendto(command_msg, ("localhost", sim_server.udp_socket.getsockname()[1]))
 
-    # Wait for state update
-    time.sleep(0.1)
-
     # Verify that q_d was updated to match commanded positions
-    assert np.allclose(sim_server.robot_state.state["q_d"], desired_positions)
+    assert wait_until(
+        lambda: np.allclose(sim_server.robot_state.state["q_d"], desired_positions)
+    ), "q_d never echoed the commanded joint positions"
 
 
 def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, mock_physics_sim):
@@ -669,11 +697,8 @@ def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, moc
 
     udp_client.sendto(command_msg, ("localhost", sim_server.udp_socket.getsockname()[1]))
 
-    # Wait for state update
-    time.sleep(0.1)
-
     # Verify that dq_d was updated to match commanded velocities
-    assert reported, "the velocity command never reached the simulator"
+    assert wait_until(lambda: bool(reported)), "the velocity command never reached the simulator"
     assert np.allclose(reported[0], desired_velocities)
 
 
@@ -720,18 +745,28 @@ def test_torque_control_desired_states(tcp_client, udp_client, sim_server, mock_
 
     udp_client.sendto(command_msg, ("localhost", sim_server.udp_socket.getsockname()[1]))
 
-    # Wait for state update
-    time.sleep(0.1)
-
     # Verify that tau_J_d was updated to match commanded torques
-    assert np.allclose(sim_server.robot_state.state["tau_J_d"], desired_torques)
+    assert wait_until(
+        lambda: np.allclose(sim_server.robot_state.state["tau_J_d"], desired_torques)
+    ), "tau_J_d never echoed the commanded torques"
 
 
 def test_initial_desired_states(tcp_client, udp_client, sim_server, mock_physics_sim):
-    """Test that desired states are correctly initialized"""
-    assert perform_handshake(tcp_client)
+    """Test that desired states are correctly initialized
 
-    # Set up initial robot state
+    The arm's position has to be in place *before* the handshake. The broadcast
+    loop seeds ``q_d`` from ``sim_state["q"]`` on its very first iteration and
+    never again (``first_state_sent`` in ``server/state_stream.py``), and that
+    loop is started by the connect handshake -- so a test that connects first
+    and sets the simulator's position afterwards is racing the publish thread
+    for the seed. Losing that race does not merely delay the assertion, it
+    decides it: ``q_d`` is seeded from the *old* value and stays there for the
+    rest of the session, so no amount of extra waiting can rescue it. That is
+    what CI's two-core runner hit -- ``q_d`` reported as all zeros against a
+    ``q`` of 0.1..0.7 -- and it is a property of the ordering, not of the clock,
+    so the ordering is what is fixed here.
+    """
+    # Set up initial robot state -- before connecting; see the docstring.
     initial_state = {
         "q": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]),
         "dq": np.zeros(7),
@@ -739,8 +774,12 @@ def test_initial_desired_states(tcp_client, udp_client, sim_server, mock_physics
     }
     mock_physics_sim.get_robot_state.return_value = initial_state
 
-    # Wait for first state update
-    time.sleep(0.1)
+    assert perform_handshake(tcp_client)
+
+    # Wait for the first state to actually go out: the seeding happens on the
+    # iteration that sends it, so states_sent > 0 is exactly "q_d has been
+    # initialised", with no guess about how long that took.
+    wait_for_udp_socket(sim_server)
 
     # Verify that q_d was initialized to match current positions
     assert np.allclose(sim_server.robot_state.state["q_d"], initial_state["q"])
@@ -924,16 +963,27 @@ def test_automatic_error_recovery_reply_waits_for_the_arm_to_settle(
     """
     assert perform_handshake(tcp_client)
 
-    settle_at = time.monotonic() + 0.1
     moving = {"q": np.zeros(7), "dq": np.array([2.6, 0.0, 0, 0, 0, 0, 0]), "tau_J": np.zeros(7)}
     settled = {"q": np.zeros(7), "dq": np.zeros(7), "tau_J": np.zeros(7)}
-    mock_physics_sim.get_robot_state.side_effect = (
-        lambda: settled if time.monotonic() >= settle_at else moving
-    )
+    settle_at = None  # armed below, once the warm-up is out of the way
+
+    def arm_state():
+        return settled if settle_at is not None and time.monotonic() >= settle_at else moving
+
+    mock_physics_sim.get_robot_state.side_effect = arm_state
 
     # Give the publish loop a moment to have observed the "still moving" state
     # at least once before recovery is requested.
     time.sleep(0.02)
+
+    # Arm the settle clock *after* that warm-up rather than before it. Started
+    # before, the 0.1 s the assertion below relies on is measured from a moment
+    # that includes however long the sleep and the scheduler actually took: on a
+    # loaded runner the arm can already have "settled" by the time the request
+    # goes out, and a reply that was never deferred at all still passes. Armed
+    # here, the arm is guaranteed to still be moving when recovery is asked for,
+    # which is the situation the test exists to describe.
+    settle_at = time.monotonic() + 0.1
 
     command_id = 1
     header = MessageHeader(Command.kAutomaticErrorRecovery, command_id, 12)
@@ -1199,7 +1249,23 @@ def test_no_command_hangs(command, tcp_client, udp_client, sim_server, mock_phys
 
 
 def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_physics_sim):
-    """Test handling of motion_generation_finished flag"""
+    """Test handling of motion_generation_finished flag
+
+    The finish datagram echoes the newest published ``message_id``, the way a
+    conforming client does (``Robot::Impl::sendRobotCommand`` stamps every
+    command with the id of the last state it accepted). It used to be hardcoded
+    to 1, which quietly depended on the ``Move`` being accepted while state 1
+    was still the current one: ``_finish_motion`` discards a finish that echoes
+    a state *older* than the one its motion started at (``_motion_epoch_id``),
+    which is the guard that stops a previous motion's trailing finish burst from
+    ending its successor. One extra millisecond between the handshake and the
+    ``Move`` -- routine on a loaded two-core runner -- put the epoch at 2, and
+    the server correctly ignored the datagram ("Ignoring a motion-finished
+    datagram from a motion that is already over (echoed id 1, motion started at
+    2)"), leaving the motion running and this test waiting for an idle that was
+    never coming. The freshness rule itself is pinned in test_comm_constraints;
+    what this test is about is what a *valid* finish does.
+    """
     assert perform_handshake(tcp_client)
 
     # First send a Move command
@@ -1226,12 +1292,15 @@ def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_phy
 
     # Wait for move command to be processed
     assert wait_for_state_update(
-        sim_server, lambda state: state["robot_mode"] == RobotMode.kMove.value, timeout=1.0
+        sim_server, lambda state: state["robot_mode"] == RobotMode.kMove.value
     ), "Failed to enter move mode"
     wait_for_udp_socket(sim_server)
 
-    # Send a command with motion_generation_finished=True
-    command_msg = struct.pack("<Q", 1)  # message_id
+    # Send a command with motion_generation_finished=True, echoing the newest
+    # published state -- read after the kMove wait above, so it cannot predate
+    # the motion's epoch however slowly the Move was accepted. See the
+    # docstring.
+    command_msg = struct.pack("<Q", sim_server.robot_state.state["message_id"])  # message_id
     command_msg += struct.pack("<7d", *([0.0] * 7))  # q_c
     command_msg += struct.pack("<7d", *([0.0] * 7))  # dq_c
     command_msg += struct.pack("<16d", *([0.0] * 16))  # O_T_EE_c
@@ -1246,7 +1315,7 @@ def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_phy
 
     # Wait for robot to enter idle mode
     assert wait_for_state_update(
-        sim_server, lambda state: state["robot_mode"] == RobotMode.kIdle.value, timeout=1.0
+        sim_server, lambda state: state["robot_mode"] == RobotMode.kIdle.value
     ), "Failed to enter idle mode after motion finished"
 
     # Verify we receive the final Move success response
@@ -1260,21 +1329,23 @@ def test_motion_generation_finished(tcp_client, udp_client, sim_server, mock_phy
     assert status == MoveStatus.kSuccess.value
 
 
-def wait_for_state_update(sim_server, condition_fn, timeout=1.0, poll_interval=0.01):
+def wait_for_state_update(
+    sim_server, condition_fn, timeout=STATE_TRANSITION_TIMEOUT, poll_interval=0.005
+):
     """Helper function to wait for a specific state condition with timeout
 
     Args:
         sim_server: The FrankaSimServer instance
         condition_fn: Function that takes robot_state and returns True when condition is met
-        timeout: Maximum time to wait in seconds
+        timeout: Maximum time to wait in seconds; see STATE_TRANSITION_TIMEOUT for
+            why the default is generous rather than tight
         poll_interval: Time between checks in seconds
 
     Returns:
         True if condition was met within timeout, False otherwise
     """
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        if condition_fn(sim_server.robot_state.state):
-            return True
-        time.sleep(poll_interval)
-    return False
+    return wait_until(
+        lambda: condition_fn(sim_server.robot_state.state),
+        timeout=timeout,
+        poll_interval=poll_interval,
+    )
