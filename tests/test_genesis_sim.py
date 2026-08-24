@@ -1,6 +1,3 @@
-import os
-import time
-
 import genesis as gs
 import numpy as np
 import pytest
@@ -50,7 +47,6 @@ def genesis_sim():
                 material=gs.materials.Rigid(gravity_compensation=1.0),
             )
             sim.scene.build()
-            sim.model, sim.data = sim.load_panda_model()
             # FR3: 7-DOF, hand-less, joints fr3_joint1..7, EE link fr3_link7.
             sim.jnt_names = [f"fr3_joint{i}" for i in range(1, 8)]
             sim.dofs_idx = [sim.franka.get_joint(name).dof_idx_local for name in sim.jnt_names]

@@ -1,3 +1,10 @@
+"""Tests for the mobile-duo Genesis scene: state, control-mode, and view wiring.
+
+Uses a mocked/stubbed Genesis scene (see ``fakes.FakeDuoEntity``) rather than a
+real physics build, so it exercises the sim's dispatch logic in isolation --
+see tests/test_mobile_duo_physics.py for the real-Genesis physics assertions.
+"""
+
 import math
 import types
 from unittest.mock import Mock

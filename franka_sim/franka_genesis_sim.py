@@ -2,7 +2,6 @@ import argparse
 import logging
 import os
 import platform
-import sys
 import time
 from pathlib import Path
 
@@ -11,8 +10,6 @@ import numpy as np
 
 from franka_sim.control_modes import ControlMode
 from franka_sim.sim_common import DEFAULT_FR3_DAMPING, resolve_fr3_joint_damping
-
-# import pinocchio as pin
 
 logger = logging.getLogger(__name__)
 
@@ -170,13 +167,6 @@ class FrankaGenesisSim:
             self.xml_path = default_fr3_mjcf()
         logger.info(f"Using Genesis FR3 MJCF: {self.xml_path}")
 
-    def load_panda_model(self):
-        pass
-        # TODO: load pinocchio model
-        # model = pin.buildModelFromUrdf(str(self.urdf_path))
-        # data = model.createData()
-        # return model, data
-
     def initialize_simulation(self):
         # Initialize Genesis with the resolved backend (idempotent: ignore
         # "already initialized").
@@ -221,10 +211,6 @@ class FrankaGenesisSim:
 
         # Build scene
         self.scene.build()
-
-        # Load Pinocchio model
-        # TODO: load pinocchio model
-        # self.model, self.data = self.load_panda_model()
 
         # Joint names and indices (FR3, 7-DOF, hand-less -> no finger joints).
         self.jnt_names = [f"fr3_joint{i}" for i in range(1, 8)]

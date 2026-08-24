@@ -53,6 +53,7 @@ from franka_sim.motion_limits import (
     CARTESIAN_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION_INDEX,
     CARTESIAN_POSITION_MOTION_GENERATOR_INVALID_FRAME_INDEX,
     CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX,
+    CARTESIAN_VELOCITY_VIOLATION_INDEX,
     CONTROLLER_TORQUE_DISCONTINUITY_INDEX,
     DELTA_T,
     ENFORCE_ENV_VAR,
@@ -74,7 +75,9 @@ from franka_sim.motion_limits import (
     MAX_TRANSLATIONAL_ACCELERATION,
     MAX_TRANSLATIONAL_JERK,
     MAX_TRANSLATIONAL_VELOCITY,
+    MEASURED_CARTESIAN_VELOCITY_LIMIT,
     MEASURED_JOINT_VELOCITY_MARGIN,
+    SINGULAR_POSE_MIN_SINGULAR_VALUE,
     TAU_J_RANGE_VIOLATION_INDEX,
     START_CARTESIAN_POSE_ROTATION_TOLERANCE,
     START_CARTESIAN_POSE_TRANSLATION_TOLERANCE,
@@ -84,8 +87,10 @@ from franka_sim.motion_limits import (
     _Differentiator,
     enforcement_enabled_by_env,
     is_homogeneous_transformation,
+    is_singular_configuration,
     lower_joint_velocity_limits,
     rotation_log,
+    smallest_singular_value,
     upper_joint_velocity_limits,
 )
 from franka_sim.robot_state import _ROBOT_STATE_PACKER, RobotState
@@ -475,7 +480,7 @@ def test_a_commanded_velocity_over_the_cap_is_a_velocity_limits_violation():
 
 
 def test_a_velocity_step_is_an_acceleration_discontinuity():
-    """kMaxJointAcceleration on ``dq_c`` is named *acceleration*, not velocity.
+    """The kMaxJointAcceleration on ``dq_c`` is named *acceleration*, not velocity.
 
     The interface-relative rule. The same limit on ``q_c`` earns index 14; here
     the commanded channel is already a velocity, so its first difference is an
@@ -3640,6 +3645,17 @@ def client():
         made.close()
 
 
+def _wire(client_factory):
+    """A connected client that has *not* sent a Move yet.
+
+    For the tests that need to see how a ``Move`` is answered, rather than to
+    get past it; :func:`start_motion` asserts the answer is ``kMotionStarted``.
+    """
+    wire = client_factory()
+    wire.connect()
+    return wire
+
+
 def start_motion(client_factory, controller_mode, motion_mode, command_id=2):
     """Connect and get past the Move handshake, ready to stream commands."""
     wire = client_factory()
@@ -3881,8 +3897,7 @@ def test_a_cartesian_pose_motion_latches_no_joint_error(serve, client):
 
     The pose streamed here is ``mock_pose()``, which is exactly where the mocked
     arm's ``O_T_EE`` is (``MOCK_O_T_EE``), so the pose generator's own checks all
-    pass and the motion runs clean -- while the arm does not move, because there
-    is no physics branch behind the pose interface.
+    pass and the motion runs clean.
     """
     server = serve(enforce=True)
     wire = start_motion(client, ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
@@ -3905,8 +3920,19 @@ def test_a_cartesian_pose_motion_latches_no_joint_error(serve, client):
     assert not any(state[ERRORS_SLICE]), "a Cartesian pose motion latched a joint error"
     assert state[ROBOT_MODE_INDEX] == RobotMode.kMove
     assert server.motion_limits.violated is False
-    # Checked, but inert: the pose interface drives no physics at all.
-    assert server.control_mode is ControlMode.POSITION
+    # The pose interface drives the arm now (through differential IK), so the
+    # backend is in the Cartesian mode and is being handed the commanded pose --
+    # what must *not* happen is the joint branches claiming the datagram and
+    # servoing to its zero-filled q_c.
+    assert server.control_mode is ControlMode.CARTESIAN_POSE
+    assert server.genesis_sim.update_cartesian_pose.call_count > 0
+    # ...and the joint branch never saw a Cartesian datagram: its zero-filled
+    # q_c would show up here as an all-zeros joint target, which is both the
+    # original bug and a pose no FR3 can hold.
+    assert not any(
+        np.allclose(np.asarray(call.args[0], dtype=float), 0.0)
+        for call in server.genesis_sim.update_joint_positions.call_args_list
+    )
     assert server.genesis_sim.update_base_twist.call_count == 0
 
 
@@ -4118,6 +4144,284 @@ def test_the_safety_controller_reports_without_enforcement_but_does_not_abort(
     assert not any(state[ERRORS_SLICE])
     assert state[ROBOT_MODE_INDEX] == RobotMode.kMove
     assert server.motion_limits.violated is False
+
+
+# -- the safety controller's Cartesian half ----------------------------------
+#
+# ``cartesian_velocity_violation``: measured end-effector speed against the
+# published translational limit, in every control mode. See
+# MotionLimitChecker.check_measured_cartesian_velocity and the citation on
+# MEASURED_CARTESIAN_VELOCITY_LIMIT.
+
+
+def test_the_ee_speed_limit_is_the_published_translational_one():
+    """The limit is franka::kMaxTranslationalVelocity, not a number of our own."""
+    assert MEASURED_CARTESIAN_VELOCITY_LIMIT == MAX_TRANSLATIONAL_VELOCITY
+    assert MEASURED_CARTESIAN_VELOCITY_LIMIT == pytest.approx(3.0 - 1e-3)
+
+
+@pytest.mark.parametrize(
+    "speed, expected",
+    [
+        (0.5 * MEASURED_CARTESIAN_VELOCITY_LIMIT, False),
+        (MEASURED_CARTESIAN_VELOCITY_LIMIT - 1e-6, False),
+        (MEASURED_CARTESIAN_VELOCITY_LIMIT, False),  # at the limit is still legal
+        (MEASURED_CARTESIAN_VELOCITY_LIMIT + 1e-6, True),
+        (2.0 * MEASURED_CARTESIAN_VELOCITY_LIMIT, True),
+    ],
+)
+def test_the_ee_speed_check_fires_exactly_above_the_limit(speed, expected):
+    """No margin on this one: 3 m/s of EE travel is nowhere near a normal motion."""
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.VELOCITY, {"q": list(HOME), "dq": [0.0] * 7})
+    # Split across all three axes so the check is provably on the norm, not on
+    # any single component.
+    axis = np.array([2.0, -1.0, 2.0]) / 3.0
+    violation = checker.check_measured_cartesian_velocity(speed * axis)
+    assert (violation is not None) is expected
+    if expected:
+        assert violation.error_index == CARTESIAN_VELOCITY_VIOLATION_INDEX
+        assert violation.error_name == "cartesian_velocity_violation"
+        assert violation.value == pytest.approx(speed)
+        assert violation.unit == "m/s"
+
+
+def test_the_ee_speed_check_is_silent_without_a_reading():
+    """A backend that publishes no EE velocity switches the check off, not on."""
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.VELOCITY, {"q": list(HOME), "dq": [0.0] * 7})
+    assert checker.check_measured_cartesian_velocity(None) is None
+    assert checker.check_measured_cartesian_velocity([float("nan"), 0.0, 0.0]) is None
+
+
+def test_the_ee_speed_check_is_armed_in_torque_mode_too():
+    """Like its joint twin, it judges the arm -- so no motion generator is needed."""
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.TORQUE, {"q": list(HOME), "dq": [0.0] * 7})
+    over = MEASURED_CARTESIAN_VELOCITY_LIMIT + 1.0
+    assert checker.check_measured_cartesian_velocity([over, 0.0, 0.0]) is not None
+    # ...and disarmed once the motion is over, exactly as the joint one is.
+    checker.end_motion()
+    assert checker.check_measured_cartesian_velocity([over, 0.0, 0.0]) is None
+
+
+def test_enforced_the_safety_controller_aborts_on_measured_ee_speed(
+    serve, client, mock_arm_sim
+):
+    """cartesian_velocity_violation over the wire, and nothing else with it.
+
+    Franka's ``CartesianVelocityViolationHardware`` records the whole point: with
+    an EE 0.5 m out along the flange, the ramp crosses the *Cartesian* limit
+    first and hardware reports that error **alone** -- no
+    ``joint_velocity_violation`` beside it -- so the two halves of the safety
+    controller are ordered, not merely both present.
+    """
+    server = serve(enforce=True)
+    wire = start_motion(client, ControllerMode.kExternalController, MotionGeneratorMode.kNone)
+
+    mock_arm_sim.get_robot_state.return_value = {
+        "q": np.array(HOME),
+        "dq": np.zeros(7),  # the joints are inside their envelope
+        "tau_J": np.zeros(7),
+        "O_dP_EE": np.array([MEASURED_CARTESIAN_VELOCITY_LIMIT + 0.5, 0.0, 0.0]),
+    }
+
+    for _ in range(10):
+        wire.read_state()
+        wire.answer(tau_j_d=[0.0] * 7)
+    assert wire.read_move_response() == MoveStatus.kReflexAborted
+
+    state = wire.read_state()
+    assert state[ERRORS_SLICE][CARTESIAN_VELOCITY_VIOLATION_INDEX] == 1
+    assert state[REFLEX_REASON_SLICE][CARTESIAN_VELOCITY_VIOLATION_INDEX] == 1
+    assert sum(state[ERRORS_SLICE]) == 1
+    assert state[ROBOT_MODE_INDEX] == RobotMode.kReflex
+
+
+def test_enforced_the_ee_speed_check_outranks_the_joint_one(serve, client, mock_arm_sim):
+    """Both broken in the same cycle: the Cartesian error is the one that latches.
+
+    The precedence hardware records. Without it a motion that leaves both
+    envelopes at once would report ``joint_velocity_violation``, which is what
+    the sim did before the Cartesian check existed -- and what the hardware
+    suite says is the wrong answer for
+    ``CartesianVelocityViolationHardware``.
+    """
+    server = serve(enforce=True)
+    wire = start_motion(client, ControllerMode.kExternalController, MotionGeneratorMode.kNone)
+
+    over_joint = upper_joint_velocity_limits(HOME)[5] + 1.0
+    mock_arm_sim.get_robot_state.return_value = {
+        "q": np.array(HOME),
+        "dq": np.array(spread(over_joint, index=5)),
+        "tau_J": np.zeros(7),
+        "O_dP_EE": np.array([0.0, MEASURED_CARTESIAN_VELOCITY_LIMIT + 0.5, 0.0]),
+    }
+
+    for _ in range(10):
+        wire.read_state()
+        wire.answer(tau_j_d=[0.0] * 7)
+    assert wire.read_move_response() == MoveStatus.kReflexAborted
+
+    state = wire.read_state()
+    assert state[ERRORS_SLICE][CARTESIAN_VELOCITY_VIOLATION_INDEX] == 1
+    assert state[ERRORS_SLICE][JOINT_VELOCITY_VIOLATION_INDEX] == 0
+    assert sum(state[ERRORS_SLICE]) == 1
+    assert server.motion_limits.violated is True
+
+
+def test_a_joint_only_excursion_still_reports_the_joint_error(serve, client, mock_arm_sim):
+    """The other side of the precedence: a slow EE does not mask a fast joint.
+
+    The two hardware tests that must keep answering ``joint_velocity_violation``
+    (``JointVelocityViolation``,
+    ``JointMotionGeneratorVelocityLimitsViolationHardware``) both spin joint 6
+    while the end effector barely travels; this is that shape in miniature.
+    """
+    serve(enforce=True)
+    wire = start_motion(client, ControllerMode.kExternalController, MotionGeneratorMode.kNone)
+
+    over_joint = upper_joint_velocity_limits(HOME)[5] + 1.0
+    mock_arm_sim.get_robot_state.return_value = {
+        "q": np.array(HOME),
+        "dq": np.array(spread(over_joint, index=5)),
+        "tau_J": np.zeros(7),
+        "O_dP_EE": np.array([0.3, 0.0, 0.0]),  # a wrist spin moves the EE hardly at all
+    }
+
+    for _ in range(10):
+        wire.read_state()
+        wire.answer(tau_j_d=[0.0] * 7)
+    assert wire.read_move_response() == MoveStatus.kReflexAborted
+
+    state = wire.read_state()
+    assert state[ERRORS_SLICE][JOINT_VELOCITY_VIOLATION_INDEX] == 1
+    assert state[ERRORS_SLICE][CARTESIAN_VELOCITY_VIOLATION_INDEX] == 0
+
+
+# -- singular start poses -----------------------------------------------------
+
+
+def test_the_singularity_threshold_separates_franka_s_own_poses():
+    """The threshold sits between the suite's singular pose and its start poses.
+
+    The two numbers it has to keep apart, measured on the sim's own FR3 model
+    and quoted in SINGULAR_POSE_MIN_SINGULAR_VALUE: ``kSingularPose``
+    (sigma_min ~ 0.011) and the tightest pose a passing Cartesian test starts a
+    motion from (``kIkBugPose``, ~0.139).
+    """
+    assert 0.011 < SINGULAR_POSE_MIN_SINGULAR_VALUE < 0.139
+    # ...and with a comfortable factor on both sides, not by a hair.
+    assert SINGULAR_POSE_MIN_SINGULAR_VALUE > 4 * 0.011
+    assert SINGULAR_POSE_MIN_SINGULAR_VALUE < 0.139 / 2
+
+
+def test_is_singular_configuration_at_the_threshold_boundary():
+    """At or below the threshold is singular; above it is not."""
+    # A diagonal 6x6 Jacobian whose smallest singular value is exactly settable.
+    def jacobian(sigma_min):
+        return np.hstack((np.diag([1.0, 1.0, 1.0, 1.0, 1.0, sigma_min]), np.zeros((6, 1))))
+
+    threshold = SINGULAR_POSE_MIN_SINGULAR_VALUE
+    assert smallest_singular_value(jacobian(threshold)) == pytest.approx(threshold)
+    assert is_singular_configuration(jacobian(threshold * 0.5)) is True
+    assert is_singular_configuration(jacobian(threshold)) is True
+    assert is_singular_configuration(jacobian(threshold * 1.001)) is False
+    assert is_singular_configuration(jacobian(threshold * 10)) is False
+
+
+def test_a_missing_jacobian_is_not_a_singularity():
+    """A backend that cannot say is no grounds for refusing the client's Move."""
+    assert smallest_singular_value(None) is None
+    assert is_singular_configuration(None) is False
+    assert is_singular_configuration(np.full((6, 7), np.nan)) is False
+    assert is_singular_configuration(np.zeros((0, 0))) is False
+
+
+def _singular_jacobian():
+    """A 6x7 Jacobian whose smallest singular value is well under the threshold."""
+    jacobian = np.zeros((6, 7))
+    for row in range(5):
+        jacobian[row, row] = 1.0
+    jacobian[5, 5] = SINGULAR_POSE_MIN_SINGULAR_VALUE / 10.0
+    return jacobian
+
+
+def test_a_cartesian_move_at_a_singular_pose_is_rejected(serve, client, mock_arm_sim):
+    """Move::Status::kStartAtSingularPoseRejected, the terminal response.
+
+    libfranka forces the shape: ``executeCommand<Move>`` handles the *first*
+    response outside any try/catch, so a rejection delivered there escapes as a
+    bare ``CommandException``; only the mode-wait loop that follows converts one
+    into the ``ControlException`` Franka's ``CartesianMotionInSingularPose``
+    catches. So the acknowledgement comes first and the rejection second.
+    """
+    mock_arm_sim.get_robot_state.return_value = {
+        "q": np.array(HOME),
+        "dq": np.zeros(7),
+        "tau_J": np.zeros(7),
+        "O_T_EE": np.array(MOCK_O_T_EE),
+        "O_J_EE": _singular_jacobian(),
+    }
+    server = serve(enforce=True)
+    wire = _wire(client)
+
+    assert wire.move(
+        ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianPosition
+    ) == MoveStatus.kMotionStarted
+    # The generator modes never leave idle, which is what keeps the client in
+    # the loop that converts the rejection.
+    state = wire.read_state()
+    assert state[ROBOT_MODE_INDEX] != RobotMode.kMove
+    assert wire.read_move_response() == MoveStatus.kStartAtSingularPoseRejected
+    # A rejection is not a reflex: nothing is latched, so the next Move needs no
+    # error recovery.
+    assert not any(state[ERRORS_SLICE])
+    assert server.motion_limits.violated is False
+
+
+def test_a_joint_move_at_a_singular_pose_is_accepted(serve, client, mock_arm_sim):
+    """Only the Cartesian generators are refused.
+
+    Franka's own test *reaches* the singular configuration by joint motion
+    (``moveP2P`` to ``kSingularPose``), so a joint interface has to start there
+    -- and driving out of a singularity is the only way to leave one.
+    """
+    mock_arm_sim.get_robot_state.return_value = {
+        "q": np.array(HOME),
+        "dq": np.zeros(7),
+        "tau_J": np.zeros(7),
+        "O_T_EE": np.array(MOCK_O_T_EE),
+        "O_J_EE": _singular_jacobian(),
+    }
+    serve(enforce=True)
+    wire = start_motion(client, ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
+    state = wire.stream(5, q_c=list(HOME))
+    assert state[ROBOT_MODE_INDEX] == RobotMode.kMove
+    assert not any(state[ERRORS_SLICE])
+
+
+def test_a_cartesian_move_at_a_well_conditioned_pose_is_accepted(
+    serve, client, mock_arm_sim
+):
+    """The other side of the boundary: an ordinary configuration starts normally."""
+    jacobian = _singular_jacobian()
+    jacobian[5, 5] = SINGULAR_POSE_MIN_SINGULAR_VALUE * 10.0
+    mock_arm_sim.get_robot_state.return_value = {
+        "q": np.array(HOME),
+        "dq": np.zeros(7),
+        "tau_J": np.zeros(7),
+        "O_T_EE": np.array(MOCK_O_T_EE),
+        "O_J_EE": jacobian,
+    }
+    serve(enforce=True)
+    wire = _wire(client)
+    assert wire.move(
+        ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianPosition
+    ) == MoveStatus.kMotionStarted
+    state = wire.stream(5, o_t_ee_c=mock_pose())
+    assert state[ROBOT_MODE_INDEX] == RobotMode.kMove
+    assert not any(state[ERRORS_SLICE])
 
 
 def test_error_recovery_clears_the_violation_and_a_new_move_runs(serve, client):

@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| **Python** | 3.11 recommended. The package declares `>=3.8` and CI builds 3.9–3.11; 3.11 is what the project is developed and tested against day to day. |
+| **Python** | 3.11 recommended. The package declares `>=3.9` and CI builds 3.9–3.11; 3.11 is what the project is developed and tested against day to day. |
 | **OS** | Linux. The loopback-alias multi-robot pattern and the `--mobile-duo` scene assume Linux networking; macOS wheels are published but only the single-arm path is exercised there. |
 | **Physics** | MuJoCo (`>=3.2,<3.3`) is a core dependency — installed for you. Genesis is optional. |
 | **Robot model** | The FR3 model comes from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) via `robot_descriptions` and **downloads itself on first run** into `~/.cache/robot_descriptions/`. The first launch therefore needs network access; later launches do not. |

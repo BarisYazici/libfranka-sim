@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from franka_sim.comm_constraints import (
     COMMUNICATION_CONSTRAINTS_VIOLATION_INDEX,
@@ -42,9 +42,16 @@ from franka_sim.franka_protocol import (
     convert_to_libfranka_motion_mode,
 )
 from franka_sim.gripper_server import FrankaGripperServer
-from franka_sim.motion_limits import MotionLimitChecker
+from franka_sim.motion_limits import (
+    SINGULAR_POSE_MIN_SINGULAR_VALUE,
+    MotionLimitChecker,
+)
 from franka_sim.motion_limits import (
     enforcement_enabled_by_env as motion_limit_enforcement_enabled_by_env,
+)
+from franka_sim.motion_limits import (
+    smallest_singular_value,
+    transform_matrix,
 )
 from franka_sim.robot_state import RobotState
 
@@ -77,15 +84,19 @@ logger = logging.getLogger(__name__)
 #: pinned ``dq_d``/``ddq_d`` to zero on the bridge the teleop reads. See
 #: :attr:`FrankaSimServer._server_owned_state_fields`.
 #:
-#: ``O_T_EE_d``/``O_T_EE_c`` and ``elbow_d``/``elbow_c`` joined this set once
-#: the Cartesian pose/elbow interfaces became FCI-owned fields in their own
-#: right (see :meth:`FrankaSimServer._publish_commanded_pose` and
+#: ``O_T_EE_d``/``O_T_EE_c``, ``O_dP_EE_d``/``O_dP_EE_c`` and
+#: ``elbow_d``/``elbow_c`` joined this set once the Cartesian pose, twist and
+#: elbow interfaces became FCI-owned fields in their own right (see
+#: :meth:`FrankaSimServer._echo_commanded_cartesian`,
+#: :meth:`FrankaSimServer._publish_commanded_pose` and
 #: :meth:`FrankaSimServer._publish_elbow`), for the identical reason the joint
 #: fields are here: none of the physics backends' ``get_robot_state()``
 #: snapshots actually carry these keys today, so listing them changes nothing
 #: yet, but it keeps this set an honest statement of FCI ownership rather than
 #: one that happens to be accidentally correct only because no backend has
-#: caught up.
+#: caught up. (The mobile base takes none of this set -- there the swerve
+#: backend really is the only source for ``q_d``/``dq_d``/``ddq_d``, and the
+#: base's own twist echo is :meth:`FrankaSimServer._handle_cartesian_velocity`.)
 COMMANDED_STATE_FIELDS = (
     "q_d",
     "dq_d",
@@ -93,9 +104,32 @@ COMMANDED_STATE_FIELDS = (
     "tau_J_d",
     "O_T_EE_d",
     "O_T_EE_c",
+    "O_dP_EE_d",
+    "O_dP_EE_c",
     "elbow_d",
     "elbow_c",
 )
+
+#: Keys a physics backend publishes in its snapshot that are *not* RobotState
+#: wire fields: internal readings the FCI layer consumes and never broadcasts.
+#: Filtered out of the publish-path state update so ``robot_state.state`` stays
+#: exactly the set of fields ``pack_state`` knows about, on every role including
+#: the mobile base.
+#:
+#: ``O_dP_EE`` is the measured end-effector translational velocity the safety
+#: controller's Cartesian check reads (see
+#: :meth:`FrankaSimServer._run_safety_velocity_check`). libfranka's
+#: ``RobotState`` has no measured Cartesian velocity -- only the commanded
+#: ``O_dP_EE_d``/``O_dP_EE_c`` -- so there is nowhere on the wire for it to go.
+#:
+#: ``O_J_EE`` is the 6x7 EE Jacobian a ``Move`` conditions its start pose on
+#: (:meth:`FrankaSimServer._refuse_move_at_singular_pose`). libfranka computes
+#: its own from the model it downloads and the FCI never sends one, so it has no
+#: wire field either -- and unlike the rest of the snapshot it is a 2-D
+#: ``ndarray``, which the state dict's consumers (``pack_state``, the
+#: state-shaped copies :meth:`FrankaSimServer._publish_hold_setpoint` hands out)
+#: have no idea what to do with.
+INTERNAL_SIM_STATE_FIELDS = ("O_dP_EE", "O_J_EE")
 
 #: How long :meth:`FrankaSimServer.stop` waits for the gripper server's accept
 #: loop to notice its socket was closed. The wait is normally microseconds --
@@ -282,10 +316,14 @@ class FrankaSimServer:
         self.control_mode = ControlMode.NONE
         self.connection_running = False  # New flag for per-connection state
         self.mobile_base = mobile_base
-        #: Commanded fields the FCI layer owns on this role, i.e. the ones the
-        #: physics snapshot may not overwrite. Empty for the mobile base; see
-        #: :data:`COMMANDED_STATE_FIELDS`.
-        self._server_owned_state_fields = () if mobile_base else COMMANDED_STATE_FIELDS
+        #: Snapshot keys the publish path must not copy into ``robot_state``:
+        #: the commanded fields the FCI layer owns (none on the mobile base; see
+        #: :data:`COMMANDED_STATE_FIELDS`) plus the backend readings that are
+        #: not wire fields at all (:data:`INTERNAL_SIM_STATE_FIELDS`, on every
+        #: role).
+        self._server_owned_state_fields = INTERNAL_SIM_STATE_FIELDS + (
+            () if mobile_base else COMMANDED_STATE_FIELDS
+        )
         # Latch so the mobile "motion finished" hold log fires once per
         # transition, not once per datagram, for callers that drive
         # _switch_to_hold_position() directly rather than through the
@@ -353,16 +391,6 @@ class FrankaSimServer:
         #: previous motion; see :meth:`_finish_motion`.
         self._motion_epoch_id = 0
         self._motion_has_commands = False
-        #: Whether this motion has actually echoed a client-commanded pose /
-        #: elbow into ``O_T_EE_d``/``O_T_EE_c`` and ``elbow_d``/``elbow_c``.
-        #: Until the first such command the commanded Cartesian fields keep
-        #: tracking the measured pose, which is the internal controller's hold;
-        #: see :meth:`_publish_commanded_pose`. Cleared by every ``Move`` and by
-        #: :meth:`reset_state`, and made inert the moment the motion generator
-        #: leaves the Cartesian modes (:meth:`_echoing_commanded_pose`), so a
-        #: session that ends any way at all snaps back to the measured pose.
-        self._commanded_pose_echoed = False
-        self._commanded_elbow_echoed = False
 
         # Shutdown bookkeeping. stop() can be reached from several directions
         # at once -- the KeyboardInterrupt handler, a second Ctrl+C landing
@@ -410,6 +438,23 @@ class FrankaSimServer:
             logger.info("Simulation initialized")
         else:
             self.genesis_sim = genesis_sim
+
+        #: Whether the physics backend can turn a Cartesian command into joint
+        #: motion, i.e. whether it implements the differential-IK half of the
+        #: simulator contract (:meth:`franka_sim.mujoco_franka_sim.
+        #: MujocoFrankaSim.update_cartesian_pose`). Backends that do not --
+        #: Genesis, the mobile-duo scene view -- keep the older behaviour on the
+        #: two Cartesian interfaces: the commanded stream is checked exactly as
+        #: before, but nothing drives the arm from it. Asked once, here, rather
+        #: than at 1 kHz on the dispatch path.
+        #:
+        #: Never set on the ``mobile_base`` role even when the backend would
+        #: support it: the base's ``kCartesianVelocity`` commands a *base twist*
+        #: for the swerve kinematics, not an end-effector twist, and it has its
+        #: own branch (:meth:`_handle_cartesian_velocity`).
+        self.cartesian_tracking = not mobile_base and hasattr(
+            self.genesis_sim, "update_cartesian_pose"
+        )
 
         self.robot_state = RobotState()
 
@@ -465,8 +510,6 @@ class FrankaSimServer:
         self.states_sent = 0
         self._motion_epoch_id = 0
         self._motion_has_commands = False
-        self._commanded_pose_echoed = False
-        self._commanded_elbow_echoed = False
         self.client_socket = None
         self.tcp_thread = None
         self.udp_socket = None
@@ -487,6 +530,11 @@ class FrankaSimServer:
         # difference the new client's first command against.
         self.motion_limits = MotionLimitChecker(enforce=self.enforce_motion_limits)
         self.robot_state = RobotState()  # Create fresh robot state for new connection
+        # The fresh RobotState puts F_T_NE/NE_T_EE back to identity, so the
+        # backend has to be told the EE frame moved back to the flange too --
+        # otherwise a tool set by the previous connection would keep skewing
+        # this one's measured EE velocity.
+        self._refresh_ee_transform()
 
     def receive_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
         """
@@ -965,6 +1013,27 @@ class FrankaSimServer:
             ):
                 self._handle_cartesian_velocity(command)
             elif (
+                self.cartesian_tracking
+                # Any internal controller, not ``kJointImpedance`` alone: the
+                # controller mode picks the *stiffness law* the robot holds the
+                # generator's output with, and both internal ones are driven by
+                # the same generator. Naming only one here while the ``Move``
+                # handler put the backend into Cartesian tracking for either
+                # left ``kCartesianImpedance`` silently inert -- in a tracking
+                # mode with no command ever reaching it. ``kExternalController``
+                # is the one that genuinely does not belong: there the client's
+                # torques drive the arm and its pose stream is a reference, so
+                # it falls through to the TORQUE branch below.
+                and self.robot_state.state["controller_mode"]
+                != LibfrankaControllerMode.kExternalController
+                and self.robot_state.state["motion_generator_mode"]
+                in (
+                    LibfrankaMotionGeneratorMode.kCartesianPosition,
+                    LibfrankaMotionGeneratorMode.kCartesianVelocity,
+                )
+            ):
+                self._drive_cartesian_generator(command)
+            elif (
                 self.robot_state.state["controller_mode"]
                 == LibfrankaControllerMode.kExternalController
             ):
@@ -975,6 +1044,48 @@ class FrankaSimServer:
                 # Update tau_J_d with commanded torques
                 self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
                 self.genesis_sim.update_torques(command["tau_J_d"])
+
+    def _drive_cartesian_generator(self, command) -> None:
+        """Hand one accepted Cartesian command to the backend's differential IK.
+
+        The arm's counterpart to the joint branches above, with the two writes
+        in the opposite order -- mode first, target second; see the comment on
+        the switch below for why the Cartesian interfaces need the mirror image
+        of :meth:`_dispatch_control_command`'s POSITION rule.
+
+        Only reached for a command this cycle's checks already accepted, and
+        only when the backend can convert one at all
+        (:attr:`cartesian_tracking`). Nothing about the checking layer changes:
+        this is a second consumer of the accepted stream, not a filter on it.
+
+        ``elbow_c[0]`` is passed through when -- and only when -- the client
+        said it commands an elbow (``valid_elbow``); ``elbow_c`` is zero-filled
+        otherwise, and steering the redundancy angle to a zero nobody asked for
+        would twist the arm on every elbow-less Cartesian motion.
+        """
+        pose_generator = (
+            self.robot_state.state["motion_generator_mode"]
+            == LibfrankaMotionGeneratorMode.kCartesianPosition
+        )
+        mode = ControlMode.CARTESIAN_POSE if pose_generator else ControlMode.CARTESIAN_VELOCITY
+        # Mode first, target second -- the *opposite* order to the POSITION
+        # branch above, and for the same underlying reason. Entering a Cartesian
+        # mode deliberately clears the target (see
+        # ``MujocoFrankaSim.set_control_mode``), so publishing this command
+        # before the switch would throw it away and leave the arm holding for a
+        # cycle. Clearing first and filling immediately after cannot spike: the
+        # worst a physics step landing in between sees is "no target", which
+        # servos zero velocity.
+        if self.control_mode is not mode:
+            logger.info("Setting control mode to %s", mode.name)
+            self.genesis_sim.set_control_mode(mode)
+            self.control_mode = mode
+        elbow_angle = command["elbow_c"][0] if command.get("valid_elbow") else None
+        if pose_generator:
+            self.genesis_sim.update_cartesian_pose(command["O_T_EE_c"], elbow_angle)
+        else:
+            self.genesis_sim.update_cartesian_velocity(command["O_dP_EE_c"], elbow_angle)
+        self.genesis_sim.update_torques([0.0] * 7)
 
     def _echo_commanded_cartesian(self, command) -> None:
         """Echo a Cartesian generator's commanded pose and elbow into the state.
@@ -992,8 +1103,7 @@ class FrankaSimServer:
 
         ``O_T_EE_c`` is the last pose the client commanded; ``O_T_EE_d`` is the
         one the generator is tracking, which in this sim is the same value
-        because a commanded pose is applied instantly (well -- checked
-        instantly; nothing drives the arm from it, see ``docs/compatibility.md``).
+        because a commanded pose is applied instantly.
         A *lost* cycle reaches this method too: the publish loop extrapolates the
         pose across it and dispatches the result down this same path
         (:meth:`_extrapolate_missed_cycle`), so both fields keep advancing along
@@ -1001,70 +1111,114 @@ class FrankaSimServer:
         reports -- "the last received c values (after the low pass filter and the
         extrapolation due to packet losses)" (``docs/overview.rst``).
 
+        **The twist generator has the identical requirement, and leaving it out
+        silently scaled the whole interface.** ``ControlLoop<CartesianVelocities>
+        ::convertMotion`` low-passes every commanded twist toward
+        ``robot_state.O_dP_EE_c`` (``src/control_loop.cpp:296-313``), the same
+        way the pose loop uses ``O_T_EE_c``. With those fields left at the wire
+        struct's permanent zero on an arm role, the filter's reference was zero
+        on *every* cycle rather than the client's own previous command, so
+        instead of converging on the commanded twist it returned a fixed
+        fraction of it: ``gain = dt / (dt + 1 / (2*pi*f_c))`` = 0.3859 at
+        libfranka's default 100 Hz cutoff and 1 ms. Every ``kCartesianVelocity``
+        client was moving the arm at 39% of the speed it asked for, with no way
+        to see why. Echoed here, the reference is the previous command and a
+        constant commanded twist converges geometrically to 1.0x.
+
         The elbow rides along with either Cartesian generator
         (``CartesianPose::hasElbow`` / ``CartesianVelocities::hasElbow``) and is
         echoed only when the client actually sent one -- ``valid_elbow`` is its
         own statement that it did, and ``elbow_c`` is zero-filled otherwise.
 
-        **Arm roles only.** The mobile base's Cartesian generator commands a
-        *twist*; its ``O_dP_EE_d``/``O_dP_EE_c`` echo and its dead-reckoned
-        ``O_T_EE`` are handled by :meth:`_handle_cartesian_velocity` and are
-        deliberately untouched here, the same role guard the rest of the
-        commanded-field ownership uses (:data:`COMMANDED_STATE_FIELDS`).
+        **Arm roles only.** The mobile base commands a *base* twist rather than
+        an end-effector one; its ``O_dP_EE_d``/``O_dP_EE_c`` echo and its
+        dead-reckoned ``O_T_EE`` are :meth:`_handle_cartesian_velocity`'s
+        business and are deliberately untouched here, the same role guard the
+        rest of the commanded-field ownership uses
+        (:data:`COMMANDED_STATE_FIELDS`).
         """
         if self.mobile_base:
             return
         mode = self.robot_state.state["motion_generator_mode"]
         if mode == LibfrankaMotionGeneratorMode.kCartesianPosition:
-            # Flag first, fields second: the publish loop reads
-            # _commanded_pose_echoed (via _echoing_commanded_pose) without a
-            # lock to decide whether to leave O_T_EE_d/c alone or overwrite
-            # them with the measured pose, so a publish cycle landing between
-            # the flag and the fields could still see "not echoing yet" and
-            # stamp the measured pose over this motion's very first commanded
-            # one -- the same ordering rule _dispatch_control_command already
-            # applies to target-then-mode.
-            self._commanded_pose_echoed = True
             pose = list(command["O_T_EE_c"])
             self.robot_state.state["O_T_EE_c"] = pose
             self.robot_state.state["O_T_EE_d"] = pose
-        elif mode != LibfrankaMotionGeneratorMode.kCartesianVelocity:
+        elif mode == LibfrankaMotionGeneratorMode.kCartesianVelocity:
+            twist = list(command["O_dP_EE_c"])
+            self.robot_state.state["O_dP_EE_c"] = twist
+            self.robot_state.state["O_dP_EE_d"] = twist
+        else:
             return
         if command.get("valid_elbow"):
-            self._commanded_elbow_echoed = True
             elbow = list(command["elbow_c"])
             self.robot_state.state["elbow_c"] = elbow
             self.robot_state.state["elbow_d"] = elbow
 
-    def _echoing_commanded_pose(self) -> bool:
-        """Whether ``O_T_EE_d``/``O_T_EE_c`` currently belong to a client stream.
+    def _cartesian_motion_owns_commanded_fields(self) -> bool:
+        """Whether a running Cartesian generator owns the commanded-echo fields.
 
-        Two conditions, and the second is what makes the snap-back automatic: a
-        pose command must have been echoed *and* the motion generator must still
-        be ``kCartesianPosition``. Every way a motion ends -- a
-        ``motion_generation_finished`` datagram, a reflex abort, StopMove, a
-        client that simply disappears -- puts the mode back to ``kIdle``, so the
-        publish loop resumes reporting the measured pose without any teardown
-        path having to remember to say so.
+        ``O_T_EE_d``/``O_T_EE_c`` and ``elbow_d``/``elbow_c`` are *commanded*
+        fields, and while one of the two Cartesian generators is running the
+        only honest source for them is the client's own stream
+        (:meth:`_echo_commanded_cartesian`). Where the stream is silent -- a
+        pose motion that commands no elbow, the cycle or two before its first
+        command lands, a twist motion which commands no pose at all -- they stay
+        frozen at the value :meth:`_freeze_commanded_cartesian` stamped when the
+        motion started, which *is* the measured value at that instant.
+
+        **Why freezing rather than tracking the measured arm.** libfranka builds
+        every Cartesian command out of these fields: they are the reference its
+        command low-pass filter blends the next command with, and its rate
+        limiter differences against (``ControlLoop<CartesianPose>::
+        convertMotion``, ``ControlLoop<CartesianVelocities>::convertMotion``,
+        ``src/control_loop.cpp``), and the smoke suite's own generators open
+        with ``franka::CartesianPose cmd{state.O_T_EE_d, state.elbow_d}``. Once
+        the arm is actually driven from those commands, publishing the *measured*
+        pose or elbow there closes a positive feedback loop through the client:
+        the command chases the lagging arm, the arm chases the command, and the
+        two wind each other up until the (correct) checking layer aborts the
+        motion. Freezing breaks the loop at its only closure point without
+        inventing a value the robot never commanded.
+
+        Cartesian generators only. Under a joint generator the client references
+        ``q_d``/``dq_d``/``ddq_d`` and never these fields, so there is no loop to
+        break, and reporting the pose the arm is in stays the closest thing this
+        sim has to the hardware's own ``O_T_EE_d = FK(q_d)``. Idle likewise --
+        and that is the behaviour the suite's "start from ``state.O_T_EE_d``"
+        generators depend on, since they read it on the motion's first cycle.
         """
-        return (
-            self._commanded_pose_echoed
-            and self.robot_state.state["motion_generator_mode"]
-            == LibfrankaMotionGeneratorMode.kCartesianPosition
-        )
-
-    def _echoing_commanded_elbow(self) -> bool:
-        """Whether ``elbow_d``/``elbow_c`` currently belong to a client stream.
-
-        :meth:`_echoing_commanded_pose`'s twin, widened by one mode: an elbow is
-        commandable on the Cartesian *velocity* generator too.
-        """
-        return self._commanded_elbow_echoed and self.robot_state.state[
-            "motion_generator_mode"
-        ] in (
+        return self.robot_state.state["motion_generator_mode"] in (
             LibfrankaMotionGeneratorMode.kCartesianPosition,
             LibfrankaMotionGeneratorMode.kCartesianVelocity,
         )
+
+    def _freeze_commanded_cartesian(self, seed: Dict[str, Any]) -> None:
+        """Stamp the commanded-echo fields with the pose/elbow the motion starts in.
+
+        Called once per accepted ``Move`` on an arm role, with the same snapshot
+        the limit checker is seeded from. It is what makes "frozen" mean *the
+        measured state at motion start* rather than "whatever the publish loop
+        happened to leave behind": a ``Move`` can arrive before the publish loop
+        has produced its first frame, and the identity the wire struct is
+        constructed with is not a pose any generator could legally start from.
+
+        Values only ever *read back* by the client, so a motion whose generator
+        is not Cartesian is stamped too -- harmlessly, since the publish loop
+        goes straight back to tracking the measured arm for it on the next
+        cycle (:meth:`_cartesian_motion_owns_commanded_fields`).
+        """
+        if self.mobile_base:
+            return
+        pose = seed.get("O_T_EE")
+        if pose is not None:
+            pose = pose.tolist() if hasattr(pose, "tolist") else list(pose)
+            self.robot_state.state["O_T_EE_d"] = pose
+            self.robot_state.state["O_T_EE_c"] = list(pose)
+        elbow = self._elbow_from_joints(seed.get("q"))
+        if elbow is not None:
+            self.robot_state.state["elbow_d"] = list(elbow)
+            self.robot_state.state["elbow_c"] = list(elbow)
 
     def _publish_commanded_derivatives(self, *fields: str) -> None:
         """Report the derivatives the applied command implies, in order.
@@ -1122,6 +1276,9 @@ class FrankaSimServer:
                 if self._refuse_move_while_latched(client_socket, header):
                     return
 
+                if self._refuse_move_at_singular_pose(client_socket, header, move_cmd):
+                    return
+
                 self._preempt_running_motion()
 
                 # A fresh session token for this motion; see _motion_generation.
@@ -1129,11 +1286,28 @@ class FrankaSimServer:
                 generation = self._motion_generation
                 self._motion_epoch_id = self.robot_state.state["message_id"]
                 self._motion_has_commands = False
-                # A new motion commands nothing yet: the commanded Cartesian
-                # fields go back to reporting the internal controller's hold
-                # until this motion's first pose/elbow command arrives.
-                self._commanded_pose_echoed = False
-                self._commanded_elbow_echoed = False
+
+                # The snapshot this motion is judged and reported from, read
+                # once and used twice: to stamp the commanded Cartesian fields
+                # here, and to seed the limit checker further down (it depends
+                # on ``generator_mode``, which the branches below decide).
+                #
+                # **Fields first, mode second**, the same rule the dispatch path
+                # applies to target-then-mode and for the same reason. Publishing
+                # the Cartesian generator mode is what makes the publish loop
+                # stop writing ``O_T_EE_d/_c`` and ``elbow_d/_c``
+                # (:meth:`_cartesian_motion_owns_commanded_fields`), so stamping
+                # them afterwards leaves a window for a cycle that reports
+                # neither: not the measured arm, because the mode already says
+                # "frozen", and not the frozen value, because it has not been
+                # written yet. A ``Move`` that arrives before the publish loop's
+                # first cycle -- which is exactly what a client that Moves
+                # straight after connecting does -- then broadcast the wire
+                # struct's zero ``elbow_d``, and libfranka's ``checkElbow``
+                # refuses to send a branch flag that is not +-1, so the elbow
+                # interface was unreachable for that motion.
+                seed = self._motion_limit_seed_state()
+                self._freeze_commanded_cartesian(seed)
 
                 # Update robot state
                 self.robot_state.set_motion_generator_mode(
@@ -1189,30 +1363,41 @@ class FrankaSimServer:
                     logger.info("Setting control mode to TORQUE")
                     self.genesis_sim.set_control_mode(ControlMode.TORQUE)
                     self.control_mode = generator_mode = ControlMode.TORQUE
-                elif move_cmd.motion_generator_mode == MotionGeneratorMode.kCartesianPosition:
-                    # Checked, never driven. There is no physics branch for a
-                    # commanded pose, so ``self.control_mode`` and the backend
-                    # are deliberately left alone -- the arm stays exactly where
-                    # it is for the whole motion. What changes is that the
-                    # client's ``O_T_EE_c``/``elbow_c`` stream is now
-                    # differentiated and judged, so a step in it aborts with the
-                    # hardware error instead of being silently dropped. See
+                elif move_cmd.motion_generator_mode in (
+                    MotionGeneratorMode.kCartesianPosition,
+                    MotionGeneratorMode.kCartesianVelocity,
+                ):
+                    # An *arm* role on one of the two Cartesian generators (the
+                    # mobile base's own kCartesianVelocity was matched further
+                    # up, and the kExternalController case one branch above:
+                    # there the client's torques drive the arm and the pose
+                    # stream is a reference, not a command to the joints).
+                    #
+                    # Driven when the backend can convert a Cartesian command
+                    # into joint motion, checked-only when it cannot; see
+                    # :attr:`cartesian_tracking`. Either way the commanded
+                    # ``O_T_EE_c``/``O_dP_EE_c``/``elbow_c`` stream is
+                    # differentiated and judged exactly as before, so a step in
+                    # it aborts with the hardware error rather than being
+                    # silently dropped. See
                     # :meth:`franka_sim.motion_limits.MotionLimitChecker._check_cartesian_pose`.
-                    logger.info(
-                        "Move accepted for kCartesianPosition: the commanded pose is "
-                        "validated but not applied -- the arm will not move"
+                    generator_mode = (
+                        ControlMode.CARTESIAN_POSE
+                        if move_cmd.motion_generator_mode
+                        == MotionGeneratorMode.kCartesianPosition
+                        else ControlMode.CARTESIAN_VELOCITY
                     )
-                    generator_mode = ControlMode.CARTESIAN_POSE
-                elif move_cmd.motion_generator_mode == MotionGeneratorMode.kCartesianVelocity:
-                    # An *arm* role asked for the twist generator (the mobile
-                    # base's own kCartesianVelocity was matched further up and
-                    # really is driven). Same deal: checked, not applied.
-                    logger.info(
-                        "Move accepted for kCartesianVelocity on an arm role: the "
-                        "commanded twist is validated but not applied -- the arm will "
-                        "not move"
-                    )
-                    generator_mode = ControlMode.CARTESIAN_VELOCITY
+                    if self.cartesian_tracking:
+                        logger.info("Setting control mode to %s", generator_mode.name)
+                        self.genesis_sim.set_control_mode(generator_mode)
+                        self.control_mode = generator_mode
+                    else:
+                        logger.info(
+                            "Move accepted for %s: this backend has no Cartesian "
+                            "tracking, so the commanded stream is validated but not "
+                            "applied -- the arm will not move",
+                            move_cmd.motion_generator_mode.name,
+                        )
                 else:
                     logger.info(
                         "Move accepted for %s / %s, which this server has no physics "
@@ -1241,9 +1426,7 @@ class FrankaSimServer:
                 # joint 4's range does not contain 0. The safety controller
                 # (measured velocity -> joint_velocity_violation) is armed
                 # regardless of mode; see MotionLimitChecker.start_motion.
-                self.motion_limits.start_motion(
-                    generator_mode, self._motion_limit_seed_state(), generation
-                )
+                self.motion_limits.start_motion(generator_mode, seed, generation)
 
                 # First send motion started response
                 logger.info("Sending kMotionStarted response")
@@ -1293,6 +1476,131 @@ class FrankaSimServer:
                 status=MoveStatus.kPreempted,
             )
         self.current_motion_id = 0
+        return True
+
+    def _refuse_move_at_singular_pose(
+        self, client_socket, header: MessageHeader, move_cmd: MoveCommand
+    ) -> bool:
+        """Reject a Cartesian ``Move`` that would start from a singular configuration.
+
+        A Cartesian motion generator has to be able to realise an arbitrary
+        commanded twist, and in a singularity it cannot: some direction of EE
+        motion costs unbounded joint speed. The robot refuses to start rather
+        than let the client discover that at 1 kHz, and libfranka has a status
+        that says exactly this --
+        ``Move::Status::kStartAtSingularPoseRejected``, which it turns into
+        ``CommandException("libfranka: Move command rejected: cannot start at
+        singular pose!")`` (``src/robot_impl.h:423-427``).
+
+        **The rejection is the motion's *terminal* response, not its first, and
+        that is forced by libfranka's own control flow.** ``Robot::Impl::
+        startMotion`` sends the ``Move`` through ``executeCommand``, which
+        blocking-receives the first response and calls ``handleCommandResponse``
+        *outside* any try/catch (``src/robot_impl.h:548-553``); a rejection
+        delivered there escapes as a bare ``CommandException``. Only the
+        responses picked up by the mode-wait loop that follows are converted --
+        ``catch (const CommandException& e) { throw ControlException(e.what()); }``
+        (``src/robot_impl.cpp:323-332``), and ``throwOnMotionError`` does the
+        same (``:96-111``). Franka's ``CartesianMotionInSingularPose``
+        (``smoke_test_errors.cpp:231``) catches ``ControlException``, so on
+        hardware the singular start is discovered *after* the ``Move`` was
+        acknowledged -- Control accepts the command, looks at where the arm is
+        standing, and terminates the motion. This method reproduces that shape:
+        ``kMotionStarted`` first, the rejection queued as the deferred terminal
+        response, and the generator modes deliberately never leaving idle so the
+        client stays in the loop that converts it.
+
+        **Cartesian generators only.** The very same test reaches the singular
+        configuration by *joint* motion (``moveP2P`` to ``kSingularPose``), so
+        joint interfaces plainly start there quite happily -- as they must, since
+        a joint generator has no Jacobian to invert and driving *out* of a
+        singularity is the only way to leave one.
+
+        The measure is ``sigma_min`` of the EE Jacobian the physics backend
+        publishes for the arm's current measured ``q``; see
+        :data:`franka_sim.motion_limits.SINGULAR_POSE_MIN_SINGULAR_VALUE` for
+        the threshold and the poses it was placed against. A backend that
+        publishes no Jacobian -- Genesis, the mobile-base bridge -- cannot be
+        asked and the Move is accepted, which is also why the ``mobile_base``
+        role (whose ``kCartesianVelocity`` commands a *base twist* and has no
+        end effector at all) needs no special case here.
+
+        Called with ``_motion_lock`` held. Returns True when the Move was
+        refused (and answered).
+        """
+        if move_cmd.motion_generator_mode not in (
+            MotionGeneratorMode.kCartesianPosition,
+            MotionGeneratorMode.kCartesianVelocity,
+        ):
+            return False
+        try:
+            sim_state = self.genesis_sim.get_robot_state()
+        except Exception:  # pragma: no cover - a backend that cannot answer
+            # Same posture as :meth:`_publish_hold_setpoint`: a backend that
+            # cannot be read is a backend this check cannot be run against, and
+            # refusing a Move on the strength of an exception would be worse
+            # than running the motion unconditioned.
+            logger.exception("Could not read the simulator to condition the Move's start pose")
+            return False
+        jacobian = sim_state.get("O_J_EE") if isinstance(sim_state, dict) else None
+        sigma_min = smallest_singular_value(jacobian)
+        if sigma_min is None:
+            return False
+        if sigma_min > SINGULAR_POSE_MIN_SINGULAR_VALUE:
+            logger.info(
+                "Cartesian Move %s start-pose conditioning: sigma_min=%.4f (limit %.4f)",
+                header.command_id,
+                sigma_min,
+                SINGULAR_POSE_MIN_SINGULAR_VALUE,
+            )
+            return False
+        logger.warning(
+            "Refusing Move %s: the arm is standing in a singularity "
+            "(sigma_min=%.4f <= %.4f), so a Cartesian motion cannot start here",
+            header.command_id,
+            sigma_min,
+            SINGULAR_POSE_MIN_SINGULAR_VALUE,
+        )
+        # A refused Move still displaces whatever was running, exactly as an
+        # accepted one does: the client that sent it has stopped servicing the
+        # old motion's control loop, and Control does not keep driving a motion
+        # nobody is feeding. This also answers the displaced motion's own
+        # ``Move`` (``kPreempted``) and clears ``current_motion_id``, which is
+        # what leaves :attr:`_pending_move_response` free for the rejection
+        # queued below -- the same sequencing the accepted path gets from
+        # calling this immediately before it starts a new motion.
+        self._preempt_running_motion()
+        # An abort latched a moment ago on another thread can still be sitting
+        # in the queue with nothing to release it yet. Flush it first rather
+        # than overwrite it: it belongs to a *different* Move, and dropping it
+        # leaves that client blocked on a TCP reply for ever. Forced, because
+        # the state it was waiting for may never arrive -- this Move starts no
+        # motion, so nothing after it will publish one on that response's
+        # behalf. Safe to call with ``_motion_lock`` held: it is an ``RLock``.
+        self._flush_pending_move_response(force=True)
+        self.send_move_response(
+            client_socket, command_id=header.command_id, status=MoveStatus.kMotionStarted
+        )
+        if not self.transmitting_state:
+            # No publish loop to release a deferred response, and no state for
+            # it to race: answer immediately rather than leave the client
+            # blocked on a TCP reply for ever. Same escape hatch as
+            # :meth:`_flush_pending_move_response`'s ``force``, taken inline
+            # because ``_motion_lock`` is already held here.
+            self.send_move_response(
+                client_socket,
+                command_id=header.command_id,
+                status=MoveStatus.kStartAtSingularPoseRejected,
+            )
+            return True
+        # Deferred exactly like a reflex abort: the client has to see at least
+        # one state after the acknowledgement before the terminal response, or
+        # it can be answered before it has even left ``executeCommand``.
+        self._pending_move_response = (
+            header.command_id,
+            MoveStatus.kStartAtSingularPoseRejected,
+            self._states_packed,
+        )
         return True
 
     def _refuse_move_while_latched(self, client_socket, header: MessageHeader) -> bool:
@@ -1447,6 +1755,17 @@ class FrankaSimServer:
         self.genesis_sim.set_control_mode(ControlMode.POSITION)
         self.control_mode = ControlMode.POSITION
         self._publish_hold_setpoint(current_joint_positions)
+        # The Cartesian twin of the zero ``dq_d``/``tau_J_d`` that hold setpoint
+        # publishes, and the arm-role counterpart of the mobile branch above: an
+        # arm held by its internal controller is commanding no end-effector
+        # motion, so the twist it reports as commanded is zero. Only a
+        # ``kCartesianVelocity`` motion ever writes anything else here
+        # (:meth:`_echo_commanded_cartesian`), and every way such a motion can
+        # end -- finished, reflex, StopMove, preemption, a client that vanishes
+        # -- arrives at this method, so this is the single place the twist has
+        # to be given back.
+        self.robot_state.state["O_dP_EE_c"] = [0.0] * 6
+        self.robot_state.state["O_dP_EE_d"] = [0.0] * 6
 
     def _publish_hold_setpoint(self, joint_positions=None) -> Dict[str, Any]:
         """Report the internal controller's own setpoint in ``q_d``/``dq_d``/``tau_J_d``.
@@ -1920,17 +2239,21 @@ class FrankaSimServer:
         a sim artifact that hid five of the suite's real Cartesian checks
         behind it.
 
-        During a ``kCartesianPosition`` motion the two fields belong to the
-        client's stream instead (:meth:`_echo_commanded_cartesian`); the moment
-        that motion ends they snap back here, which is what the real robot does
-        when the internal controller takes the flange back.
+        During either Cartesian motion the two fields belong to that motion
+        instead -- to the client's stream on the pose generator
+        (:meth:`_echo_commanded_cartesian`), and frozen at the motion's start
+        pose where the stream carries none
+        (:meth:`_cartesian_motion_owns_commanded_fields`, which is also where
+        the reason they must not track the measured arm there is written down).
+        The moment the motion ends they snap back here, which is what the real
+        robot does when the internal controller takes the flange back.
 
         **Arm roles only.** The mobile-duo base bridge's ``O_T_EE`` is
         dead-reckoned from the commanded twist and its commanded Cartesian
         fields are ``O_dP_EE_d``/``O_dP_EE_c``; neither is this method's
         business. Same role guard as :data:`COMMANDED_STATE_FIELDS`.
         """
-        if self.mobile_base or self._echoing_commanded_pose():
+        if self.mobile_base or self._cartesian_motion_owns_commanded_fields():
             return
         pose = sim_state.get("O_T_EE")
         if pose is None:
@@ -1963,43 +2286,99 @@ class FrankaSimServer:
         """
         if self.mobile_base:
             return
-        joints = sim_state.get("q")
-        if joints is None or len(joints) < 4:
+        elbow = self._elbow_from_joints(sim_state.get("q"))
+        if elbow is None:
             return
-        elbow = [float(joints[2]), 1.0 if float(joints[3]) >= 0.0 else -1.0]
         self.robot_state.state["elbow"] = elbow
-        # ``elbow_d``/``elbow_c`` are the *commanded* elbow on hardware. While a
-        # Cartesian generator is streaming one they are that stream's
-        # (:meth:`_echo_commanded_cartesian`); the rest of the time -- idle,
-        # between motions, under a joint generator, or under a Cartesian motion
-        # that commands no elbow at all -- the honest value is the one the
-        # internal controller is holding, which is the measured elbow. Same
-        # reasoning as ``q_d`` between motions; see
+        # ``elbow_d``/``elbow_c`` are the *commanded* elbow on hardware. While
+        # either Cartesian generator is running they belong to that motion --
+        # the client's stream when it commands an elbow
+        # (:meth:`_echo_commanded_cartesian`), frozen at the motion's start
+        # elbow when it does not -- and must not track the arm, for the
+        # feedback reason spelled out in
+        # :meth:`_cartesian_motion_owns_commanded_fields`. The rest of the time
+        # -- idle, between motions, under a joint generator -- the honest value
+        # is the one the internal controller is holding, which is the measured
+        # elbow. Same reasoning as ``q_d`` between motions; see
         # :meth:`_publish_hold_setpoint`.
-        if self._echoing_commanded_elbow():
+        if self._cartesian_motion_owns_commanded_fields():
             return
         self.robot_state.state["elbow_d"] = list(elbow)
         self.robot_state.state["elbow_c"] = list(elbow)
 
+    @staticmethod
+    def _elbow_from_joints(joints) -> Optional[List[float]]:
+        """``[redundancy angle, branch flag]`` for an arm configuration, or None.
+
+        ``elbow[0]`` is joint 3's angle on an FR3 and ``elbow[1]`` is the sign
+        of joint 4, which libfranka insists is exactly +-1 (``isValidElbow``,
+        ``include/franka/control_tools.h``). None when the caller has no arm
+        configuration to read, so every caller can skip rather than guess.
+        """
+        if joints is None or len(joints) < 4:
+            return None
+        return [float(joints[2]), 1.0 if float(joints[3]) >= 0.0 else -1.0]
+
+    def _refresh_ee_transform(self) -> None:
+        """Recompute ``F_T_EE`` from ``F_T_NE``/``NE_T_EE`` and tell the backend.
+
+        ``F_T_EE = F_T_NE * NE_T_EE`` -- libfranka's own decomposition
+        (``Robot::setEE``, ``include/franka/robot.h``), so the two settable
+        halves and the derived whole can never disagree. Both are column-major
+        16-element wire poses, and so is the result.
+
+        The backend is told because the EE frame is where it measures Cartesian
+        velocity for the safety controller (see
+        :meth:`franka_sim.mujoco_franka_sim.MujocoFrankaSim.update_ee_transform`).
+        A backend without that setter -- Genesis, the mobile-base bridge -- is
+        left alone and simply publishes no ``O_dP_EE``, which switches the
+        Cartesian check off rather than feeding it a wrong frame.
+        """
+        f_t_ee = transform_matrix(self.robot_state.state["F_T_NE"]) @ transform_matrix(
+            self.robot_state.state["NE_T_EE"]
+        )
+        values = [float(value) for value in f_t_ee.T.flatten()]
+        self.robot_state.state["F_T_EE"] = values
+        # getattr on self too: reset_state() also runs from teardown paths, and
+        # a half-built server has no backend yet.
+        setter = getattr(getattr(self, "genesis_sim", None), "update_ee_transform", None)
+        if setter is None:
+            return
+        try:
+            setter(values)
+        except Exception:  # pragma: no cover - a backend that rejects the frame
+            logger.warning("Backend rejected the F_T_EE update", exc_info=True)
+
     def _run_safety_velocity_check(self, sim_state) -> None:
         """Run the safety controller against this cycle's measured velocity.
 
-        The one limit check that judges the *robot* rather than the client, and
-        the only one that is not tied to a motion generator: the real robot
-        watches measured ``dq`` against the position-based velocity envelope and
-        latches ``joint_velocity_violation`` when the arm leaves it, in every
-        control mode. Franka's hardware smoke suite pins the case no commanded
-        check could ever cover -- a pure-torque session ramping 3 Nm into joint
-        6 until the arm folds through the envelope, with no commanded velocity
-        anywhere in the session (``moveJointVelocityViolation``).
+        The limit checks that judge the *robot* rather than the client, and the
+        only ones not tied to a motion generator: the real robot watches
+        measured ``dq`` against the position-based velocity envelope and latches
+        ``joint_velocity_violation``, and watches the measured end-effector
+        speed against the Cartesian translational limit and latches
+        ``cartesian_velocity_violation`` -- both in every control mode. Franka's
+        hardware smoke suite pins the case no commanded check could ever cover:
+        a pure-torque session ramping 3 Nm into joint 6 until the arm folds
+        through the envelope, with no commanded velocity anywhere in the session
+        (``moveJointVelocityViolation``).
+
+        **The Cartesian check is asked first, and that ordering is the
+        hardware's.** ``CartesianVelocityViolationHardware`` ramps joints 2 and
+        4 with an EE 0.5 m out along the flange and hardware reports
+        ``cartesian_velocity_violation`` *on its own* -- no
+        ``joint_velocity_violation`` beside it -- so whichever cycle is the
+        first to break both, the Cartesian error is the one that must latch.
+        (In this sim the EE passes 3 m/s some 90 ms before either joint check
+        objects, so the ordering only matters as a guarantee, not in practice.)
 
         Called once per cycle from the state-publish loop with the physics
-        snapshot it has already read, so it costs one comparison per joint and
-        no extra backend call. Reporting is always on; the abort is gated on
-        ``--enforce-motion-limits`` and goes through the same latch-then-abort
-        plumbing as every other violation, so the client sees the identical
-        thing: the error bit in ``errors``/``reflex_reason``, ``kReflex``, and
-        the pending ``Move`` answered ``kReflexAborted``.
+        snapshot it has already read, so it costs one comparison per joint, one
+        vector norm, and no extra backend call. Reporting is always on; the
+        abort is gated on ``--enforce-motion-limits`` and goes through the same
+        latch-then-abort plumbing as every other violation, so the client sees
+        the identical thing: the error bit in ``errors``/``reflex_reason``,
+        ``kReflex``, and the pending ``Move`` answered ``kReflexAborted``.
 
         Skipped on a ``mobile_base`` server: the envelope is the FR3's, read out
         of the arm's own URDF, and a swerve base's steering and drive joints are
@@ -2009,9 +2388,13 @@ class FrankaSimServer:
         if self.mobile_base or sim_state is None:
             return
         motion_id = self.motion_limits.motion_id
-        violation = self.motion_limits.check_measured_velocity(
-            sim_state.get("q"), sim_state.get("dq")
-        )
+        # Both are asked every cycle, not short-circuited: each also *records*
+        # this cycle's reading, and the joint one's ``q`` is the reference
+        # configuration the commanded-velocity envelope is built from. Only the
+        # verdict is prioritised.
+        cartesian = self.motion_limits.check_measured_cartesian_velocity(sim_state.get("O_dP_EE"))
+        joint = self.motion_limits.check_measured_velocity(sim_state.get("q"), sim_state.get("dq"))
+        violation = cartesian or joint
         if violation is None:
             return
         self.motion_limits.report(violation, enforced=self.enforce_motion_limits)
@@ -2445,6 +2828,15 @@ class FrankaSimServer:
 
             # Reflect NE_T_EE in subsequent RobotState broadcasts, like the real robot.
             self.robot_state.state["NE_T_EE"] = cmd.NE_T_EE
+            # ...and with it F_T_EE, which is *derived*: libfranka documents
+            # ``Robot::setEE`` as setting "the transformation NE_T_EE from
+            # nominal end effector to end effector frame [...] The transformation
+            # from flange to end effector frame is split into two
+            # transformations: F_T_EE = F_T_NE * NE_T_EE"
+            # (``include/franka/robot.h``). Publishing it is what lets a client
+            # -- and this server's own Cartesian safety check -- know where the
+            # EE actually is.
+            self._refresh_ee_transform()
 
             # Send success response (status = 0)
             total_size = 12 + 4  # Header (12) + status (1) + padding (3)

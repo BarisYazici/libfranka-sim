@@ -26,6 +26,12 @@ from typing import Optional
 import mujoco
 import numpy as np
 
+from franka_sim.cartesian_ik import (
+    CartesianFeedforward,
+    elbow_null_velocity,
+    resolved_rate,
+    tracking_twist,
+)
 from franka_sim.control_modes import ControlMode
 from franka_sim.sim_common import (
     FR3_FORCE_LIMITS,
@@ -33,7 +39,6 @@ from franka_sim.sim_common import (
     RealtimeFactorMonitor,
     close_passive_viewer,
     launch_passive_viewer,
-    pose_to_column_major,
     resolve_fr3_joint_damping,
 )
 
@@ -283,6 +288,30 @@ class MujocoFrankaSim:
         self.finger_dofs_idx: Optional[np.ndarray] = None
         self.ee_body_id: Optional[int] = None
 
+        # Flange -> EE transform (row-major 4x4), i.e. the FCI's ``F_T_EE``.
+        # Identity until a client sends a SetEE-family command; see
+        # update_ee_transform(). Only the translation is read today (the EE's
+        # *speed* does not depend on how the EE frame is rotated), but the whole
+        # transform is kept so a rotational or pose consumer needs no new API.
+        self._f_t_ee = np.eye(4)
+        # Scratch for mj_jac, allocated once: it runs at 1 kHz. One 6xnv block
+        # with the translational and rotational halves as *views* into it, so
+        # the stacked Jacobian every consumer wants is already assembled and
+        # ee_jacobian() is a single column-slice rather than two index copies
+        # and a vstack. Three allocations a step become one, which matters here
+        # for the garbage collector as much as for the arithmetic: this loop has
+        # a 1 ms deadline and a gen-2 pass is milliseconds.
+        self._jacobian_scratch: Optional[np.ndarray] = None
+        self._jacp: Optional[np.ndarray] = None
+        self._jacr: Optional[np.ndarray] = None
+        # The EE Jacobian and pose for one model state, memoised on ``data.time``
+        # so the two consumers that both want them on the same physics step --
+        # the state snapshot and the Cartesian control law -- pay for one
+        # evaluation between them. See _step_ee_readings().
+        self._readings_time: Optional[float] = None
+        self._readings_jacobian: Optional[np.ndarray] = None
+        self._readings_pose: Optional[np.ndarray] = None
+
         # Latest commands from the network threads, published lock-free (see the
         # class docstring and the update_* methods).
         self.control_mode = ControlMode.POSITION  # Default to position control
@@ -298,6 +327,17 @@ class MujocoFrankaSim:
         # baseline from an old streaming session or a different control mode
         # never produces a first-step spike.
         self._position_feedforward = PositionFeedforward(ARM_INITIAL_Q)
+
+        # Cartesian generators. ``latest_cartesian_pose`` is the commanded
+        # ``O_T_EE_c`` as a row-major 4x4 (None until a pose motion streams
+        # one); ``latest_cartesian_twist`` is the commanded ``O_dP_EE_c``;
+        # ``latest_elbow_angle`` is ``elbow_c[0]``, the redundancy angle, or
+        # None when the client commands no elbow. All rebound whole, never
+        # mutated, exactly like the joint commands above.
+        self.latest_cartesian_pose: Optional[np.ndarray] = None
+        self.latest_cartesian_twist = np.zeros(6)
+        self.latest_elbow_angle: Optional[float] = None
+        self._cartesian_feedforward = CartesianFeedforward()
 
         # Per-finger targets (m), each 0..MAX_FINGER_TRAVEL. Start fully open.
         self.max_finger_width = 2 * MAX_FINGER_TRAVEL  # total opening
@@ -318,6 +358,8 @@ class MujocoFrankaSim:
             "ddq_d": np.zeros(7),
             "tau_J": np.zeros(7),
             "O_T_EE": np.eye(4).T.flatten(),
+            "O_dP_EE": np.zeros(3),
+            "O_J_EE": np.zeros((6, 7)),
         }
 
     # -- construction ------------------------------------------------------
@@ -359,6 +401,10 @@ class MujocoFrankaSim:
         if self.ee_body_id < 0:
             raise KeyError(f"Body {ee_body!r} not found in the compiled model")
 
+        self._jacobian_scratch = np.zeros((6, self.model.nv))
+        self._jacp = self._jacobian_scratch[:3]
+        self._jacr = self._jacobian_scratch[3:]
+
         if self.enable_hand:
             finger_names = [f"{self.prefix}finger_joint{i}" for i in (1, 2)]
             self.finger_qpos_adr = _qpos_addresses(self.model, finger_names)
@@ -394,6 +440,30 @@ class MujocoFrankaSim:
         if not isinstance(mode, ControlMode):
             raise ValueError(f"Mode must be a ControlMode enum, got {type(mode)}")
         logger.info("Switching control mode to: %s", mode.value)
+        if mode in (ControlMode.CARTESIAN_POSE, ControlMode.CARTESIAN_VELOCITY):
+            # Same discontinuous-entry rule as POSITION below, in Cartesian
+            # terms: forget the previous motion's target entirely rather than
+            # carry it into this one. Cleared to *nothing*, not to the current
+            # pose: this runs on a network thread while the physics thread
+            # steps, so reading the model here would be a torn read of
+            # ``xpos``/``xmat``, and the arm has no need of a seed -- with no
+            # target the servo simply holds zero velocity until this motion's
+            # first command lands, which is one millisecond later.
+            #
+            # Cleared *before* ``self.control_mode`` is published, and that
+            # order is load-bearing: the physics thread branches on the mode and
+            # then reads the targets, both without a lock, so publishing the
+            # mode first opens a window where a step sees "Cartesian" and the
+            # *previous* motion's pose or twist still standing -- one full step
+            # of tracking a target this motion never asked for (measured: an
+            # 11 rad/s joint-4 target on entry). Clearing first can only cost
+            # the opposite, harmless thing: a step that still sees the old mode
+            # with its own target already gone, which every mode below reads as
+            # "hold".
+            self.latest_cartesian_pose = None
+            self.latest_cartesian_twist = np.zeros(6)
+            self.latest_elbow_angle = None
+            self._cartesian_feedforward.reset()
         self.control_mode = mode
         if mode == ControlMode.POSITION:
             # Discontinuous-target entry point: a fresh Move into POSITION mode
@@ -421,6 +491,55 @@ class MujocoFrankaSim:
     def update_joint_velocities(self, velocities) -> None:
         """Publish the latest commanded joint velocities (lock-free; see update_torques)."""
         self.latest_joint_velocities = np.asarray(velocities, dtype=float)
+
+    def update_cartesian_pose(self, o_t_ee_c, elbow_angle=None) -> None:
+        """Publish the commanded EE pose for a ``kCartesianPosition`` motion.
+
+        ``o_t_ee_c`` is the wire's 16-element **column-major** 4x4;
+        ``elbow_angle`` is ``elbow_c[0]`` when the client commands an elbow and
+        None otherwise. Lock-free (see :meth:`update_torques`): both are rebound
+        whole and only the physics thread reads them.
+
+        Publishing a target is all this does. The conversion to joint motion
+        happens on the physics thread, once per step, in
+        :meth:`cartesian_joint_velocity` -- so a client streaming at 1 kHz and a
+        physics loop stepping at 1 kHz stay decoupled, and a cycle that brings
+        no command simply tracks the pose that is still standing.
+        """
+        self.latest_cartesian_pose = np.asarray(o_t_ee_c, dtype=float).reshape(4, 4).T
+        self.latest_elbow_angle = None if elbow_angle is None else float(elbow_angle)
+
+    def update_cartesian_velocity(self, o_dp_ee_c, elbow_angle=None) -> None:
+        """Publish the commanded EE twist for a ``kCartesianVelocity`` motion.
+
+        ``o_dp_ee_c`` is ``[vx, vy, vz, wx, wy, wz]`` in the base frame, the
+        layout libfranka packs ``CartesianVelocities`` in. Lock-free; see
+        :meth:`update_cartesian_pose`.
+        """
+        self.latest_cartesian_twist = np.asarray(o_dp_ee_c, dtype=float)[:6]
+        self.latest_elbow_angle = None if elbow_angle is None else float(elbow_angle)
+
+    def update_ee_transform(self, f_t_ee) -> None:
+        """Publish the flange -> EE transform the FCI calls ``F_T_EE``.
+
+        ``f_t_ee`` is a 16-element **column-major** 4x4, the layout every
+        transform on the FCI wire uses (``std::array<double, 16>``), so it can
+        be handed straight through from a ``SetEE``/``SetNEToEE`` request.
+
+        What it changes is where :meth:`_read_and_publish_state` measures the
+        arm's Cartesian velocity. The default identity measures at the flange;
+        a client that mounts a tool 0.5 m out is measured 0.5 m out, and the
+        lever arm is real -- which is exactly the difference Franka's
+        ``CartesianVelocityViolationHardware`` is built to detect (see
+        :meth:`franka_sim.motion_limits.MotionLimitChecker.check_measured_cartesian_velocity`).
+
+        Lock-free (see :meth:`update_torques`): a fresh array is bound in one
+        bytecode step and the physics thread only ever reads it.
+        """
+        matrix = np.asarray(f_t_ee, dtype=float)
+        if matrix.size != 16:
+            raise ValueError(f"F_T_EE must have 16 elements, got {matrix.size}")
+        self._f_t_ee = matrix.reshape(4, 4).T
 
     def update_finger_positions(self, positions) -> None:
         """Publish per-finger position targets (length-2, each 0..0.04 m).
@@ -475,7 +594,16 @@ class MujocoFrankaSim:
             tau = self.latest_torques
         else:
             dq = self.data.qvel[self.arm_dofs_idx]
-            if mode == ControlMode.VELOCITY:
+            if mode in (ControlMode.CARTESIAN_POSE, ControlMode.CARTESIAN_VELOCITY):
+                # A Cartesian command becomes a joint velocity and then goes
+                # through the *same* velocity servo a kJointVelocity motion
+                # drives -- no separate Cartesian control law, so every
+                # measured-side check downstream (the joint velocity envelope,
+                # the EE speed limit) judges a Cartesian motion with the code
+                # that judges a joint one. See cartesian_joint_velocity().
+                jacobian, ee_pose = self._step_ee_readings()
+                tau = ARM_VELOCITY_KV * (self.cartesian_joint_velocity(jacobian, ee_pose) - dq)
+            elif mode == ControlMode.VELOCITY:
                 tau = ARM_VELOCITY_KV * (self.latest_joint_velocities - dq)
             else:
                 target = self.latest_joint_positions
@@ -500,6 +628,131 @@ class MujocoFrankaSim:
         if self.enable_hand:
             self.data.qfrc_applied[self.finger_dofs_idx] = self.finger_control_force()
 
+    def ee_pose(self) -> np.ndarray:
+        """Measured EE pose as a row-major 4x4 in the base frame.
+
+        The flange body's pose composed with ``F_T_EE``
+        (:meth:`update_ee_transform`) -- the same frame :meth:`ee_jacobian`,
+        :meth:`measured_ee_velocity` and the published ``O_T_EE`` describe;
+        ``_read_and_publish_state`` transposes this very matrix onto the wire.
+        Row-major, i.e. ordinary matrix layout: the wire's column-major form is
+        one ``.T.flatten()`` away, and mixing the two up is the classic way to
+        get a transposed rotation that looks almost right.
+        """
+        pose = np.eye(4)
+        pose[:3, :3] = self.data.xmat[self.ee_body_id].reshape(3, 3)
+        pose[:3, 3] = self.data.xpos[self.ee_body_id]
+        return pose @ self._f_t_ee
+
+    def cartesian_joint_velocity(
+        self, jacobian: np.ndarray, ee_pose: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Joint velocity that realises this step's Cartesian command.
+
+        The bridge between the FCI's two Cartesian interfaces and the joint
+        servo: differential IK on ``jacobian``, with the desired twist taken
+        from whichever generator is running. ``ee_pose`` is the measured pose
+        the same step's ``jacobian`` was taken at (see :meth:`_step_ee_readings`);
+        it is read back off the model when a caller does not have one.
+
+        * ``kCartesianPosition``: the commanded pose's own velocity (the
+          :class:`~franka_sim.cartesian_ik.CartesianFeedforward` backward
+          difference) plus a proportional term on the pose error, so the arm
+          both follows the trajectory and closes on it.
+        * ``kCartesianVelocity``: the commanded twist as it stands. There is no
+          pose to track and therefore nothing to correct towards -- a twist
+          generator's *only* statement is a velocity, and integrating one into a
+          pose to servo against would invent a reference the client never sent
+          and then fight the client's next twist with it.
+
+        The elbow rides in the Jacobian's null space when the client commands
+        one; see :func:`franka_sim.cartesian_ik.elbow_null_velocity`.
+        """
+        if self.control_mode == ControlMode.CARTESIAN_POSE:
+            desired = self.latest_cartesian_pose
+            if desired is None:
+                return np.zeros(7)
+            feedforward = self._cartesian_feedforward.step(desired, self.dt)
+            if ee_pose is None:
+                ee_pose = self.ee_pose()
+            twist = tracking_twist(desired, ee_pose, feedforward)
+        else:
+            twist = self.latest_cartesian_twist
+        elbow_angle = self.latest_elbow_angle
+        null_velocity = (
+            None
+            if elbow_angle is None
+            else elbow_null_velocity(elbow_angle, self.data.qpos[self.arm_qpos_adr])
+        )
+        return resolved_rate(jacobian, twist, null_velocity)
+
+    def ee_jacobian(self) -> np.ndarray:
+        """Geometric Jacobian of the EE frame, base-oriented, 6x7 over the arm joints.
+
+        Rows 0-2 map ``dq`` to the EE's translational velocity, rows 3-5 to its
+        angular velocity. The point is the flange origin shifted by ``F_T_EE``'s
+        translation (:meth:`update_ee_transform`) -- and the "flange" is
+        whichever body this backend already reports as ``O_T_EE`` (``link7``),
+        so the Jacobian, the pose and the velocity the client is told about all
+        describe one and the same frame.
+
+        Only the arm's seven columns: the finger DOFs are not ancestors of the
+        EE body, so their columns are structurally zero and carrying them would
+        only make every consumer slice them off again.
+
+        Two consumers, both in the FCI layer above: the measured Cartesian
+        velocity the safety controller watches (:meth:`measured_ee_velocity`),
+        and the smallest singular value a ``Move`` uses to decide whether the
+        arm is standing in a singularity. Computed once per physics step and
+        published in the snapshot so neither of them has to touch ``mjData``
+        from another thread.
+        """
+        rotation = self.data.xmat[self.ee_body_id].reshape(3, 3)
+        point = self.data.xpos[self.ee_body_id] + rotation @ self._f_t_ee[:3, 3]
+        mujoco.mj_jac(self.model, self.data, self._jacp, self._jacr, point, self.ee_body_id)
+        # ``_jacp``/``_jacr`` are views into one 6xnv scratch, so the stack is
+        # already there; the column slice is what makes the result a fresh array
+        # the caller may keep (the state snapshot does) rather than a window
+        # onto the buffer the next step overwrites.
+        return self._jacobian_scratch[:, self.arm_dofs_idx]
+
+    def _step_ee_readings(self):
+        """``(jacobian, ee_pose)`` for the model as it stands, computed once a step.
+
+        :meth:`_read_and_publish_state` and :meth:`arm_control_torque` both want
+        both of them, and in :meth:`run_simulation` they run back to back on the
+        *same* model state -- read, apply, step. Evaluating them twice cost
+        ~11 us of a 1 ms budget on the thread that must not miss its deadline,
+        which on a Cartesian motion was a tenth of the whole control law.
+
+        Keyed on ``data.time``, so the memo can only ever be returned for the
+        state it was taken from: anything that advances the physics invalidates
+        it, and :meth:`step`'s apply-then-step order simply misses every time
+        rather than reading a stale one. The public
+        :meth:`ee_jacobian`/:meth:`ee_pose` are left uncached -- a caller that
+        pokes ``qpos`` directly (tests do) must get an honest answer.
+
+        It also makes the guarantee exact rather than incidental: the pose the
+        client is told about, the Jacobian the safety check uses and the frame
+        the control law servos are now literally the same two arrays, so a
+        ``F_T_EE`` rebound mid-step cannot land between them.
+        """
+        if self._readings_time != self.data.time:
+            self._readings_jacobian = self.ee_jacobian()
+            self._readings_pose = self.ee_pose()
+            self._readings_time = self.data.time
+        return self._readings_jacobian, self._readings_pose
+
+    def measured_ee_velocity(self) -> np.ndarray:
+        """Translational velocity of the EE frame in the base frame (m/s).
+
+        ``J_p * dq`` from :meth:`ee_jacobian` -- a Jacobian rather than a
+        difference of poses because the difference would carry the integrator's
+        step noise divided by 1 ms, which at these magnitudes is louder than the
+        signal. The quantity Control watches for ``cartesian_velocity_violation``.
+        """
+        return self.ee_jacobian()[:3] @ self.data.qvel[self.arm_dofs_idx]
+
     def _read_and_publish_state(self) -> None:
         """Read the model once and publish one state snapshot for the network threads."""
         # Copies, not views: the snapshot is handed to the network threads and
@@ -518,6 +771,19 @@ class MujocoFrankaSim:
                 "dq": np.array(self.data.qvel[self.finger_dofs_idx]),
             }
 
+        # One Jacobian evaluation serves both Cartesian readings below, and one
+        # pose evaluation serves ``O_T_EE`` -- and this step's control law gets
+        # both of them for free (see _step_ee_readings).
+        #
+        # The pose is composed with F_T_EE (ee_pose()), not the bare flange: the
+        # FCI's O_T_EE is by definition "measured end effector pose in base
+        # frame", and publishing the flange there while ee_jacobian()/
+        # measured_ee_velocity() -- and the Cartesian generators that servo
+        # against them -- all describe the EE frame would put the whole
+        # Cartesian interface a tool-length out of agreement with itself. With
+        # the default identity F_T_EE the two are the same matrix.
+        jacobian, ee_pose = self._step_ee_readings()
+
         # q_d / tau_J mirror the latest network commands (atomic reads), exactly
         # as the Genesis sim reports them.
         self._state_snapshot = {
@@ -528,9 +794,9 @@ class MujocoFrankaSim:
             "dq_d": dq,
             "ddq_d": self.ddq_filtered,
             "tau_J": self.latest_torques,
-            "O_T_EE": pose_to_column_major(
-                self.data.xpos[self.ee_body_id], self.data.xquat[self.ee_body_id]
-            ),
+            "O_T_EE": ee_pose.T.flatten(),
+            "O_dP_EE": jacobian[:3] @ dq,
+            "O_J_EE": jacobian,
         }
 
     def step(self, steps: int = 1) -> None:

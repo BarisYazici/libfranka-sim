@@ -1,3 +1,5 @@
+"""Physics-backed gripper backend that drives the shared Genesis finger DOFs."""
+
 import logging
 import time
 
@@ -85,12 +87,23 @@ class GenesisFrankaHand(GripperBackend):
 
     # -- GripperBackend -----------------------------------------------------
     def homing(self) -> bool:
+        """Drive the fingers fully open and block until they settle.
+
+        Always reports success (real homing calibration has no sim equivalent
+        here) and clears any prior grasp/stuck state.
+        """
         self._drive_and_settle(self.max_width)
         self.is_grasped = False
         self.is_stuck = False
         return True
 
     def move(self, width: float, speed: float) -> bool:
+        """Drive the fingers to ``width`` and block until they settle or time out.
+
+        ``speed`` is accepted for protocol compatibility but not used to pace
+        the motion. Always returns True; ``is_stuck`` is set if the fingers
+        never settled within the timeout.
+        """
         final, settled = self._drive_and_settle(width)
         self.is_grasped = False
         self.is_stuck = not settled
@@ -104,6 +117,13 @@ class GenesisFrankaHand(GripperBackend):
         speed: float,
         force: float,
     ) -> bool:
+        """Close the fingers toward ``width`` and infer whether an object was caught.
+
+        An object is considered caught when the fingers settle wider than the
+        commanded width and within [``width`` - epsilon_inner, ``width`` +
+        epsilon_outer]. Returns ``is_grasped``. ``speed``/``force`` are accepted
+        for protocol compatibility but not used (no contact-force API here).
+        """
         commanded = self._clamp_width(width)
         final, settled = self._drive_and_settle(width)
         caught = final > commanded + 1e-4 and (
@@ -120,12 +140,22 @@ class GenesisFrankaHand(GripperBackend):
         return self.is_grasped
 
     def stop(self) -> bool:
+        """Stop any in-progress motion by driving the fingers fully open.
+
+        Always returns True and clears any prior grasp/stuck state.
+        """
         self._drive_and_settle(self.max_width)
         self.is_grasped = False
         self.is_stuck = False
         return True
 
     def get_state(self) -> GripperStateData:
+        """Return the current width, max width, grasp flag, and temperature.
+
+        Reads only the lock-free finger snapshot, so this is safe to call
+        concurrently with the sim's physics thread (e.g. from the UDP
+        broadcaster thread).
+        """
         return GripperStateData(
             self._current_width(), self.max_width, self.is_grasped, self.temperature
         )

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""TCP/UDP server implementing the libfranka gripper wire protocol (port 1338)."""
 import logging
 import select
 import socket
@@ -58,6 +59,11 @@ class FrankaGripperServer:
 
     # -- low-level receive --------------------------------------------------
     def receive_exact(self, sock: socket.socket, size: int) -> Optional[bytes]:
+        """Block until exactly ``size`` bytes are read from ``sock``, or return None.
+
+        Returns None on a socket error or on a clean close/EOF before
+        ``size`` bytes have been received.
+        """
         data = bytearray()
         while len(data) < size:
             try:
@@ -70,6 +76,11 @@ class FrankaGripperServer:
         return bytes(data)
 
     def receive_message(self, sock: socket.socket):
+        """Read one framed gripper command message: a header plus its payload.
+
+        Returns ``(header, payload)``, or ``(None, None)`` if the header or
+        payload could not be fully read (see ``receive_exact``).
+        """
         header_data = self.receive_exact(sock, GRIPPER_HEADER_SIZE)
         if header_data is None:
             return None, None
@@ -155,6 +166,13 @@ class FrankaGripperServer:
 
     # -- connection handling ------------------------------------------------
     def handle_client(self, sock: socket.socket):
+        """Serve one client connection: dispatch commands until it disconnects.
+
+        Polls ``sock`` for readability, reads one framed message at a time,
+        routes ``kConnect`` to ``_handle_connect`` and everything else to
+        ``_dispatch_command``, and on exit tears down the UDP broadcast
+        thread/socket and closes ``sock``.
+        """
         self.connection_running = True
         try:
             while self.running and self.connection_running:
@@ -189,6 +207,12 @@ class FrankaGripperServer:
                 pass
 
     def run_server(self):
+        """Bind and listen on ``host``:``port``, accepting one client at a time.
+
+        Blocks until ``stop()`` closes the listening socket; each accepted
+        connection is served synchronously via ``handle_client`` before the
+        next ``accept()``.
+        """
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -208,6 +232,7 @@ class FrankaGripperServer:
             self.handle_client(client_socket)
 
     def stop(self):
+        """Signal the server loop to exit and close the listening socket."""
         logger.info("Stopping gripper server")
         self.running = False
         self.connection_running = False

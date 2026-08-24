@@ -212,9 +212,11 @@ zero-filled `q_c` its datagram happens to carry — and, symmetrically, a joint
 motion is never blamed for the zero-filled `O_T_EE_c` its datagram carries, which
 is not a valid transform at all.
 
-Both Cartesian generators are checked on an arm role even though neither moves it
-(see ["what will not work"](#what-will-not-work)): the point of the checks there
-is the *abort*, which is what makes Franka's own smoke tests for Cartesian errors
+The checking layer is independent of whether the backend can *drive* the
+interface: it judges the stream the client sent, so it behaves identically on a
+backend that moves the arm from a Cartesian command and one that does not (see
+[Cartesian control](#cartesian-control)). The point of the checks is the
+*abort*, which is what makes Franka's own smoke tests for Cartesian errors
 terminate. With enforcement off they only log, and a smoke test waiting for an
 abort will still wait forever.
 
@@ -308,6 +310,57 @@ Five things worth knowing before you turn it on:
   microseconds apart after an overrun, and it no longer runs ahead of its own
   receive path.
 
+## Cartesian control
+
+Both Cartesian motion generators drive the arm on the default MuJoCo single-arm
+backend. `kCartesianPosition` streams `O_T_EE_c`, `kCartesianVelocity` streams
+`O_dP_EE_c`, and either becomes joint motion through **damped-least-squares
+differential IK** (`franka_sim/cartesian_ik.py`) on the MuJoCo Jacobian at the
+EE frame — the frame `F_T_EE` defines, so a tool set with `setEE` really is the
+point that is being commanded. The joint velocity that comes out goes into the
+*same* velocity servo a `kJointVelocity` motion drives, which is what makes the
+measured-side safety checks apply unchanged: an over-fast Cartesian command
+reaches the joint velocity envelope and aborts with `joint_velocity_violation`
+exactly as it does on hardware.
+
+Details worth knowing:
+
+* **The checking layer is unchanged.** IK tracking is a second consumer of the
+  accepted command stream, not a filter on it. Every limit check listed under
+  [discontinuous commands](#discontinuous-commands) runs first and on the same
+  signal it always did.
+* **The elbow steers the null space.** `elbow_c[0]` is the redundancy angle
+  (joint 3 on an FR3) and is chased inside the Jacobian's null space, so it
+  moves the elbow without moving the end effector. `elbow_c[1]`, the branch
+  flag, is not followed: flipping it means passing through a singularity, which
+  the FCI treats as an error rather than a command.
+* **A Cartesian `Move` is refused from a singular configuration**, with
+  `Move::Status::kStartAtSingularPoseRejected` — libfranka's "Move command
+  rejected: cannot start at singular pose!". The test is the smallest singular
+  value of the EE Jacobian at the arm's measured `q` against a threshold of
+  0.05; see `SINGULAR_POSE_MIN_SINGULAR_VALUE` for how that number was placed.
+  Joint interfaces are *not* refused — driving out of a singularity is the only
+  way to leave one.
+* **Under `kExternalController` nothing changes.** There the client's torques
+  drive the arm and the Cartesian stream is a reference, so the sim stays in
+  torque mode exactly as before.
+* **The controller mode is not a control law here.** Both internal controllers —
+  `kJointImpedance` and `kCartesianImpedance` — drive the arm through the same
+  joint-velocity servo, because that is the only law the backends implement.
+  `SetCartesianImpedance`'s `K_x` is [accepted and not
+  enforced](robot-state.md#tcp-commands), so a client that picks
+  `kCartesianImpedance` to get a compliant end effector gets a stiff one that
+  tracks its commands instead. What it will *not* get is silence: naming only
+  `kJointImpedance` on the dispatch path would leave a `kCartesianImpedance`
+  Cartesian motion accepted, checked and completely inert.
+* **`O_T_EE` is measured at `link7`**, not at the true flange (`link8`, 0.107 m
+  further along z). That is a pre-existing frame choice shared with the Genesis
+  backend and the mobile-duo scene, and `F_T_EE` is composed on top of it — so
+  the sim is self-consistent, but an *absolute* Cartesian target taken from a
+  real robot lands 0.107 m away from where hardware would put it.
+* **Not on every backend.** Genesis and the mobile-duo scene view implement no
+  IK; there the Cartesian interfaces stay checked-but-inert.
+
 ## Multiple robots on one host
 
 libfranka pins the command port to 1337 and gives you no way to change it, so you
@@ -345,5 +398,57 @@ with its own `--bind`-equivalent address.
 | --- | --- |
 | libfranka <= 0.17 (protocol 9) | Different `RobotState` layout. Not supported. |
 | `franka::Robot::setGuidingMode`, `setEE`, `setK`, `setLoad` | The commands are **accepted and acknowledged**, so your client will not hang — but the values are not enforced by the sim. See [TCP commands](robot-state.md#tcp-commands). |
-| Cartesian **position** control | **The arm does not move.** No physics branch turns a commanded pose into joint targets, so `kCartesianPosition` gets `kMotionStarted` and then nothing happens mechanically. The commanded stream is no longer ignored, though: `O_T_EE_c` and `elbow_c` are decoded, differentiated and validated against the pose generator's full set of limits, and under `--enforce-motion-limits` a bad one aborts with the error the real robot gives — invalid frame, start pose, start elbow, elbow sign, elbow limits, and the velocity/acceleration/jerk discontinuities. Franka's own `arm_smoke_tests` Cartesian error cases therefore *terminate* against the sim instead of hanging. The same is true of `kCartesianVelocity` on an **arm** role; on the mobile duo's **base** role Cartesian velocity is checked *and* driven. |
+| Cartesian control on the **Genesis** backend and the **mobile-duo arms** | The arm does not move. Those backends implement no differential IK, so `kCartesianPosition`/`kCartesianVelocity` get `kMotionStarted` and the commanded stream is checked but never applied. The default MuJoCo single-arm backend *does* drive both interfaces — see [Cartesian control](#cartesian-control). |
 | Anything relying on contact/collision reporting | The collision and external-force fields are permanent zeros today. See [the field table](robot-state.md#robotstate-fields). |
+
+## Known issue: run-to-run repeatability of velocity generators
+
+**The sim does not reproduce a velocity-commanded motion to the same joint
+configuration twice.** Two runs of the same `kJointVelocity`, `kCartesianVelocity`
+or torque motion from the same start pose end tens of milliradians apart under
+host load. Position generators are unaffected — they close the loop on a
+commanded pose and correct whatever the last cycle got wrong — so this is
+specifically the *integrating* interfaces.
+
+**Why.** The physics thread paces itself on the wall clock, one 1 ms step per
+millisecond of real time. The client's motion profile advances on a different
+clock: the `message_id` of the states this server publishes, which is what
+libfranka's `Duration` counts. Those two clocks are the same clock on hardware
+and are not here — the publish loop sits a few Hz under 1 kHz (a deliberate
+consequence of the [minimum state spacing](#lazy-clients-and-the-command-cycle)
+that keeps two states from being sent microseconds apart after an overrun), and
+it loses more ticks the busier the box is. Every millisecond of slip is one more
+physics step of the last commanded velocity than the client's own clock
+accounted for, integrated straight into the joint configuration and never
+corrected.
+
+**What you will see.** Franka's own `smoke_test_motion_control` has a test built
+on exactly this assumption — `ControlMechanismParityTest.LoopMatchesActiveControl`
+runs one motion sequence through `robot->control()` and again through the
+read/write active-control interface and asserts the two land within 5e-3 rad per
+joint. Against the sim it fails roughly 10–30% of the time depending on load,
+and `CombinationParamHardware` occasionally goes with it. **This is not new in
+the Cartesian release:** it reproduces on the release before it, where the
+failure enters at the `kJointVelocity` stage instead (0.044 rad observed), and an
+interleaved A/B of the two revisions does not separate them (4/12 vs 1/12 failures,
+Fisher p ≈ 0.32). Driving the Cartesian generators simply gave the same mechanism
+two more motions to accumulate in — an 8 s open-loop twist trajectory is the
+longest integration in the suite.
+
+**What to do about it.** Nothing, if you are running a controller: this is a
+repeatability property, not a correctness one, and every other test in the suite
+passes. If you are diffing two runs of the same trajectory, difference the
+*commanded* stream rather than the measured configuration, or drive a position
+generator. The real fix is to step the physics once per published control cycle
+instead of once per wall millisecond, so that the robot's clock is the clock the
+client sees — that is on the roadmap, not in this release.
+
+**One residual is not explained.** A `kCartesianPosition` motion very
+occasionally aborts mid-flight with
+`cartesian_motion_generator_velocity_discontinuity` at a few hundred to ~1500
+m/s² on `O_T_EE_c`, on a commanded stream that is smooth by construction (~1 in
+15 runs of the parity test observed). The commanded pose is echoed from the
+client's own stream, so a stale echo would explain it — but that has not been
+demonstrated, and the mechanism above does not account for it. Treat an isolated
+Cartesian discontinuity abort as possibly the sim rather than your client, and
+please report it.

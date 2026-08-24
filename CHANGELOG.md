@@ -9,6 +9,75 @@ breaking changes — these are called out explicitly.
 
 ### Added
 
+- **Cartesian motion generators now drive the arm (MuJoCo backend).** Both
+  `kCartesianPosition` and `kCartesianVelocity` were checking-only: the
+  commanded stream was validated in full and the arm never moved. They are now
+  converted to joint motion by damped-least-squares differential IK on the
+  MuJoCo Jacobian at the EE frame (`franka_sim/cartesian_ik.py`), evaluated once
+  per physics step.
+  - The joint velocity that comes out is fed into the **existing** velocity
+    servo, the same one a `kJointVelocity` motion drives, so every measured-side
+    safety check applies to a Cartesian motion unchanged. That is what makes
+    Franka's `CartesianMotionGeneratorJointPositionLimitsViolationHardware` pass:
+    the commanded trajectory drives joint 7 into its position stop, the
+    position-based velocity envelope collapses to zero there, and the sim aborts
+    with `joint_velocity_violation` — the error hardware records.
+  - **The command-stream checking layer is untouched.** IK tracking is a second
+    consumer of the accepted stream, not a filter on it; every limit, start-pose
+    and elbow check runs first and on the same signal it always did.
+  - `elbow_c[0]`, the redundancy angle, steers the Jacobian's **null space**, so
+    it moves the elbow without moving the end effector. `elbow_c[1]` (the branch
+    flag) is not followed — flipping it means passing through a singularity,
+    which the FCI treats as an error.
+  - The IK twist is clamped to the FR3's published Cartesian velocity limits.
+    That never binds on a checked stream; it exists so that with
+    `--enforce-motion-limits` *off* a client teleporting its commanded pose
+    produces a wrong arm rather than an exploding one.
+  - Under `kExternalController` nothing changes: the client's torques still
+    drive the arm and the pose stream stays a reference.
+  - Both internal controller modes drive — `kCartesianImpedance` as well as
+    `kJointImpedance` — through the same joint-velocity servo, since that is the
+    only law the backends implement. `SetCartesianImpedance` is still accepted
+    and not enforced, so `kCartesianImpedance` buys you a tracking arm rather
+    than a compliant one; what it no longer buys you is an accepted, checked and
+    completely inert motion.
+  - Backends without IK (Genesis, the mobile-duo scene view) keep the previous
+    checked-but-inert behaviour; the server asks the backend once and dispatches
+    accordingly.
+
+- **`cartesian_velocity_violation` (4) — the safety controller's Cartesian
+  half.** The measured end-effector speed is now watched against
+  `franka::kMaxTranslationalVelocity` (3 − 1e−3 m/s) every cycle, in every
+  control mode, computed from the MuJoCo Jacobian at the frame `F_T_EE` defines.
+  This is what Franka's `CartesianVelocityViolationHardware` is built to detect:
+  it moves the EE 0.5 m out along the flange with `setEE` *before* running an
+  ordinary joint-velocity ramp, and only that lever arm gets the EE past 3 m/s
+  before the joints reach their own envelope.
+  - **Translation only, and it outranks `joint_velocity_violation` (3).** Both
+    are read off hardware rather than assumed: two suite tests spin joint 6
+    through its 4.18 rad/s envelope — so the EE angular speed passes 2.5 rad/s
+    first — and hardware still answers `joint_velocity_violation`, which rules a
+    rotational term out; and `CartesianVelocityViolationHardware` reports
+    `cartesian_velocity_violation` *alone*, which fixes the precedence.
+  - `F_T_EE` is now **derived and published** as `F_T_NE · NE_T_EE`, libfranka's
+    own decomposition, instead of being a permanent identity. `setEE` therefore
+    shows up in `RobotState` and in the frame the sim measures at.
+
+- **A Cartesian `Move` from a singular configuration is rejected** with
+  `Move::Status::kStartAtSingularPoseRejected`, which libfranka turns into
+  "Move command rejected: cannot start at singular pose!". The test is the
+  smallest singular value of the EE Jacobian at the arm's measured `q` against
+  0.05 — placed between Franka's own `kSingularPose` (σ_min ≈ 0.011) and the
+  tightest start pose any passing Cartesian test uses (≈ 0.139).
+  - Delivered as the motion's **terminal** response, after `kMotionStarted`,
+    because libfranka's `executeCommand<Move>` handles the first response
+    outside any try/catch: a rejection delivered there escapes as a bare
+    `CommandException`, and only the mode-wait loop that follows converts one
+    into the `ControlException` the hardware test catches.
+  - Joint interfaces are **not** refused: Franka's own test reaches the singular
+    configuration by joint motion, and driving out of a singularity is the only
+    way to leave one.
+
 - **Packet-loss extrapolation — a missed motion-generator cycle now continues
   the trajectory, as the FCI does.** This was the last documented divergence in
   the communication layer. Control "takes the previous waypoints and performs a
@@ -329,7 +398,70 @@ breaking changes — these are called out explicitly.
   not applied when the only question is which name an already-certain violation
   gets. Skipped on a mobile-*base* server, whose joints are not FR3 joints.
 
+### Known issues
+
+- **Velocity-commanded motions are not run-to-run repeatable, and Franka's
+  `ControlMechanismParityTest.LoopMatchesActiveControl` flakes ~10–30% under host
+  load** (occasionally taking `CombinationParamHardware` with it). The physics
+  thread steps on the wall clock while the client's motion profile advances on
+  the `message_id` clock of the published states, and the publish loop runs a few
+  Hz under 1 kHz; every millisecond of slip is an extra step of the last
+  commanded velocity that nothing corrects. **Not introduced by the Cartesian
+  work** — it reproduces on 0.4.0, where the divergence enters at the
+  `kJointVelocity` stage instead (0.044 rad observed), and an interleaved A/B of
+  the two revisions does not separate them (4/12 vs 1/12, Fisher p ≈ 0.32).
+  Driving the Cartesian generators only gave the same mechanism two more motions
+  to accumulate in. Position generators are unaffected. The fix — stepping the
+  physics once per published control cycle rather than once per wall millisecond
+  — is roadmap, not in this release. See
+  [the known-issue section](docs/compatibility.md#known-issue-run-to-run-repeatability-of-velocity-generators).
+- **Unexplained:** a `kCartesianPosition` motion very occasionally aborts
+  mid-flight with `cartesian_motion_generator_velocity_discontinuity` at a few
+  hundred to ~1500 m/s² on a commanded stream that is smooth by construction
+  (~1 in 15 parity-test runs). Not root-caused.
+
 ### Changed
+
+- **Arm roles now echo the commanded twist into `O_dP_EE_c`/`O_dP_EE_d`, which
+  fixes a silent 0.386x scaling of the whole `kCartesianVelocity` interface.**
+  `ControlLoop<CartesianVelocities>::convertMotion` sends
+  `lowpassFilter(dt, motion.O_dP_EE, robot_state.O_dP_EE_c, cutoff)`, not the
+  twist your callback returned. With `O_dP_EE_c` left at the wire struct's
+  permanent zero on an arm role — the mobile base echoed its own twist, the arm
+  echoed nothing — the filter's reference was zero on *every* cycle instead of
+  the client's previous command, so the expression stopped being a filter and
+  became a constant multiplier: `gain = dt / (dt + 1/(2*pi*f_c))` = **0.3859** at
+  libfranka's default 100 Hz cutoff and 1 ms. A client asking for 0.1 m/s got
+  0.0386 m/s, for the whole motion, with nothing on the wire to show why. The
+  fields now carry the client's stream while a twist motion runs (extrapolated
+  through a lost cycle like every other commanded field) and return to zero when
+  it ends — an arm held by its internal controller commands no end-effector
+  motion. This is the exact Cartesian twin of the `q_d` staleness fixed below.
+
+- **`O_T_EE` is now published at the end-effector frame, not the bare flange.**
+  It is the measured `link7` pose composed with `F_T_EE`, which is the frame
+  `ee_pose()`, the EE Jacobian, the measured `O_dP_EE` and both Cartesian
+  generators already worked in — so pose, Jacobian and velocity finally describe
+  one and the same frame. A **no-op at the default identity `F_T_EE`**; it
+  matters the moment a client sends `SetNEToEE`, where publishing the flange
+  while servoing the EE meant the client read a pose a whole tool-length away
+  from the frame the sim was controlling, and the first Cartesian command
+  computed from it opened with a tool-length pose error.
+
+- **`elbow_d`/`elbow_c` and `O_T_EE_d`/`O_T_EE_c` no longer track the measured
+  arm while a Cartesian motion is running.** They are commanded fields: during
+  either Cartesian generator they carry the client's own stream, and where the
+  stream carries nothing — a pose motion that commands no elbow, a twist motion
+  that commands no pose, the cycle before the first command lands — they are now
+  **frozen at the value the motion started from** instead of following the arm.
+  libfranka builds every Cartesian command out of these fields (they are its
+  low-pass filter's reference and its rate limiter's baseline, and the smoke
+  suite's generators open with `franka::CartesianPose{state.O_T_EE_d,
+  state.elbow_d}`), so now that the arm is actually driven from those commands,
+  reporting the measured value there closes a feedback loop through the client.
+  Idle and joint motions are unchanged: they report the measured pose and elbow,
+  which is what a "start from `state.O_T_EE_d`" generator reads on its first
+  cycle.
 
 - **Motion-limit errors now use the interface-relative discontinuity names the
   robot uses.** Which discontinuity a violation is called depends on the channel

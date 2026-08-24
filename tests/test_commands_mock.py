@@ -307,7 +307,7 @@ def test_stop_move_command(tcp_client, udp_client, sim_server, mock_genesis_sim)
 def test_second_move_after_stop_move_gets_live_state_on_same_connection(
     tcp_client, udp_client, sim_server, mock_genesis_sim, field_indices
 ):
-    """StopMove ends the motion, not the session -- pinned end to end.
+    """A StopMove ends the motion, not the session -- pinned end to end.
 
     Regression for ``handle_stop_move_command`` clearing ``transmitting_state``
     (and ``connection_running``): both used to permanently stop the 1 kHz
@@ -455,7 +455,8 @@ def _pack_move_command(command_id):
         *move_cmd.maximum_path_deviation,
         *move_cmd.maximum_goal_pose_deviation,
     )
-    return MessageHeader(command=Command.kMove, command_id=command_id, size=12 + len(payload)), payload
+    header = MessageHeader(command=Command.kMove, command_id=command_id, size=12 + len(payload))
+    return header, payload
 
 
 def _read_state_datagram(udp_client, field_indices):
@@ -477,7 +478,9 @@ def _locate_scalar_field(field, sentinel):
     probe.state[field] = sentinel
     values = _ROBOT_STATE_PACKER.unpack(probe.pack_state())
     matches = [index for index, value in enumerate(values) if value == sentinel]
-    assert len(matches) == 1, f"sentinel for {field!r} was not unique in the packed state: {matches}"
+    assert len(matches) == 1, (
+        f"sentinel for {field!r} was not unique in the packed state: {matches}"
+    )
     return matches[0]
 
 
@@ -861,7 +864,11 @@ def test_wait_for_standstill_blocks_until_dq_settles(mock_genesis_sim):
     drove the same field the fix must not read.
     """
     server = _bare_server(mock_genesis_sim)
-    state = {"q": np.zeros(7), "dq": np.array([2.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), "tau_J": np.zeros(7)}
+    state = {
+        "q": np.zeros(7),
+        "dq": np.array([2.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "tau_J": np.zeros(7),
+    }
     mock_genesis_sim.get_robot_state.side_effect = lambda: state
 
     settle_delay = 0.08
@@ -877,7 +884,9 @@ def test_wait_for_standstill_blocks_until_dq_settles(mock_genesis_sim):
     elapsed = time.monotonic() - start
     settler.join(timeout=1.0)
 
-    settle_cycles_time = AUTOMATIC_ERROR_RECOVERY_SETTLE_CYCLES * AUTOMATIC_ERROR_RECOVERY_POLL_PERIOD
+    settle_cycles_time = (
+        AUTOMATIC_ERROR_RECOVERY_SETTLE_CYCLES * AUTOMATIC_ERROR_RECOVERY_POLL_PERIOD
+    )
     # Must not have returned before the arm was actually driven to rest, plus
     # (most of) the sustained-settle window that confirms it stayed there.
     assert elapsed >= settle_delay + 0.5 * settle_cycles_time
@@ -1156,17 +1165,6 @@ _GUARD_COMMAND_PAYLOADS = {
 # are documented exclusions rather than a weaker guard, per
 # test_move_command/test_stop_move_command above.
 _GUARD_EXCLUDED_COMMANDS = {Command.kConnect, Command.kMove}
-
-
-def _recv_exact(sock, size):
-    """Read exactly `size` bytes or raise, so a short/partial reply fails loudly."""
-    data = bytearray()
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise ConnectionError("Connection closed while reading response")
-        data.extend(chunk)
-    return bytes(data)
 
 
 @pytest.mark.parametrize("command", [c for c in Command if c not in _GUARD_EXCLUDED_COMMANDS])

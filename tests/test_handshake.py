@@ -66,7 +66,7 @@ def test_incompatible_version(tcp_client, sim_server, mock_genesis_sim):
 
     # Receive response
     response_header_data = tcp_client.recv(12)
-    response_header = MessageHeader.from_bytes(response_header_data)
+    MessageHeader.from_bytes(response_header_data)
 
     response_data = tcp_client.recv(8)
     status, server_version = struct.unpack("<HH4x", response_data)

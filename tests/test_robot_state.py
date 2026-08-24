@@ -1,5 +1,4 @@
 import struct
-import time
 
 import pytest
 
@@ -42,6 +41,22 @@ ROBOT_STATE_V10_FMT = (
 
 # Byte offset of the `q` field (used to verify float encoding at the right place).
 _FMT_BEFORE_Q = "<" + "Q" + "16f" * 6 + "f9f3f" + "f9f3f" + "2f2f" + "7f7f7f"
+
+# Byte offset of the `theta` field, transcribed the same independent way: it is
+# the last pair of joint arrays before the accelerometers.
+_FMT_BEFORE_THETA = (
+    "<"
+    + "Q"
+    + "16f" * 6
+    + "f9f3f"
+    + "f9f3f"
+    + "2f2f"
+    + "7f" * 8
+    + "7f6f7f6f"
+    + "7f6f6f6f"
+    + "3f2f2f2f"
+    + "16f6f6f"
+)
 
 
 def test_robot_state_initialization():
@@ -97,6 +112,62 @@ def test_robot_state_packing():
     assert list(q) == pytest.approx(state.state["q"])
 
 
+def _unpack_theta_dtheta(packed):
+    """Return (theta, dtheta) read off the wire at their v10 offsets."""
+    offset = struct.calcsize(_FMT_BEFORE_THETA)
+    theta = struct.unpack("<7f", packed[offset : offset + 28])
+    dtheta = struct.unpack("<7f", packed[offset + 28 : offset + 56])
+    return list(theta), list(dtheta)
+
+
+def test_theta_and_dtheta_report_the_measured_joint_state():
+    """theta/dtheta are the motor-side encoder; rigid joints make them q/dq.
+
+    Regression: they were left at their zero initialiser and never written, so
+    every published state claimed the motors sat at 0 rad no matter where the
+    arm was. Franka's smoke-test external controller closes its PD loop on
+    theta (``test/smoke/src/smoke_common.cpp:272-276``), so a zero theta turned
+    ``k_p * (q_d - theta)`` into k_p times the whole joint angle and every
+    ``*ExternalController*`` motion aborted with ``tau_J_range_violation``.
+    """
+    state = RobotState()
+    state.state["q"] = [0.1, 0.2, 0.3, -2.0, 0.5, 2.2, 0.7]
+    state.state["dq"] = [0.01, -0.02, 0.03, -0.04, 0.05, -0.06, 0.07]
+
+    theta, dtheta = _unpack_theta_dtheta(state.pack_state())
+
+    assert theta == pytest.approx(state.state["q"])
+    assert dtheta == pytest.approx(state.state["dq"])
+    # The dict the rest of the server reads is kept truthful too, not just the
+    # bytes on the wire.
+    assert state.state["theta"] == pytest.approx(state.state["q"])
+    assert state.state["dtheta"] == pytest.approx(state.state["dq"])
+
+
+def test_theta_tracks_q_across_successive_packs():
+    """A second pack must report the new q, not the one the first pack saw."""
+    state = RobotState()
+    state.state["q"] = [0.0] * 7
+    state.pack_state()
+
+    state.state["q"] = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
+    state.state["dq"] = [0.5] * 7
+    theta, dtheta = _unpack_theta_dtheta(state.pack_state())
+
+    assert theta == pytest.approx(state.state["q"])
+    assert dtheta == pytest.approx([0.5] * 7)
+
+
+def test_mirroring_motor_state_does_not_alias_q():
+    """Theta must be a copy: mutating q afterwards may not rewrite the packed theta."""
+    state = RobotState()
+    state.state["q"] = [0.3] * 7
+    state.pack_state()
+
+    state.state["theta"][0] = 99.0
+    assert state.state["q"][0] == pytest.approx(0.3)
+
+
 def test_robot_state_mode_changes():
     """Test robot state mode changes"""
     state = RobotState()
@@ -135,10 +206,6 @@ def test_robot_state_mode_changes():
     # Extract and verify each field
     motion_mode, controller_mode = struct.unpack(
         "<BB", packed_state[controller_mode_offset : controller_mode_offset + 2]
-    )
-    errors = struct.unpack("<41B", packed_state[errors_offset : errors_offset + 41])
-    reflex_reason = struct.unpack(
-        "<41B", packed_state[reflex_reason_offset : reflex_reason_offset + 41]
     )
     robot_mode = struct.unpack("<B", packed_state[robot_mode_offset : robot_mode_offset + 1])[0]
     success_rate = struct.unpack("<f", packed_state[success_rate_offset:])[0]

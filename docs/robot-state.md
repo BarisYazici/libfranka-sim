@@ -63,7 +63,7 @@ constant for the life of the connection.
 | `q_d` | **faithful** | The last commanded joint-position target — `q_c` for a position-mode client, the *held* previous waypoint through a lost cycle (see [below](#what-the-sim-does-with-a-lost-cycle)), and the internal controller's own hold setpoint (measured `q`) between motions. Owned by the FCI layer on arm roles, so no physics backend overwrites it. In a **torque-only** session (`kExternalController` with no motion generator) nothing commands a joint position at all, so `q_d` stays at the hold setpoint captured when the `Move` was accepted and `dq_d` / `ddq_d` stay zero for the whole session; see the caveat below the table. |
 | `dq_d` | **faithful** | `dq_{c,k-1}`: the backward-difference velocity the commanded stream implies in position mode, the commanded `dq_c` in velocity mode, zero between motions. This is the value libfranka documents ("always sent back to the user in the robot state"), and it is what its default command low-pass filter feeds back in. |
 | `ddq_d` | **faithful** | `ddq_{c,k-1}`: the backward-difference acceleration of the commanded stream, from the same differencing the [discontinuity checks](#motion-limits-and-discontinuities) run. Zero between motions. Not a measured acceleration. |
-| `theta`, `dtheta` | **stub** | Permanent zero. There is no motor-side / pre-gearbox encoder model; only link-side `q` exists. |
+| `theta`, `dtheta` | **approximation** | Derived: `theta = q`, `dtheta = dq`. No backend models joint elasticity, so the motor-side encoder reads exactly what the link-side one does. On hardware the two differ by the joint's elastic-element deflection, `q = theta - tau_J / K_joint` -- order 1e-3 rad at ordinary torques for the FR3. |
 
 !!! warning "`q_d` is frozen for the whole of a torque-only session"
 
@@ -104,13 +104,15 @@ constant for the life of the connection.
 
 | Field | Kind | What the sim actually reports |
 | --- | --- | --- |
-| `O_T_EE` | **physics** | Measured flange (`link7`) pose, converted to a column-major 4×4. Because all the frame offsets below are identity, this is the **flange** pose — *not* a hand or fingertip TCP pose, even with `--gripper-physics`. |
+| `O_T_EE` | **physics** | Measured flange (`link7`) pose composed with `F_T_EE`, converted to a column-major 4×4 — the same frame `O_dP_EE`, the EE Jacobian and the Cartesian generators use, so the pose you are told about is the pose the sim controls. With the default identity `F_T_EE` that is the **flange** pose — *not* a hand or fingertip TCP pose, even with `--gripper-physics`; send `SetNEToEE` to move the frame. |
 | `O_T_EE` *(mobile-duo `base` role)* | **approximation** | Not physics-measured. Open-loop dead reckoning: `x, y, theta` Euler-integrated from the commanded body twist. No wheel contact or slip feeds back — the pose is exactly what you commanded, integrated. |
-| `O_T_EE_d` | **derived** *(idle)* / **echo** *(pose motion)* | Between motions, and during every motion whose generator is not the Cartesian pose one, this is the **measured** `O_T_EE` — the pose the internal controller is holding, republished every cycle. During a `kCartesianPosition` motion it is the commanded pose the generator is tracking, extrapolated through a lost cycle exactly as `q_d` is; it snaps back to the measured pose the moment the motion ends, however it ends. It used to be a permanent identity, and that was not harmless: a libfranka Cartesian-pose motion generator initialises and holds from this field, so an identity opened every pose motion metres away from the robot and tripped `cartesian_position_motion_generator_start_pose_invalid` on cycle 0. *(Arm roles only — the mobile-duo base bridge is unchanged.)* |
-| `O_T_EE_c` | **derived** *(idle)* / **echo** *(pose motion)* | The last pose the client commanded, or — idle, between motions, under a non-Cartesian generator — the measured `O_T_EE`, same as `O_T_EE_d`. libfranka reads this one too: it is the reference its command low-pass filter blends the next `O_T_EE_c` with (`ControlLoop<CartesianPose>::convertMotion`), so a stub here dragged every command the client sent towards whatever the sim invented. The commanded pose is also decoded, differentiated and [checked](#motion-limits-and-discontinuities) against the pose generator's limits — but it is never *applied*: the arm does not move. |
-| `F_T_EE`, `F_T_NE` | **stub** | Permanent identity. The flange↔EE offset is never modelled. |
-| `NE_T_EE`, `EE_T_K` | **echo** | Identity until set; `SetNEToEE` / `SetEEToK` values are reflected back in subsequent states, exactly as the real robot reports them — but the frames are not used in any kinematics. |
-| `O_dP_EE_d`, `O_dP_EE_c` | **echo** *(base role only)* | On the mobile-duo base's Cartesian-velocity path, both echo the commanded body twist. For arm roles and the single-arm sim they are permanent-zero stubs. Same caveat as `delbow_c` below: a `kCartesianPosition` client running libfranka's own `limit_rate = true` feeds its rate limiter from `O_dP_EE_c`/`O_ddP_EE_c` (`limitRate<CartesianPose>`, `src/rate_limiting.cpp`), and on an arm role both are permanent zero here — so client-side rate limiting on the *pose* interface is judging against a signal the sim never actually populates, and can misbehave silently. |
+| `O_T_EE_d` | **derived** *(idle / joint motion)* / **echo** *(pose motion)* / **frozen** *(twist motion)* | Three regimes. **Idle, between motions, and under a joint generator** it is the **measured** `O_T_EE` — the pose the internal controller is holding, republished every cycle; that is what a libfranka pose generator reads on its first callback (`std::array<double, 16> cmd = state.O_T_EE_d;`). **Under `kCartesianPosition`** it is the commanded pose the generator is tracking, extrapolated through a lost cycle exactly as `q_d` is. **Under `kCartesianVelocity`** the client commands no pose at all, so rather than resume tracking the arm this motion is itself driving, the field is *frozen* at the pose the motion started from and returns to measured tracking the moment the motion ends, however it ends. Freezing is not cosmetic: a commanded field that follows the arm the commands are moving closes a feedback loop through the client's own filter. It used to be a permanent identity, which opened every pose motion metres away from the robot and tripped `cartesian_position_motion_generator_start_pose_invalid` on cycle 0. *(Arm roles only — the mobile-duo base bridge is unchanged.)* |
+| `O_T_EE_c` | **derived** *(idle / joint motion)* / **echo** *(pose motion)* / **frozen** *(twist motion)* | The last pose the client commanded, and otherwise exactly `O_T_EE_d` above, regime for regime. libfranka reads this one too: it is the reference its command low-pass filter blends the next `O_T_EE_c` with (`ControlLoop<CartesianPose>::convertMotion`), so a stub here dragged every command the client sent towards whatever the sim invented. The commanded pose is also decoded, differentiated and [checked](#motion-limits-and-discontinuities) against the pose generator's limits, and — on the default MuJoCo backend — [applied](compatibility.md#cartesian-control) through differential IK, so the arm actually follows it. |
+| `F_T_EE` | **derived** | `F_T_NE · NE_T_EE`, libfranka's own decomposition (`Robot::setEE`), recomputed whenever `SetNEToEE` moves the frame and reset to identity on a new connection. Not a stub any more: on the MuJoCo backend it is where `O_T_EE`, the EE Jacobian and the measured `O_dP_EE` the [safety controller](#cartesian_velocity_violation-4-the-safety-controllers-other-half) watches are all evaluated, so a tool mounted 0.5 m out really is measured 0.5 m out, lever arm and all. |
+| `F_T_NE` | **stub** | Permanent identity — there is no `SetNEToF`-style command on the v10 wire to move it, so the nominal-EE frame always sits on the flange and `F_T_EE` is exactly `NE_T_EE`. |
+| `NE_T_EE` | **echo** | Identity until set; `SetNEToEE` values are reflected back in subsequent states, exactly as the real robot reports them — and, unlike `EE_T_K`, they *do* reach the kinematics through `F_T_EE` above. |
+| `EE_T_K` | **echo** | Identity until set; `SetEEToK` values are reflected back in subsequent states, but the stiffness frame is not used in any kinematics — nothing in the sim implements Cartesian impedance for it to mean anything to. |
+| `O_dP_EE_d`, `O_dP_EE_c` | **echo** *(twist motion)* / **zero** *(otherwise)* | The last twist the client commanded, on both the mobile-duo base's Cartesian-velocity path (a *body* twist) and an arm role's `kCartesianVelocity` (an *end-effector* twist), extrapolated through a lost cycle like every other commanded field. Zero the rest of the time — idle, between motions, and under any other generator — because an arm held by its internal controller is commanding no end-effector motion. **The arm-role echo is new, and its absence was not a harmless stub:** `ControlLoop<CartesianVelocities>::convertMotion` low-passes every commanded twist toward `O_dP_EE_c`, so with the field pinned at zero the filter stopped being a filter and became a constant multiplier — `dt / (dt + 1/(2πf_c))` = **0.386** at libfranka's default 100 Hz cutoff. Every `kCartesianVelocity` client was moving the arm at 39% of the speed it asked for, silently. `O_ddP_EE_c` is still a permanent zero, so a client that opts into libfranka's `limit_rate = true` is feeding its rate limiter a jerk reference the sim never populates, on both Cartesian interfaces — same caveat as `delbow_c` below. |
 | `O_ddP_EE_c`, `O_ddP_O` | **stub** | Permanent zero. |
 | `elbow` | **derived** | `(q[2], sign(q[3]))` — the redundancy angle *is* joint 3 on an FR3 and the branch flag *is* the sign of joint 4, so this is a reading of `q` rather than a model. It was a permanent `[0.0, 0.0]` stub until the [elbow checks](#motion-limits-and-discontinuities) landed — and a zero branch flag is one libfranka refuses to send (`checkElbow` throws client-side unless it is exactly ±1), which made the elbow interface unreachable from a real client. *(Arm roles only; the mobile-duo base bridge has no elbow.)* |
 | `elbow_d`, `elbow_c` | **derived** *(idle)* / **echo** *(Cartesian motion)* | The same `(q[2], sign(q[3]))` reading whenever nothing commands an elbow — idle, between motions, under a joint generator, or under a Cartesian motion whose commands carry no elbow at all (`valid_elbow` clear). While either Cartesian generator *is* streaming one, both echo it, held through lost cycles and snapping back to the measured elbow when the motion ends. `elbow_c` is also decoded and checked on both Cartesian generators (start elbow, sign consistency, velocity/acceleration/jerk). *(Arm roles only.)* |
@@ -152,7 +154,7 @@ observer in the sim today.
 | `motion_generator_mode` | **faithful** | Set from the `Move` request's motion-generator mode, reset to `kIdle` on motion end or `StopMove`. Correct. |
 | `controller_mode` | **faithful** | Set from the `Move` request's controller mode, reset to `kOther` on motion end. Also gates which physics branch the UDP command loop takes. Correct. |
 | `robot_mode` | **approximation** | `kIdle`, `kMove` and — on a communication-constraints violation — `kReflex`. `kOther`, `kGuiding`, `kUserStopped` and `kAutomaticErrorRecovery` exist in the enum but the sim never produces them. |
-| `errors` (`current_errors`) | **approximation** | Eleven of the 41 booleans can really be latched: `communication_constraints_violation` (25), the safety controller's `joint_velocity_violation` (3), and the [motion-limit errors](#motion-limits-and-discontinuities) at indices 11–15, 18, 20, 32 and 34. Each is latched by the condition it names and cleared by `AutomaticErrorRecovery`. Indices 16 and 19 belong to a Cartesian *pose* generator this server does not serve, so nothing sets them; the rest — collision reflexes, power and Cartesian-position limits — are permanently `false`. |
+| `errors` (`current_errors`) | **approximation** | Eighteen of the 41 booleans can really be latched: `communication_constraints_violation` (25), the safety controller's `joint_velocity_violation` (3) and `cartesian_velocity_violation` (4), and the [motion-limit errors](#motion-limits-and-discontinuities) at indices 11–22, 31, 32 and 34. Index 24, `start_elbow_sign_inconsistent`, has a name in the error table but is [deliberately never latched](#what-is-checked-and-what-it-latches). Each is latched by the condition it names and cleared by `AutomaticErrorRecovery`. The rest — collision reflexes, power and Cartesian-position limits — are permanently `false`. |
 | `reflex_reason` (`last_motion_errors`) | **approximation** | The same bits, latched as the record of what aborted the previous motion. Deliberately *not* cleared by `AutomaticErrorRecovery`, matching libfranka's "the errors that aborted the previous motion". |
 | `control_command_success_rate` | **faithful** | The real thing: the fraction of the last 100 control cycles that were answered in time, recomputed every cycle. `0.0` when no control or motion-generator loop is running — which is what the robot reports then, not a stub. See [communication constraints](#communication-constraints) below. |
 
@@ -170,7 +172,7 @@ observer in the sim today.
 | `SetCartesianImpedance` (5) | **accepted, not enforced** | Parses `K_x`, replies `kSuccess`. There is no Cartesian impedance mode in the sim at all. |
 | `SetGuidingMode` (6) | **accepted, not enforced** | Acknowledged with `kSuccess`; guiding mode is not entered and `robot_mode` never becomes `kGuiding`. |
 | `SetEEToK` (7) | **accepted, not enforced** | Acknowledged with `kSuccess`; `EE_T_K` is reflected in `RobotState` but not used in any kinematics. |
-| `SetNEToEE` (8) | **accepted, not enforced** | Acknowledged with `kSuccess`; `NE_T_EE` is reflected in `RobotState` (`F_T_NE` stays identity) but not used in any kinematics. |
+| `SetNEToEE` (8) | **implemented** | Acknowledged with `kSuccess`; `NE_T_EE` is reflected in `RobotState`, and — `F_T_NE` staying identity — `F_T_EE` is recomputed from it and handed to the physics backend. On the MuJoCo backend that moves the frame `O_T_EE`, the EE Jacobian, the Cartesian generators and the measured-EE-speed check all work in. The Genesis backend and the mobile-duo bridge still only echo it. |
 | `SetLoad` (9) | **accepted, not enforced** | Acknowledged with `kSuccess`; `m_load` / `I_load` / `F_x_Cload` are reflected in `RobotState` but the load is not applied to the dynamics. |
 
 !!! tip "\"Accepted, not enforced\" is a deliberate contract"
@@ -447,16 +449,17 @@ Rows are in **precedence order within each generator**: the first row whose
 condition trips is the error you get. Only the signal belonging to the motion's
 *active* generator is examined — a joint-position motion is judged on `q_c` and
 nothing else, and a `kCartesianPosition` motion is judged on `O_T_EE_c` and
-`elbow_c` and nothing else. That last one is **checked but inert**: the pose
-generator has no physics branch behind it, so the commanded stream is judged in
-full while the arm stays exactly where it is.
+`elbow_c` and nothing else.
 
-The safety controller (`joint_velocity_violation`, 3) is **not in this table**,
-because it is not in this precedence chain. It judges *measured* `dq`, on the
-state-publish thread, once per cycle, in every control mode including pure
-torque — it never preempts any row below and no row below preempts it. The one
-place the two meet is that a commanded velocity-envelope violation (13) latches
-3 alongside itself; see [below](#joint_velocity_violation-3-the-safety-controller).
+The safety controller is **not in this table**, because it is not in this
+precedence chain. Its two errors — `joint_velocity_violation` (3) on measured
+`dq` and `cartesian_velocity_violation` (4) on measured end-effector speed — are
+judged on the state-publish thread, once per cycle, in every control mode
+including pure torque; they never preempt any row below and no row below
+preempts them. The two places the halves meet each other: a commanded
+velocity-envelope violation (13) latches 3 alongside itself, and 4 outranks 3
+when a single cycle breaks both. See
+[below](#joint_velocity_violation-3-the-safety-controller).
 
 | Generator | Check | Limit | Error latched (index) |
 | --- | --- | --- | --- |
@@ -473,7 +476,7 @@ place the two meet is that a commanded velocity-envelope violation (13) latches
 | Cartesian velocity (the [mobile base](mobile-duo.md) twist) | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_acceleration_discontinuity` (20) |
 | Cartesian velocity | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
 | Cartesian velocity | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
-| Cartesian pose (`kCartesianPosition`, **checked but inert**) | `O_T_EE_c` is a homogeneous transformation | `franka::isHomogeneousTransformation`: bottom row `[0,0,0,1]`, rows and columns of the rotation block unit-norm to 1e−5 | `cartesian_position_motion_generator_invalid_frame_flag` (31) — refused even with enforcement off |
+| Cartesian pose (`kCartesianPosition`) | `O_T_EE_c` is a homogeneous transformation | `franka::isHomogeneousTransformation`: bottom row `[0,0,0,1]`, rows and columns of the rotation block unit-norm to 1e−5 | `cartesian_position_motion_generator_invalid_frame_flag` (31) — refused even with enforcement off |
 | Cartesian pose | first `O_T_EE_c` matches the robot's measured `O_T_EE` | 0.05 m / 0.1 rad (sim choices, see below) | `cartesian_position_motion_generator_start_pose_invalid` (16) |
 | Cartesian pose | first `elbow_c` matches the robot's `(q[2], sign(q[3]))` | 0.1 rad (sim choice) or a sign mismatch | `cartesian_motion_generator_start_elbow_invalid` (22) |
 | Cartesian pose / velocity | `elbow_c[1]` unchanged mid-motion | any flip of the ±1 branch flag | `cartesian_motion_generator_elbow_sign_inconsistent` (21) |
@@ -485,12 +488,12 @@ place the two meet is that a commanded velocity-envelope violation (13) latches
 | torque | \|dτ/dt\| | `kMaxTorqueRate` = 1000 − 1e−3 Nm/s | `controller_torque_discontinuity` (32) |
 | any | every commanded value is finite | NaN and ±∞ are refused | the limits violation of the generator they arrived in |
 
-The Cartesian rows above are **checked but inert**: neither Cartesian generator
-drives an arm in this sim, so the motion runs with the arm standing still and the
-only thing that happens is the validation. That is deliberate — Franka's own
-`arm_smoke_tests` suite for Cartesian errors needs the *abort*, not the motion,
-and an interface that silently swallowed its command stream left those tests
-waiting forever for an error that never came.
+These checks are independent of whether the arm is *driven* from the stream they
+judge. On the default MuJoCo single-arm backend both Cartesian generators move
+the arm, through differential IK (see
+[Cartesian control](compatibility.md#cartesian-control)); on Genesis and the
+mobile-duo scene view they stay checked-but-inert. The validation above is
+identical either way, because it judges what the client sent.
 
 One index in the enum is deliberately unreachable here:
 `start_elbow_sign_inconsistent` (24), which by its name is the start-time twin of
@@ -499,10 +502,10 @@ leaves the sign alone, and libfranka refuses to *send* a branch flag that is not
 exactly ±1 — so both halves of the start-elbow check report 22 instead, the one
 index the suite does pin. See `START_ELBOW_SIGN_INCONSISTENT_INDEX`.
 
-**With enforcement off, an arm-role Cartesian motion is inert and never ends.**
-The violation is logged by name, but nothing aborts and nothing moves, so a smoke
-test waiting for an error waits forever. The abort is the deliverable here;
-`--enforce-motion-limits` is what turns it on.
+**With enforcement off, a violating Cartesian motion never ends.** The violation
+is logged by name, but nothing aborts, so a smoke test waiting for an error waits
+forever. The abort is the deliverable here; `--enforce-motion-limits` is what
+turns it on.
 
 ### Which discontinuity you get depends on the interface
 
@@ -596,6 +599,45 @@ Like every other check here, this one always logs and only aborts under
 `kReflexAborted`. It is skipped on a mobile-*base* server, whose steering and
 drive joints are not FR3 joints; the duo's arms are ordinary arm servers and do
 get it.
+
+### `cartesian_velocity_violation` (4): the safety controller's other half
+
+The same idea one frame out: the safety controller also watches how fast the
+**end effector** is actually travelling, and latches
+`cartesian_velocity_violation` when it leaves the FR3's translational Cartesian
+limit — `franka::kMaxTranslationalVelocity`, 3 − 1e−3 m/s. Measured, not
+commanded, so it is armed in every control mode, torque included; the speed
+comes from the MuJoCo Jacobian at the frame `F_T_EE` defines, so a tool set with
+`setEE` really is the point being watched.
+
+**MuJoCo backend only.** The check reads a measured end-effector velocity that
+only the MuJoCo arm backend publishes; the Genesis backend and the mobile-duo
+scene's arm roles publish none, so on those the check simply never fires — no
+false positives, no coverage. `joint_velocity_violation` (3) is unaffected and
+stays armed on every arm role.
+
+Two things about it are worth stating, because both are read off hardware rather
+than assumed:
+
+* **Translation only.** The obvious companion bound would be
+  `kMaxRotationalVelocity` (2.5 rad/s) on the EE's angular velocity, and the
+  hardware suite rules it out: `JointVelocityViolation` and
+  `JointMotionGeneratorVelocityLimitsViolationHardware` both spin *joint 6*
+  — whose axis is near enough the EE's own — through its 4.18 rad/s envelope,
+  so the EE angular speed passes 2.5 rad/s well before the joint limit, and
+  hardware still answers `joint_velocity_violation`. Elbow speed is excluded
+  too; the enum's only elbow-speed error is the motion generator's (17).
+* **It outranks `joint_velocity_violation`.** In
+  `CartesianVelocityViolationHardware` the EE is moved 0.5 m out along the
+  flange with `setEE` and then an ordinary joint-velocity ramp is run: hardware
+  reports `cartesian_velocity_violation` **alone**, with no
+  `joint_velocity_violation` beside it. So when a single cycle breaks both, 4 is
+  the bit that latches.
+
+No tolerance is added on top, unlike the 0.1 rad/s allowed on measured `dq`.
+That margin exists because ordinary motions ride right up against the joint
+envelope; 3 m/s of end-effector travel is an order of magnitude beyond anything
+a conforming motion reaches.
 
 **Non-finite commands are refused whether or not enforcement is on.** Every
 `value > limit` comparison against a NaN is false, so a NaN passes each check
@@ -800,12 +842,19 @@ sim will now find it for you first if you ask it to.
   `self_collision_avoidance_violation`, `power_limit_violation` and the Cartesian
   *position* limits, none of which the sim can detect because it models neither
   contact forces nor an inverse-kinematics stage.
-* **Cartesian pose and impedance control.** `kCartesianPosition` is *checked* but
-  never applied: the commanded pose and elbow stream is judged against the pose
-  generator's full set of limits, but no inverse-kinematics stage turns it into
-  joint targets, so the arm does not move and the
-  `cartesian_motion_generator_joint_*` errors — which are about the joint
-  trajectory the IK would have produced — still have nothing to check.
+* **Cartesian *impedance* control.** `kCartesianImpedance` as a controller mode
+  is accepted but the sim always servos in joint space; and
+  `setJointImpedance` / `setCartesianImpedance` are acknowledged without
+  changing the servo gains, so a client that lowers its stiffness sees the same
+  tracking it saw before. The Cartesian *motion generators* themselves are now
+  driven — see [Cartesian control](compatibility.md#cartesian-control).
+* **The `cartesian_motion_generator_joint_*` errors** (indices 27–30), which are
+  about the joint trajectory the internal IK produces. The sim's IK produces one
+  now, but those four errors are not raised from it: a Cartesian command that
+  drives a joint into its stop currently surfaces as the safety controller's
+  `joint_velocity_violation`, which is also what Franka's own
+  `CartesianMotionGeneratorJointPositionLimitsViolationHardware` records from
+  hardware.
 
 The encouraging part: **the protocol machinery for all of this is public.** The
 limits, the error enum and the rate-limiting formulas all live in libfranka's own

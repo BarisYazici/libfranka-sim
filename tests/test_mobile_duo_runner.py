@@ -1,6 +1,5 @@
 import socket
 import sys
-import threading
 import time
 
 import pytest
@@ -237,7 +236,7 @@ class StubSpineServer:
 
 def test_runner_shares_the_spine_model_with_the_scene(bound_scene):
     spine = StubSpineServer()
-    runner = MobileDuoRunner(bound_scene, LOOPBACK, spine_server=spine)
+    MobileDuoRunner(bound_scene, LOOPBACK, spine_server=spine)
     assert bound_scene.spine_model is spine.model
 
 

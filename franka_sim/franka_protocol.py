@@ -1,3 +1,10 @@
+"""Wire-format types for the Franka robot network protocol (libfranka v10).
+
+Defines the TCP command/status enums and the ``MessageHeader`` framing shared
+by every command exchange, matching ``research_interface::robot`` in
+libfranka_new byte-for-byte (packed structs, little-endian).
+"""
+
 import enum
 import struct
 from dataclasses import dataclass

@@ -81,6 +81,9 @@ class RobotState:
             "tau_J": [0.0] * 7,  # Joint torques
             "dtau_J": [0.0] * 7,  # Joint torque derivatives
             "tau_J_d": [0.0] * 7,  # Desired joint torques
+            # Motor-side encoder. Derived from q/dq on every publish -- see
+            # _mirror_motor_state() -- so these initial values are only what a
+            # state packed before the first physics read carries.
             "theta": [0.0] * 7,  # Motor positions
             "dtheta": [0.0] * 7,  # Motor velocities
             "robot_mode": RobotMode.kIdle.value,  # Store as integer value
@@ -139,6 +142,7 @@ class RobotState:
         ``struct.pack`` via the module-level precompiled packer.
         """
         s = self.state
+        self._mirror_motor_state()
         return _ROBOT_STATE_PACKER.pack(
             s["message_id"],
             *s["O_T_EE"],
@@ -189,6 +193,40 @@ class RobotState:
             s["robot_mode"],
             s["control_command_success_rate"],
         )
+
+    def _mirror_motor_state(self) -> None:
+        """Derive ``theta``/``dtheta`` from ``q``/``dq``.
+
+        ``theta`` is the *motor* position and ``dtheta`` the motor velocity
+        (``include/franka/robot_state.h``: "Motor position", "Motor velocity"),
+        both joint-side referenced and both a straight pass-through of the wire
+        fields (``src/robot_impl.cpp:547-548``). On hardware they differ from
+        the link-side ``q``/``dq`` only by the deflection of the joint's
+        elastic element, ``q = theta - tau_J / K_joint``; with the FR3's
+        joint stiffness that is order 1e-3 rad at ordinary torques.
+
+        No backend here models joint elasticity -- every joint is rigid -- so
+        the motor-side encoder reads exactly what the link-side one does and
+        the faithful value for this sim is ``theta = q``, ``dtheta = dq``.
+
+        This matters because ``theta``/``dtheta`` are not decoration: they are
+        what an external torque controller closes its loop on. Franka's own
+        smoke-test controller (``test/smoke/src/smoke_common.cpp:272-276``)
+        computes ``k_p * (q_d - theta) + k_d * (dq_d - filtered(dtheta))``, so
+        leaving ``theta`` at the zero it is initialised to made every
+        ``*ExternalController*`` test command ``k_p`` times the *whole* joint
+        angle -- e.g. joint 6 at ``250 * 2.19 rad = 547 Nm`` against a 12 Nm
+        limit -- and the motion died of ``tau_J_range_violation`` a few
+        milliseconds after libfranka's torque rate limiter had ramped that far.
+
+        Done here, at the single choke point every published state passes
+        through, rather than in each backend's ``get_robot_state()``: the
+        relation is a property of the joint model, not of the physics engine,
+        and the server has state-publishing paths (the idle hold, standstill
+        waits, the mobile-duo bridges) that never touch a backend snapshot.
+        """
+        self.state["theta"] = list(self.state["q"])
+        self.state["dtheta"] = list(self.state["dq"])
 
     def update(self):
         """Advance to the next state frame with a monotonic message_id.

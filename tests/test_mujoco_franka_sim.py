@@ -645,3 +645,209 @@ def test_resolve_sim_class_rejects_an_unknown_backend():
 
     with pytest.raises(ValueError, match="bullet"):
         resolve_sim_class("bullet")
+
+
+# --- Cartesian interfaces: differential IK -----------------------------------
+#
+# The pose and twist interfaces drive the arm through damped-least-squares IK
+# (franka_sim.cartesian_ik) into the *same* velocity servo a kJointVelocity
+# motion drives, so everything downstream -- the measured-side safety checks
+# above all -- judges a Cartesian motion with the code that judges a joint one.
+
+
+def _pose_of(sim):
+    """The measured EE pose as a row-major 4x4 (what ee_pose returns)."""
+    return sim.ee_pose()
+
+
+def test_a_cartesian_pose_command_converges_on_a_reachable_pose(sim):
+    """The tracking claim, end to end: command a pose, the EE gets there."""
+    sim.set_control_mode(ControlMode.CARTESIAN_POSE)
+    goal = _pose_of(sim)
+    goal[:3, 3] += np.array([0.05, -0.04, -0.06])
+
+    for _ in range(SETTLE_STEPS):
+        sim.update_cartesian_pose(goal.T.flatten())
+        sim.step(1)
+
+    reached = _pose_of(sim)
+    assert reached[:3, 3] == pytest.approx(goal[:3, 3], abs=1e-3)
+    assert reached[:3, :3] == pytest.approx(goal[:3, :3], abs=1e-3)
+
+
+def test_a_cartesian_pose_command_tracks_a_moving_target(sim):
+    """A streamed trajectory, not just a setpoint: the lag stays sub-millimetre.
+
+    The feed-forward is what buys this. On the proportional term alone the arm
+    would trail the command by ``v / TRANSLATION_GAIN`` -- 2.5 mm at the 0.1 m/s
+    used here.
+    """
+    from franka_sim.cartesian_ik import TRANSLATION_GAIN
+
+    sim.set_control_mode(ControlMode.CARTESIAN_POSE)
+    pose = _pose_of(sim)
+    speed = 0.1  # m/s
+    for _ in range(1000):
+        pose[2, 3] -= speed * sim.dt
+        sim.update_cartesian_pose(pose.T.flatten())
+        sim.step(1)
+
+    lag = np.linalg.norm(_pose_of(sim)[:3, 3] - pose[:3, 3])
+    assert lag < 1e-3
+    assert lag < 0.1 * speed / TRANSLATION_GAIN  # far inside the feed-forward-less lag
+
+
+def test_a_cartesian_velocity_command_moves_the_ee_at_the_commanded_speed(sim):
+    """The twist interface: a commanded velocity is realised, not merely checked."""
+    sim.set_control_mode(ControlMode.CARTESIAN_VELOCITY)
+    start = _pose_of(sim)[:3, 3].copy()
+    twist = np.array([0.05, 0.0, -0.05, 0.0, 0.0, 0.0])
+
+    steps = 1000
+    for _ in range(steps):
+        sim.update_cartesian_velocity(twist)
+        sim.step(1)
+
+    travelled = _pose_of(sim)[:3, 3] - start
+    assert travelled == pytest.approx(twist[:3] * steps * sim.dt, abs=2e-3)
+
+
+def test_a_cartesian_motion_respects_the_joint_position_limits(sim):
+    """The arm may be driven *to* a stop, never through one.
+
+    A pose 2 m away is far outside the workspace, so the IK saturates: the twist
+    clamp bounds what it asks for and the model's own joint ranges bound where
+    it ends up. Nothing here may leave the URDF's joint range, whatever the
+    client asks for.
+    """
+    from franka_sim.motion_limits import JOINT_POSITION_LIMITS
+
+    sim.set_control_mode(ControlMode.CARTESIAN_POSE)
+    goal = _pose_of(sim)
+    goal[:3, 3] += np.array([2.0, 2.0, 2.0])
+
+    for _ in range(SETTLE_STEPS):
+        sim.update_cartesian_pose(goal.T.flatten())
+        sim.step(1)
+
+    q = sim.get_robot_state()["q"]
+    lower = np.array([low for low, _ in JOINT_POSITION_LIMITS])
+    upper = np.array([high for _, high in JOINT_POSITION_LIMITS])
+    # The URDF range less MuJoCo's own solver softness at the stop.
+    assert np.all(q >= lower - 1e-2), q
+    assert np.all(q <= upper + 1e-2), q
+    assert np.all(np.isfinite(q))
+
+
+def test_an_elbow_command_steers_the_null_space_without_moving_the_ee(sim):
+    """What elbow_c[0] buys: joint 3 moves, the end effector does not."""
+    sim.set_control_mode(ControlMode.CARTESIAN_POSE)
+    held = _pose_of(sim)
+    start_q3 = sim.get_robot_state()["q"][2]
+    target_q3 = start_q3 + 0.3
+
+    for _ in range(SETTLE_STEPS):
+        sim.update_cartesian_pose(held.T.flatten(), elbow_angle=target_q3)
+        sim.step(1)
+
+    reached = _pose_of(sim)
+    assert sim.get_robot_state()["q"][2] == pytest.approx(target_q3, abs=1e-2)
+    assert reached[:3, 3] == pytest.approx(held[:3, 3], abs=1e-3)
+    assert reached[:3, :3] == pytest.approx(held[:3, :3], abs=1e-3)
+
+
+def test_entering_a_cartesian_mode_forgets_the_previous_motions_target(sim):
+    """A fresh Move must not inherit a target, and must not spike on entry."""
+    sim.set_control_mode(ControlMode.CARTESIAN_POSE)
+    far = _pose_of(sim)
+    far[:3, 3] += np.array([0.2, 0.0, 0.0])
+    sim.update_cartesian_pose(far.T.flatten())
+
+    sim.set_control_mode(ControlMode.CARTESIAN_POSE)  # a new motion starts here
+    assert sim.latest_cartesian_pose is None
+
+    resting = sim.get_robot_state()["q"].copy()
+    sim.step(50)  # no command arrives: the arm must simply hold
+    assert sim.get_robot_state()["q"] == pytest.approx(resting, abs=1e-3)
+
+
+def test_the_ee_velocity_reading_is_measured_at_the_configured_ee_frame(sim):
+    """F_T_EE moves the point the safety controller measures the speed at.
+
+    The whole substance of ``cartesian_velocity_violation``: the same joint
+    motion is a different Cartesian speed depending on where the tool is.
+    """
+    sim.set_control_mode(ControlMode.VELOCITY)
+    sim.update_joint_velocities([0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0])
+    sim.step(200)
+
+    at_flange = sim.measured_ee_velocity().copy()
+    omega = sim.ee_jacobian()[3:] @ sim.data.qvel[sim.arm_dofs_idx]
+    flange_rotation = sim.data.xmat[sim.ee_body_id].reshape(3, 3)
+
+    offset = np.array([0.0, 0.0, 0.5])
+    tool = np.eye(4)
+    tool[:3, 3] = offset
+    sim.update_ee_transform(tool.T.flatten())
+    with_tool = sim.measured_ee_velocity().copy()
+
+    # Rigid-body composition, exactly: v_tool = v_flange + omega x (R p).
+    assert with_tool == pytest.approx(
+        at_flange + np.cross(omega, flange_rotation @ offset), abs=1e-9
+    )
+    # ...and the lever arm is not a rounding difference.
+    assert np.linalg.norm(with_tool - at_flange) > 0.1
+
+    sim.update_ee_transform(np.eye(4).T.flatten())
+    assert sim.measured_ee_velocity() == pytest.approx(at_flange)
+
+
+def test_the_published_jacobian_predicts_the_measured_ee_velocity(sim):
+    """O_J_EE and O_dP_EE are one evaluation, so they cannot drift apart."""
+    sim.set_control_mode(ControlMode.VELOCITY)
+    sim.update_joint_velocities([0.3, -0.4, 0.2, 0.1, 0.0, 0.5, 0.0])
+    sim.step(200)
+
+    state = sim.get_robot_state()
+    assert state["O_J_EE"].shape == (6, 7)
+    assert state["O_dP_EE"] == pytest.approx(state["O_J_EE"][:3] @ state["dq"], abs=1e-12)
+
+
+def test_the_published_pose_is_the_ee_frame_not_the_bare_flange(sim):
+    """``O_T_EE`` is composed with ``F_T_EE``, like every other Cartesian reading.
+
+    The published pose, :meth:`ee_pose`, the Jacobian and ``O_dP_EE`` all have to
+    describe one frame or the interface disagrees with itself: a client that
+    mounts a tool would read a pose a whole tool-length away from the frame the
+    Cartesian generators actually servo, and its first command -- built from that
+    pose -- would open with a tool-length pose error.
+    """
+    sim.step(1)
+    at_flange = np.array(sim.get_robot_state()["O_T_EE"]).reshape(4, 4).T
+    rotation = at_flange[:3, :3]
+
+    offset = np.array([0.0, 0.0, 0.5])
+    tool = np.eye(4)
+    tool[:3, 3] = offset
+    sim.update_ee_transform(tool.T.flatten())
+    sim.step(1)
+
+    with_tool = np.array(sim.get_robot_state()["O_T_EE"]).reshape(4, 4).T
+    # Exactly R * p further along, and not a millimetre of anything else: one
+    # physics step at rest moves nothing.
+    assert with_tool[:3, 3] == pytest.approx(at_flange[:3, 3] + rotation @ offset, abs=1e-6)
+    assert with_tool[:3, :3] == pytest.approx(rotation, abs=1e-9)
+    assert np.linalg.norm(with_tool[:3, 3] - at_flange[:3, 3]) == pytest.approx(0.5, abs=1e-6)
+    # ...and it is the very matrix ee_pose() returns, transposed onto the wire.
+    assert with_tool == pytest.approx(sim.ee_pose(), abs=1e-12)
+
+
+def test_the_published_pose_is_unchanged_by_an_identity_ee_transform(sim):
+    """The default costs nothing: F_T_EE = I republishes the flange, bit for bit."""
+    sim.step(1)
+    before = np.array(sim.get_robot_state()["O_T_EE"])
+
+    sim.update_ee_transform(np.eye(4).T.flatten())
+    sim.step(1)
+
+    assert np.array(sim.get_robot_state()["O_T_EE"]) == pytest.approx(before, abs=1e-12)

@@ -247,6 +247,26 @@ MAX_TORQUE = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 #: command that put it there.
 JOINT_VELOCITY_VIOLATION_INDEX = 3
 
+#: ``kCartesianVelocityViolation`` (``error.h:13``) ->
+#: ``cartesian_velocity_violation``.
+#:
+#: The Cartesian half of the safety controller, and the same kind of check as
+#: :data:`JOINT_VELOCITY_VIOLATION_INDEX`: it watches how fast the *end
+#: effector* is actually travelling, not what the client asked for, so it is
+#: armed in every control mode. See
+#: :meth:`MotionLimitChecker.check_measured_cartesian_velocity`.
+#:
+#: Franka's hardware smoke suite pins it with a test that exists only to make
+#: the EE frame the deciding factor: ``CartesianVelocityViolationHardware``
+#: (``smoke_test_errors.cpp:264``) first calls ``robot->setEE`` with an EE
+#: 0.5 m out along the flange z, *then* runs ``moveCartesianVelocityViolation``
+#: (``smoke_errors.cpp:793``) -- a joint-velocity motion ramping joints 2 and 4
+#: at +-3 rad/s^2 towards 4 rad/s. Without the 0.5 m lever the same ramp
+#: reaches the joint envelope first and hardware answers
+#: ``joint_velocity_violation``; with it the EE crosses the translational limit
+#: first and hardware answers ``cartesian_velocity_violation`` *alone*.
+CARTESIAN_VELOCITY_VIOLATION_INDEX = 4
+
 #: ``kJointPositionMotionGeneratorStartPoseInvalid`` (``error.h:20``) ->
 #: ``joint_position_motion_generator_start_pose_invalid``.
 JOINT_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX = 11
@@ -371,6 +391,7 @@ TAU_J_RANGE_VIOLATION_INDEX = 34
 #: straight against libfranka's own vocabulary.
 ERROR_NAMES = {
     JOINT_VELOCITY_VIOLATION_INDEX: "joint_velocity_violation",
+    CARTESIAN_VELOCITY_VIOLATION_INDEX: "cartesian_velocity_violation",
     JOINT_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX: (
         "joint_position_motion_generator_start_pose_invalid"
     ),
@@ -572,6 +593,70 @@ START_VELOCITY_TOLERANCE = 0.1
 #: within five times this margin of the envelope.
 MEASURED_JOINT_VELOCITY_MARGIN = 0.1
 
+#: Bound on *measured* end-effector translational speed, in m/s, above which the
+#: safety controller latches ``cartesian_velocity_violation``. Franka's own
+#: number: :data:`MAX_TRANSLATIONAL_VELOCITY`, i.e. ``franka::kMaxTranslational``
+#: ``Velocity`` = 3.0 m/s less ``kLimitEps`` (``include/franka/rate_limiting.h:82``),
+#: which is the FR3 specification's Cartesian translational velocity limit
+#: (``p_dot_max = 3.0 m/s`` in Franka's "Robot and interface specifications").
+#: Nothing separate is published for the safety controller's copy of it, so the
+#: one published Cartesian translational bound is used for both.
+#:
+#: **Translation only, and that is measured from hardware rather than assumed.**
+#: The obvious companion bound would be :data:`MAX_ROTATIONAL_VELOCITY`
+#: (2.5 rad/s) on the EE angular velocity, but the hardware smoke suite rules it
+#: out. Two of its tests spin *joint 6* -- whose axis is (near enough) the EE's
+#: own -- straight through the joint envelope: ``JointVelocityViolation``
+#: (``smoke_test_errors.cpp:132``, a 3 Nm torque ramp) and
+#: ``JointMotionGeneratorVelocityLimitsViolationHardware``
+#: (``smoke_test_errors.cpp:118``, a 5 rad/s^2 ``dq_c`` ramp). Joint 6's envelope
+#: is 4.18 rad/s, so in both the EE angular speed passes 2.5 rad/s well before
+#: the joint limit -- and hardware still answers ``joint_velocity_violation``,
+#: never ``cartesian_velocity_violation``. A rotational term here would rename
+#: both of those errors and break them. Elbow speed is excluded for the same
+#: reason plus one more: the enum's only elbow-speed error is the motion
+#: generator's (:data:`CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX`),
+#: and it is a *commanded* check.
+#:
+#: No tolerance is added on top, unlike :data:`MEASURED_JOINT_VELOCITY_MARGIN`.
+#: That margin exists because ordinary motions ride right up against the joint
+#: envelope, where integrator noise alone can cross it; 3 m/s of end-effector
+#: travel is an order of magnitude beyond anything a conforming motion reaches
+#: (the suite's fastest point-to-point moves peak near 1 m/s), so there is no
+#: jitter at the boundary to absorb.
+MEASURED_CARTESIAN_VELOCITY_LIMIT = MAX_TRANSLATIONAL_VELOCITY
+
+#: Smallest singular value of the end-effector Jacobian at or below which a
+#: configuration counts as *singular*, so that a ``Move`` asking for a Cartesian
+#: motion generator from there is rejected with
+#: ``Move::Status::kStartAtSingularPoseRejected`` -- the status libfranka turns
+#: into "Move command rejected: cannot start at singular pose!"
+#: (``src/robot_impl.h:427``).
+#:
+#: **Not a libfranka constant.** Control's own singularity test is not published
+#: anywhere; only the rejection status and its message are. The measure chosen
+#: here is the standard one -- ``sigma_min`` of the 6x7 geometric Jacobian,
+#: which is the reciprocal of the joint speed needed per unit of EE speed in the
+#: worst-conditioned direction, and goes to zero exactly when a Cartesian
+#: direction becomes unreachable.
+#:
+#: 0.05 is placed empirically, against the two things it has to separate on the
+#: sim's own FR3 model (``robot_descriptions`` ``fr3_v2``):
+#:
+#: * The pose Franka's suite calls singular, ``kSingularPose``
+#:   ``{0, 1.28, 0, -0.5415, 0, 2.74, 0}`` (``robot_test_fixture.h:73``), where
+#:   ``sigma_min`` = 0.0108 -- a factor 4.6 below the threshold. The fixture's
+#:   other documented singularities sit under it too
+#:   (``kSingularityJointPoses[1]``: 0.092).
+#: * Every start pose a *passing* Cartesian test opens a motion from. The whole
+#:   ``kInitPoses`` set spans 0.151..0.205, ``kStartPose`` 0.227,
+#:   ``kIkBugPose`` 0.139 -- the tightest of them still a factor 2.8 above the
+#:   threshold.
+#:
+#: The gap between 0.011 and 0.139 is two orders of magnitude wide in the ratio
+#: sense; 0.05 is the geometric middle of it.
+SINGULAR_POSE_MIN_SINGULAR_VALUE = 0.05
+
 #: Opt-in switch for the abort. Validation and the rate-limited warning always
 #: run; setting this to a truthy value additionally makes a violation latch the
 #: error, stop the motion and refuse the offending command, the way the robot
@@ -623,6 +708,46 @@ MAX_COALESCED_CYCLES = 3
 
 
 # -- limit helpers ------------------------------------------------------------
+
+
+def smallest_singular_value(jacobian: Optional[Any]) -> Optional[float]:
+    """``sigma_min`` of a Jacobian, or None when there is nothing to measure.
+
+    None rather than an exception for a missing, misshapen, unconvertible or
+    non-finite Jacobian: the caller's remedy in every one of those cases is the
+    same -- skip the singularity test rather than guess -- and the input comes
+    from a physics backend, not from the client. The conversion is guarded for
+    the same reason the shape is: a backend free to publish whatever it likes
+    under ``O_J_EE`` can publish something ``np.asarray(..., dtype=float)``
+    raises on (a ragged nested sequence, a string, an object array), and a
+    ``Move`` must not fail with a ``ValueError`` from a diagnostic.
+    """
+    if jacobian is None:
+        return None
+    try:
+        matrix = np.asarray(jacobian, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if matrix.ndim != 2 or matrix.size == 0 or not np.all(np.isfinite(matrix)):
+        return None
+    try:
+        return float(np.linalg.svd(matrix, compute_uv=False)[-1])
+    except np.linalg.LinAlgError:  # pragma: no cover - SVD not converging
+        return None
+
+
+def is_singular_configuration(
+    jacobian: Optional[Any], threshold: float = SINGULAR_POSE_MIN_SINGULAR_VALUE
+) -> bool:
+    """Whether ``jacobian`` describes a singular configuration.
+
+    False when no Jacobian is available at all, which is the safe answer: a
+    backend that cannot say is not grounds for refusing the client's ``Move``.
+    See :data:`SINGULAR_POSE_MIN_SINGULAR_VALUE` for where the threshold comes
+    from.
+    """
+    sigma_min = smallest_singular_value(jacobian)
+    return sigma_min is not None and sigma_min <= threshold
 
 
 def upper_joint_velocity_limits(joint_positions: Sequence[float]) -> List[float]:
@@ -1400,6 +1525,7 @@ class MotionLimitChecker:
         start_pose_tolerance: float = START_POSE_TOLERANCE,
         start_velocity_tolerance: float = START_VELOCITY_TOLERANCE,
         measured_velocity_margin: float = MEASURED_JOINT_VELOCITY_MARGIN,
+        measured_cartesian_velocity_limit: float = MEASURED_CARTESIAN_VELOCITY_LIMIT,
         start_cartesian_translation_tolerance: float = (
             START_CARTESIAN_POSE_TRANSLATION_TOLERANCE
         ),
@@ -1414,6 +1540,7 @@ class MotionLimitChecker:
         self.start_pose_tolerance = start_pose_tolerance
         self.start_velocity_tolerance = start_velocity_tolerance
         self.measured_velocity_margin = measured_velocity_margin
+        self.measured_cartesian_velocity_limit = measured_cartesian_velocity_limit
         self.start_cartesian_translation_tolerance = start_cartesian_translation_tolerance
         self.start_cartesian_rotation_tolerance = start_cartesian_rotation_tolerance
         self.start_elbow_tolerance = start_elbow_tolerance
@@ -1441,6 +1568,11 @@ class MotionLimitChecker:
         #: none has been seen yet in this motion. The safety controller's input;
         #: see :meth:`check_measured_velocity`.
         self._measured_velocity: Optional[List[float]] = None
+        #: Last *measured* EE translational velocity (m/s, base frame) the
+        #: server handed over, or None when the backend publishes none. The
+        #: Cartesian half of the safety controller's input; see
+        #: :meth:`check_measured_cartesian_velocity`.
+        self._measured_ee_velocity: Optional[List[float]] = None
         self._active = False
         #: Whether *a motion* is running, as opposed to whether a motion
         #: generator this module differences is running (:attr:`_active`). The
@@ -1531,6 +1663,7 @@ class MotionLimitChecker:
             # server does not check: the safety controller watches the arm.
             self._safety_active = True
             self._measured_velocity = None
+            self._measured_ee_velocity = None
             self._motion_id = motion_id
             self._first_command = True
             self._applied_id = None
@@ -1592,6 +1725,7 @@ class MotionLimitChecker:
             self._active = False
             self._safety_active = False
             self._measured_velocity = None
+            self._measured_ee_velocity = None
             self._motion_id = 0
             self._first_command = True
 
@@ -1602,6 +1736,7 @@ class MotionLimitChecker:
             self._active = False
             self._safety_active = False
             self._measured_velocity = None
+            self._measured_ee_velocity = None
             self._motion_id = 0
             self._first_command = True
             self._logged = set()
@@ -2056,6 +2191,74 @@ class MotionLimitChecker:
                     "rad/s",
                 )
         return None
+
+    def check_measured_cartesian_velocity(
+        self, ee_velocity: Optional[Sequence[float]] = None
+    ) -> Optional[Violation]:
+        """Run the safety controller against the arm's *measured* EE speed.
+
+        The Cartesian twin of :meth:`check_measured_velocity`, called from the
+        same place in the state-publish loop with the same physics snapshot, and
+        judging the robot rather than the client for the same reason: hardware
+        watches how fast the end effector is actually travelling in every
+        control mode, whatever motion generator (if any) is running.
+
+        ``ee_velocity`` is the measured translational velocity of the **EE
+        frame** -- the frame ``F_T_EE`` defines, not the flange -- expressed in
+        the base frame, as three components in m/s. Which frame it is measured
+        at is the whole substance of the check: Franka's
+        ``CartesianVelocityViolationHardware`` moves the EE 0.5 m out along the
+        flange z with ``setEE`` *before* running an otherwise unremarkable
+        joint-velocity ramp, and it is only that lever arm that gets the EE past
+        3 m/s before the joints reach their own envelope. Computing the speed at
+        the flange instead would reproduce the joint error, not the Cartesian
+        one. The velocity itself comes from the physics backend, which is where
+        the Jacobian and ``F_T_EE`` live; see
+        ``MujocoFrankaSim.update_ee_transform``.
+
+        None (or a non-finite reading) means the backend published no EE
+        velocity this cycle -- a backend that does not compute one at all, or a
+        role that has no EE. Skipped rather than guessed at, exactly as a
+        missing measured ``dq`` is.
+
+        Returns the violation, or None. Stores the reading either way.
+        """
+        with self._lock:
+            if ee_velocity is not None:
+                candidate = [float(value) for value in ee_velocity[:3]]
+                # A non-finite *measured* velocity is the simulator's problem,
+                # not the client's; same reasoning as in
+                # :meth:`check_measured_velocity`.
+                self._measured_ee_velocity = (
+                    candidate if all(math.isfinite(value) for value in candidate) else None
+                )
+            if not self._safety_active:
+                return None
+            return self._check_measured_cartesian_velocity_locked()
+
+    def _check_measured_cartesian_velocity_locked(self) -> Optional[Violation]:
+        """The comparison behind :meth:`check_measured_cartesian_velocity`; lock held.
+
+        Compares the Euclidean norm of the EE's translational velocity against
+        :data:`MEASURED_CARTESIAN_VELOCITY_LIMIT` -- a norm, not per axis,
+        because that is what "Cartesian velocity" means in Franka's own limit
+        table and in ``limitRate`` (``src/rate_limiting.cpp``), which bounds the
+        magnitude of the translation vector.
+        """
+        measured = self._measured_ee_velocity
+        if measured is None or len(measured) < 3:
+            return None
+        speed = _norm(measured)
+        if speed <= self.measured_cartesian_velocity_limit:
+            return None
+        return Violation(
+            CARTESIAN_VELOCITY_VIOLATION_INDEX,
+            "O_dP_EE",
+            "translation",
+            speed,
+            self.measured_cartesian_velocity_limit,
+            "m/s",
+        )
 
     def record(self, command: Dict[str, Any], *, clean: Optional[bool] = None) -> None:
         """Accept one *received* command as applied.

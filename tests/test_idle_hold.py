@@ -336,7 +336,6 @@ mujoco = pytest.importorskip("mujoco")
 
 from franka_sim.franka_sim_server import FrankaSimServer  # noqa: E402
 from franka_sim.mujoco_franka_sim import (  # noqa: E402
-    DEFAULT_DT,
     MujocoFrankaSim,
     default_fr3_mjcf,
 )
