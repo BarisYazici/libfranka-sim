@@ -236,7 +236,7 @@ sim.
 **The fake spine device.** The duo's prismatic lift
 (`franka_spine_vertical_joint`) is driven by a separate REST device on real
 hardware, not by libfranka. `--spine` runs a fake version of that device
-in-process (`franka_sim.spine_stub`) and shares its motion model with the
+in-process (`franka_sim.mobile.spine_stub`) and shares its motion model with the
 scene, so a REST move visibly raises the lift (and everything mounted on
 it — the head and both arms) in the viewer:
 

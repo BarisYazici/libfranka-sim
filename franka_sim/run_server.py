@@ -9,7 +9,7 @@ import time
 from typing import Optional
 
 from franka_sim.franka_protocol import COMMAND_PORT
-from franka_sim.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
+from franka_sim.mobile.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
 
 # Configure logging to silence Numba debug output
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -20,7 +20,7 @@ logging.getLogger("numba").setLevel(logging.WARNING)
 #: the process' life that is not ours to bound. See :func:`_arm_exit_watchdog`.
 #:
 #: Sized for the mobile-duo worst case, which is the slowest shutdown this
-#: module drives: ``MobileDuoRunner.stop()`` (``mobile_duo_runner.py``) stops
+#: module drives: ``MobileDuoRunner.stop()`` (``mobile/runner.py``) stops
 #: its three FCI bridges (arms + base) one at a time, then the shared scene.
 #: Each bridge's own ``FrankaSimServer.stop()``/``cleanup()`` sums to roughly
 #: 2.2 s in its own internal, individually-bounded waits -- ``cleanup()``'s
@@ -40,8 +40,8 @@ SHUTDOWN_WATCHDOG_S = 15.0
 #: :func:`resolve_scene_class` so choosing one backend never pays the other's
 #: (multi-second, native) import cost.
 MOBILE_DUO_PHYSICS = {
-    "genesis": ("franka_sim.mobile_duo_sim", "MobileDuoScene"),
-    "mujoco": ("franka_sim.mobile_duo_mujoco_sim", "MobileDuoMujocoScene"),
+    "genesis": ("franka_sim.mobile.duo_sim", "MobileDuoScene"),
+    "mujoco": ("franka_sim.mobile.duo_mujoco_sim", "MobileDuoMujocoScene"),
 }
 
 #: Physics backend used unless ``--physics`` says otherwise, for the single arm
@@ -246,7 +246,7 @@ def validate_args(args) -> None:
     if not args.scene_urdf:
         raise ValueError("--scene-urdf is required with --mobile-duo")
 
-    from franka_sim.mobile_duo_runner import parse_bind_specs
+    from franka_sim.mobile.runner import parse_bind_specs
 
     parse_bind_specs(args.bind)
 
@@ -276,7 +276,7 @@ def motion_limits_setting(args) -> Optional[bool]:
 
 def run_mobile_duo(args) -> None:
     """Bring up the three-bridge mobile duo simulation (blocks)."""
-    from franka_sim.mobile_duo_runner import MobileDuoRunner, parse_bind_specs
+    from franka_sim.mobile.runner import MobileDuoRunner, parse_bind_specs
 
     binds = parse_bind_specs(args.bind)
     scene = resolve_scene_class(args.physics)(
@@ -286,7 +286,7 @@ def run_mobile_duo(args) -> None:
     )
     spine_server = None
     if args.spine:
-        from franka_sim.spine_stub import (
+        from franka_sim.mobile.spine_stub import (
             SPINE_CERT_DIR,
             SpineStubServer,
             make_self_signed_cert,

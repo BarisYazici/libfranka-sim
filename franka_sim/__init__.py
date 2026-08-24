@@ -16,22 +16,22 @@ from franka_sim.franka_sim_server import FrankaSimServer
 from franka_sim.gripper_backend import FrankaHandSim, GripperBackend
 from franka_sim.gripper_physics import GenesisFrankaHand
 from franka_sim.gripper_server import FrankaGripperServer
+from franka_sim.mobile.spine_stub import SpineModel, SpineStubServer
+from franka_sim.mobile.swerve_base import SwerveBase
+from franka_sim.mobile.swerve_kinematics import SwerveKinematics
 from franka_sim.robot_state import RobotState
 from franka_sim.run_server import main as run_server_main
-from franka_sim.spine_stub import SpineModel, SpineStubServer
-from franka_sim.swerve_base import SwerveBase
-from franka_sim.swerve_kinematics import SwerveKinematics
 
 #: Names whose defining module imports a physics engine (``genesis`` or
 #: ``mujoco``), resolved on first access instead of at package import.
 _LAZY_EXPORTS = {
     "FrankaGenesisSim": "franka_sim.franka_genesis_sim",
-    "MobileDuoRunner": "franka_sim.mobile_duo_runner",
-    "MobileDuoScene": "franka_sim.mobile_duo_sim",
+    "MobileDuoRunner": "franka_sim.mobile.runner",
+    "MobileDuoScene": "franka_sim.mobile.duo_sim",
     "MujocoFrankaSim": "franka_sim.mujoco_franka_sim",
-    "SceneView": "franka_sim.mobile_duo_sim",
-    "TMRGenesisSim": "franka_sim.tmr_genesis_sim",
-    "parse_bind_specs": "franka_sim.mobile_duo_runner",
+    "SceneView": "franka_sim.mobile.duo_sim",
+    "TMRGenesisSim": "franka_sim.mobile.tmr_genesis_sim",
+    "parse_bind_specs": "franka_sim.mobile.runner",
 }
 
 

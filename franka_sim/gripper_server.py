@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """TCP/UDP server implementing the libfranka gripper wire protocol (port 1338)."""
+import errno
 import logging
 import select
 import socket
@@ -214,10 +215,22 @@ class FrankaGripperServer:
         next ``accept()``.
         """
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # No SO_REUSEPORT -- same reasoning as the arm server's
+        # _bind_listener(): a silent co-bind on the gripper port would
+        # load-balance clients between two servers with no error anywhere.
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.server_socket.settimeout(1.0)
-        self.server_socket.bind((self.host, self.port))
+        try:
+            self.server_socket.bind((self.host, self.port))
+        except OSError as e:
+            self.server_socket.close()
+            if e.errno == errno.EADDRINUSE:
+                logger.error(
+                    "Gripper port %s:%s is already in use -- refusing to co-bind.",
+                    self.host,
+                    self.port,
+                )
+            raise
         self.server_socket.listen(1)
         self.running = True
         logger.info(f"Gripper server listening on {self.host}:{self.port}")

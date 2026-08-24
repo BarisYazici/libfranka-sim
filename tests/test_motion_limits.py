@@ -1764,8 +1764,13 @@ def test_the_drain_gate_waits_for_a_command_the_receive_path_has_not_read(
     server.udp_socket.bind(("127.0.0.1", 0))
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Nothing queued: the gate is a poll and a return.
-        assert server._drain_gate() < server._DRAIN_GATE_TIMEOUT / 2
+        # Nothing queued and nothing in flight: the gate is a poll and a
+        # return, and it charges the pacer *nothing* -- the poll and the clock
+        # reads are this cycle's own work, and the loop already sleeps before
+        # the gate rather than after it. Returning the couple of microseconds
+        # they take pushed every deadline out by the gate's own cost and held
+        # the publish rate at ~997.5 Hz in every control mode.
+        assert server._drain_gate() == 0.0
 
         # One datagram nobody will read: the gate waits out its whole bound
         # rather than publishing over it, and says so.
@@ -1775,9 +1780,52 @@ def test_the_drain_gate_waits_for_a_command_the_receive_path_has_not_read(
 
         # ...and once the receive path has taken it, the gate clears again.
         server.udp_socket.recvfrom(64)
-        assert server._drain_gate() < server._DRAIN_GATE_TIMEOUT / 2
+        assert server._drain_gate() == 0.0
     finally:
         sender.close()
+        server.udp_socket.close()
+
+
+def test_the_drain_gate_waits_for_a_command_read_but_not_yet_applied(
+    mock_genesis_sim,
+):
+    """An empty socket is not the same as an applied command.
+
+    ``_handle_commands`` takes the datagram out of the socket at the *start* of
+    its turn and writes the commanded echo -- ``q_d``, ``O_T_EE_c``,
+    ``elbow_c`` -- at the *end* of it, with the decoding, the communication
+    accounting and the whole limit check in between. A gate that released on an
+    empty socket therefore released into the one window where the echo is
+    guaranteed stale, and did so exactly when it had engaged at all: the moment
+    the receive thread drains the last queued datagram is the moment it still
+    has all of its work ahead of it.
+
+    Worse, the communication accounting has already run by then, so the cycle
+    counts as answered and the publish loop does not extrapolate over it
+    either. The reference simply freezes for one cycle; libfranka's 100 Hz
+    command filter blends its next command toward the frozen value and emits a
+    ``(1 - gain)`` x one-cycle step; and this server aborts the motion on the
+    discontinuity it manufactured. Measured against the smoke suite's elbow
+    motion, a 179 urad/cycle elbow ramp came back 110 urad short on exactly
+    that cycle -- 110 rad/s^2 against a 10 rad/s^2 limit.
+    """
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(genesis_sim=mock_genesis_sim, enable_gripper=False)
+    server.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.udp_socket.bind(("127.0.0.1", 0))
+    try:
+        # The socket is empty, but the receive thread is mid-turn on a datagram
+        # it has already read: the state that would go out now carries the echo
+        # of the command *before* that one.
+        server._commands_in_flight = 1
+        assert server._drain_gate() >= server._DRAIN_GATE_TIMEOUT
+
+        # The turn ends -- the command is applied, the echo is current -- and
+        # the gate clears immediately.
+        server._commands_in_flight = 0
+        assert server._drain_gate() == 0.0
+    finally:
         server.udp_socket.close()
 
 
@@ -4216,7 +4264,7 @@ def test_enforced_the_safety_controller_aborts_on_measured_ee_speed(
     ``joint_velocity_violation`` beside it -- so the two halves of the safety
     controller are ordered, not merely both present.
     """
-    server = serve(enforce=True)
+    serve(enforce=True)
     wire = start_motion(client, ControllerMode.kExternalController, MotionGeneratorMode.kNone)
 
     mock_arm_sim.get_robot_state.return_value = {

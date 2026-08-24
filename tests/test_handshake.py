@@ -78,8 +78,6 @@ def test_incompatible_version(tcp_client, sim_server, mock_genesis_sim):
         tcp_client.recv(1)
 
 
-# TODO: Fix this test
-@pytest.mark.skip(reason="Not raising error currently")
 def test_invalid_command(tcp_client, sim_server, mock_genesis_sim):
     """Test sending invalid command during handshake"""
     # Connect to server
@@ -93,14 +91,12 @@ def test_invalid_command(tcp_client, sim_server, mock_genesis_sim):
     # Send message
     tcp_client.sendall(header.to_bytes())
 
-    # Server should close connection
-    time.sleep(0.1)  # Give server time to process and close
-    with pytest.raises((ConnectionError, socket.error)):
-        tcp_client.recv(1)
+    # The server refuses the handshake by closing the connection GRACEFULLY,
+    # so the client sees end-of-stream (recv -> b""), not a reset/exception.
+    tcp_client.settimeout(2.0)
+    assert tcp_client.recv(1) == b""
 
 
-# TODO: Fix this test
-@pytest.mark.skip(reason="Not raising error currently")
 def test_malformed_payload(tcp_client, sim_server, mock_genesis_sim):
     """Test handshake with malformed payload"""
     # Connect to server
@@ -114,7 +110,7 @@ def test_malformed_payload(tcp_client, sim_server, mock_genesis_sim):
     # Send message
     tcp_client.sendall(header.to_bytes() + payload)
 
-    # Server should close connection
-    time.sleep(0.1)  # Give server time to process and close
-    with pytest.raises((ConnectionError, socket.error)):
-        tcp_client.recv(1)
+    # Same contract as test_invalid_command: a graceful close, seen as
+    # end-of-stream on the client side.
+    tcp_client.settimeout(2.0)
+    assert tcp_client.recv(1) == b""

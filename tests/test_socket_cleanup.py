@@ -18,6 +18,7 @@ listening port back. And a plain client disconnect must not trigger any of
 it -- the server serves the next client.
 """
 
+import errno
 import logging
 import socket
 import threading
@@ -291,6 +292,35 @@ def test_cleanup_announces_itself_once(mock_genesis_sim, caplog):
 
     announcements = [r for r in caplog.records if r.message.startswith("Cleaning up server")]
     assert len(announcements) == 1
+
+
+def test_a_second_server_cannot_co_bind_the_command_port():
+    """The listener must refuse to share a port that is already taken.
+
+    `SO_REUSEPORT` used to let two servers co-bind with no error on either
+    side, after which the kernel load-balanced incoming clients between
+    them -- silent cross-talk on both. The occupier here opts INTO
+    SO_REUSEPORT on purpose: the bind can only fail because our listener
+    abstains, which is exactly the property this test pins.
+    """
+    port = _free_port()
+    occupier = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupier.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    occupier.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    occupier.bind(("127.0.0.1", port))
+    occupier.listen(1)
+    try:
+        server = FrankaSimServer.__new__(FrankaSimServer)
+        server.host = "127.0.0.1"
+        server.port = port
+        server.server_socket = None
+        with pytest.raises(OSError) as excinfo:
+            server._bind_listener()
+        assert excinfo.value.errno == errno.EADDRINUSE
+        # The failed attempt must not leave a half-open socket behind.
+        assert server.server_socket is None
+    finally:
+        occupier.close()
 
 
 def test_stop_ends_the_accept_loop_and_frees_the_port(listening_server):

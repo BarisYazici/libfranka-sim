@@ -13,14 +13,18 @@ extend-ignore =
     D200,
     D205,
     D400,
-    D401,
-    F401,
-    F841
+    D401
 exclude =
     .git,
     __pycache__,
     build,
     dist,
     *.egg-info
+# F401 (unused import) is enforced everywhere except the deliberate re-export
+# facades below: their import lists *are* the public API. ``franka_sim.limits``
+# and ``franka_sim.server`` need no entry -- their ``__init__`` files are
+# docstring-only and re-export nothing.
 per-file-ignores =
     __init__.py:F401
+    franka_sim/motion_limits.py:F401
+    franka_sim/franka_sim_server.py:F401

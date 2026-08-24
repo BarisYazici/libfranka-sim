@@ -178,7 +178,7 @@ def apply_fr3v2_visuals(
 
     Mutates ``scene_spec`` in place and returns the number of visual geoms
     added. Raises if the Menagerie model cannot be read or does not contain the
-    expected bodies -- :class:`~franka_sim.mobile_duo_mujoco_sim.MobileDuoMujocoScene`
+    expected bodies -- :class:`~franka_sim.mobile.duo_mujoco_sim.MobileDuoMujocoScene`
     catches that and keeps the converted-URDF visuals.
     """
     mjcf_path = Path(mjcf_path) if mjcf_path is not None else resolve_fr3v2_mjcf()

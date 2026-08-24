@@ -7,6 +7,38 @@ breaking changes — these are called out explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- **The mobile-robot modules moved into a `franka_sim.mobile` subpackage.**
+  Eight files that had accumulated at the top level of `franka_sim` are now
+  gathered under `franka_sim/mobile/`, so the top-level package reads as the
+  arm/FCI core it is: `mobile_duo_sim` → `mobile.duo_sim`,
+  `mobile_duo_mujoco_sim` → `mobile.duo_mujoco_sim`, `mobile_duo_common` →
+  `mobile.common`, `mobile_duo_runner` → `mobile.runner`, and `spine_stub`,
+  `swerve_base`, `swerve_kinematics`, `tmr_genesis_sim` keeping their names one
+  level down. **No API change:** the classes, functions and constants are
+  identical, `franka_sim.MobileDuoScene` and every other top-level export
+  resolves exactly as before, and each old dotted path is aliased to the moved
+  module *object* (via `sys.modules`, not a re-export copy) — so
+  `import franka_sim.spine_stub`, `from franka_sim.swerve_base import
+  SwerveBase` and even `monkeypatch.setattr("franka_sim.mobile_duo_sim.gs", …)`
+  all keep working and keep pointing at the one live module. The
+  `run-franka-spine-stub` entry point now names the new path. Loggers whose
+  names callers configure against (`franka_sim.swerve_base`,
+  `franka_sim.mobile_duo_runner`, `franka_sim.mobile_duo_common`) are pinned to
+  their pre-move names, so existing logging config is unaffected.
+
+- **A second server on the same port now fails loudly with `EADDRINUSE`.**
+  The TCP listeners (arm port 1337, gripper port 1338) no longer set
+  `SO_REUSEPORT`. With it, two servers co-bound the port with no error on
+  either side and the kernel load-balanced incoming clients between them —
+  observed in practice as spurious connection timeouts and cross-talk when a
+  test run and a live server overlapped. `SO_REUSEADDR` remains, so a
+  restart still rebinds through a lingering `TIME_WAIT`. The arm server also
+  binds its port *before* physics initialization now, so a busy port kills
+  `run-franka-sim-server` immediately instead of after the scene loads, and
+  the old silent "force close and rebind" retry is gone.
+
 ### Added
 
 - **Cartesian motion generators now drive the arm (MuJoCo backend).** Both
@@ -415,10 +447,16 @@ breaking changes — these are called out explicitly.
   physics once per published control cycle rather than once per wall millisecond
   — is roadmap, not in this release. See
   [the known-issue section](docs/compatibility.md#known-issue-run-to-run-repeatability-of-velocity-generators).
-- **Unexplained:** a `kCartesianPosition` motion very occasionally aborts
+- ~~**Unexplained:** a `kCartesianPosition` motion very occasionally aborts
   mid-flight with `cartesian_motion_generator_velocity_discontinuity` at a few
   hundred to ~1500 m/s² on a commanded stream that is smooth by construction
-  (~1 in 15 parity-test runs). Not root-caused.
+  (~1 in 15 parity-test runs). Not root-caused.~~ **Root-caused and fixed** — see
+  the drain-gate entry under *Fixed*. The gate released while the receive thread
+  still had a read datagram in hand, the published echo froze for one cycle, and
+  the client's own 100 Hz command filter emitted a `(1 - gain) × Δcommand` step
+  that this server then measured and aborted on. A residual remains, bounded by
+  the gate's own 5 ms timeout: a receive-thread stall longer than that still
+  publishes a stale echo.
 
 ### Changed
 
@@ -548,6 +586,47 @@ breaking changes — these are called out explicitly.
 
 ### Fixed
 
+- **The drain gate now waits for the client's answer to be *applied*, not merely
+  read — closing the last window in which this server manufactured the
+  discontinuity it then aborted on.** An empty socket is not the same as an
+  applied command: `_handle_commands` takes the datagram out of the socket at the
+  *start* of its turn and writes the commanded echo — `q_d`, `O_T_EE_c`,
+  `elbow_c` — at the *end* of it, with the decoding, the communication accounting
+  and the whole limit check in between. `_drain_gate` released on the empty
+  socket, so it released straight into the one window where the published echo is
+  guaranteed stale, and did so precisely on the cycles where it had engaged at
+  all: the moment the receive thread drains the last queued datagram is the moment
+  it still has all of its work ahead of it. Worse, `comm.command_received` has
+  already run by then, so the cycle counts as *answered* and the publish loop does
+  not extrapolate over it either — the reference simply freezes for one cycle,
+  libfranka's own 100 Hz command filter blends the next command toward the frozen
+  value and emits a `(1 - gain)` × one-cycle step, and this server aborts on the
+  kink it caused. The gate now also waits on `_commands_in_flight`, a counter the
+  receive thread holds up for the whole journey from socket to simulator.
+
+  Measured on Franka's old-wire `smoke_test_motion_control`, the two tests the
+  issue was reported against (`ElbowFromInitPoseHardware/pose_index_0`,
+  `CombinationParamHardware/pose_index_0`), on a host loaded with 12 spinning
+  cores: **9 spurious aborts in 30 runs before, 0 in 50 runs after.** Every
+  pre-fix abort was caught with a ring-buffer dump of the last cycles, and 8 of
+  the 9 were this window (the ninth needed a receive-thread stall longer than the
+  gate's own 5 ms bound). The dumps are unambiguous: the client's commanded stream
+  runs at |d²/dt²| ≈ 0.05 rad/s² for hundreds of cycles and takes a *single*
+  one-cycle step on exactly the cycle whose state carried the stale echo, of size
+  `(1 - 0.3859) × Δcommand` — 107.171 rad/s² observed against 107.230 predicted,
+  114.443 against 114.392, 222.683 against 222.145, and 184.307 m/s² of
+  `O_T_EE_c` translation against a predicted 184.3. That last one is the
+  "unexplained" `cartesian_motion_generator_velocity_discontinuity` at a few
+  hundred m/s² this file listed as a known issue; it is the same mechanism, and it
+  is not Cartesian-specific — one of the nine fired in `kJointPosition` with no
+  differential IK running at all.
+- **The drain gate no longer charges its own cost to the 1 kHz pacer.** It
+  returned the couple of microseconds its `poll(0)` and clock reads take even when
+  it had not waited at all, and the publish loop adds that to `next_deadline`
+  every cycle. The result was a systematic ~2.5 µs of drift per cycle — a median
+  inter-state interval of 1.0025 ms and a publish rate pinned near 997.5 Hz in
+  *every* control mode, idle included. The gate now returns exactly `0.0` when it
+  did not wait; the median interval measures 1.0000 ms.
 - **The state publisher no longer manufactures the discontinuity it then
   reports.** Under `--enforce-motion-limits`, an ordinary approach motion would
   intermittently abort mid-flight with

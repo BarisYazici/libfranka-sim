@@ -6,7 +6,7 @@ real-time-factor monitor every paced stepping loop reports through. It lives in
 its own module so the MuJoCo backends -- now the default -- can reuse the
 Genesis backends' calibration and pacing without importing ``genesis`` at all.
 
-``franka_genesis_sim`` and ``mobile_duo_sim`` re-export the names they used to
+``franka_genesis_sim`` and ``mobile.duo_sim`` re-export the names they used to
 define, so every existing import path keeps working.
 """
 

@@ -52,7 +52,6 @@ from franka_sim.franka_protocol import (
     MoveStatus,
     RobotMode,
 )
-from franka_sim.motion_limits import DELTA_T
 from franka_sim.robot_state import _ROBOT_STATE_PACKER, RobotState
 
 VIOLATION = COMMUNICATION_CONSTRAINTS_VIOLATION_INDEX

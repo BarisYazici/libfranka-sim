@@ -12,8 +12,6 @@ from franka_sim.franka_protocol import (
     Command,
     ConnectStatus,
     ControllerMode,
-    LibfrankaControllerMode,
-    LibfrankaMotionGeneratorMode,
     MessageHeader,
     MotionGeneratorMode,
     MoveCommand,
@@ -530,7 +528,7 @@ def test_invalid_move_parameters(tcp_client, udp_client, sim_server, mock_genesi
 
     # Receive error response
     response_header_data = tcp_client.recv(12)
-    response_header = MessageHeader.from_bytes(response_header_data)
+    MessageHeader.from_bytes(response_header_data)  # must parse as a header
     response_data = tcp_client.recv(4)
     status = struct.unpack("<B3x", response_data)[0]
     assert status == MoveStatus.kInvalidArgumentRejected
