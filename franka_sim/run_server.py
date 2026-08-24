@@ -3,6 +3,7 @@ import argparse
 import importlib
 import logging
 import sys
+from typing import Optional
 
 from franka_sim.franka_protocol import COMMAND_PORT
 from franka_sim.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
@@ -59,6 +60,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--gripper-physics",
         action="store_true",
         help="Use the physics gripper (9-DOF, fingers move in the viewer)",
+    )
+    parser.add_argument(
+        "--enforce-comm-constraints",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Abort a motion with communication_constraints_violation after 20 "
+        "consecutively lost command cycles, as the real FCI does. Off by "
+        "default; packet loss is tracked and reported in "
+        "control_command_success_rate either way, and a missed cycle holds the "
+        "last command. Same as "
+        "setting FRANKA_SIM_ENFORCE_COMM_CONSTRAINTS=1; pass "
+        "--no-enforce-comm-constraints to force it off even when that is set",
+    )
+    parser.add_argument(
+        "--enforce-motion-limits",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Abort a motion when a commanded signal breaks the FCI's joint "
+        "position, velocity, acceleration, jerk or torque-rate limits, as the "
+        "real robot does. Off by default; violations are always checked and "
+        "logged either way. Independent of --enforce-comm-constraints. Same as "
+        "setting FRANKA_SIM_ENFORCE_MOTION_LIMITS=1; pass "
+        "--no-enforce-motion-limits to force it off even when that is set",
     )
     parser.add_argument(
         "--mobile-duo",
@@ -142,6 +166,29 @@ def validate_args(args) -> None:
     parse_bind_specs(args.bind)
 
 
+def comm_constraints_setting(args) -> Optional[bool]:
+    """Translate ``--enforce-comm-constraints`` into the server's tri-state flag.
+
+    Three states, not two. ``None`` -- neither flag given -- means "no opinion"
+    and leaves the decision to ``$FRANKA_SIM_ENFORCE_COMM_CONSTRAINTS``. True
+    and False are explicit and *do* override the environment, which is the
+    point of ``--no-enforce-comm-constraints``: without it there was no way to
+    switch enforcement off for one run of a server started from a shell (or a
+    launch file, or a container) that exports the variable.
+    """
+    return args.enforce_comm_constraints
+
+
+def motion_limits_setting(args) -> Optional[bool]:
+    """Translate ``--enforce-motion-limits`` into the server's tri-state flag.
+
+    Same tri-state as :func:`comm_constraints_setting`, with
+    ``--no-enforce-motion-limits`` as the explicit off switch that overrides
+    ``$FRANKA_SIM_ENFORCE_MOTION_LIMITS``.
+    """
+    return args.enforce_motion_limits
+
+
 def run_mobile_duo(args) -> None:
     """Bring up the three-bridge mobile duo simulation (blocks)."""
     from franka_sim.mobile_duo_runner import MobileDuoRunner, parse_bind_specs
@@ -172,7 +219,13 @@ def run_mobile_duo(args) -> None:
         )
 
     runner = MobileDuoRunner(
-        scene, binds, port=args.port, arm_urdf=args.urdf, spine_server=spine_server
+        scene,
+        binds,
+        port=args.port,
+        arm_urdf=args.urdf,
+        spine_server=spine_server,
+        enforce_comm_constraints=comm_constraints_setting(args),
+        enforce_motion_limits=motion_limits_setting(args),
     )
 
     print(f"  physics backend -> {args.physics} (dt={scene.dt}s)")
@@ -204,6 +257,8 @@ def run_single_arm(args) -> None:
         enable_gripper=not args.no_gripper,
         gripper_physics=args.gripper_physics,
         physics=args.physics,
+        enforce_comm_constraints=comm_constraints_setting(args),
+        enforce_motion_limits=motion_limits_setting(args),
     )
     try:
         server.start()
@@ -214,6 +269,15 @@ def run_single_arm(args) -> None:
 
 def main():
     """Run the Franka simulation server."""
+    # Make the sim's own logging visible by default: without a handler,
+    # operationally important lines (idle hold engaged, RTF overload,
+    # motion-limit violations) are silently dropped. Respect any handler
+    # the embedding application configured first.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
     args = build_parser().parse_args()
     try:
         validate_args(args)

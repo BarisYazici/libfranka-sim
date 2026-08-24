@@ -61,6 +61,8 @@ class MobileDuoRunner:
         port: int = COMMAND_PORT,
         arm_urdf: Optional[str] = None,
         spine_server=None,
+        enforce_comm_constraints: Optional[bool] = None,
+        enforce_motion_limits: Optional[bool] = None,
     ):
         self.scene = scene
         self.binds = dict(binds)
@@ -84,6 +86,8 @@ class MobileDuoRunner:
                 urdf_path=arm_urdf,
                 enable_gripper=False,
                 mobile_base=(role == ROLE_BASE),
+                enforce_comm_constraints=enforce_comm_constraints,
+                enforce_motion_limits=enforce_motion_limits,
             )
             for role in ROLES
         }

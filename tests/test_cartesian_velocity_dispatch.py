@@ -91,19 +91,33 @@ def test_cartesian_velocity_command_reaches_the_base(
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
     send_robot_command(udp_client, base_sim_server, o_dp_ee_c=BASE_TWIST)
 
-    mock_base_sim.update_base_twist.assert_called_with(BASE_TWIST)
+    # assert_any_call, not assert_called_with: this client sends one datagram
+    # and then goes quiet, so twenty cycles later the communication-constraints
+    # emulation ramps the commanded twist to a safe stop and the *last* call is
+    # a decelerating one. What this test is about is that the twist arrived.
+    mock_base_sim.update_base_twist.assert_any_call(BASE_TWIST)
 
 
 def test_cartesian_velocity_is_echoed_in_the_reported_state(
-    tcp_client, udp_client, base_sim_server
+    tcp_client, udp_client, base_sim_server, mock_base_sim
 ):
     assert perform_handshake(tcp_client)
     send_move(tcp_client, ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
+
+    # Snapshot the reported command at the moment it is handed to the base.
+    # Reading the state afterwards would read the safe stop instead (see above),
+    # and this test is about the echo, not about the stop.
+    echoed = []
+    state = base_sim_server.robot_state.state
+    mock_base_sim.update_base_twist.side_effect = lambda twist: echoed.append(
+        (list(state["O_dP_EE_c"]), list(state["O_dP_EE_d"]))
+    )
+
     send_robot_command(udp_client, base_sim_server, o_dp_ee_c=BASE_TWIST)
 
-    state = base_sim_server.robot_state.state
-    assert state["O_dP_EE_c"] == pytest.approx(BASE_TWIST)
-    assert state["O_dP_EE_d"] == pytest.approx(BASE_TWIST)
+    assert echoed, "the twist never reached the base"
+    assert echoed[0][0] == pytest.approx(BASE_TWIST)
+    assert echoed[0][1] == pytest.approx(BASE_TWIST)
     assert state["motion_generator_mode"] == LibfrankaMotionGeneratorMode.kCartesianVelocity.value
 
 

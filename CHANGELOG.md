@@ -5,6 +5,164 @@ All notable changes to **franka-sim** are documented here. The format is based o
 so per [Semantic Versioning](https://semver.org/) a minor (`0.x`) bump may include
 breaking changes — these are called out explicitly.
 
+## [Unreleased]
+
+### Added
+
+- **FCI communication-constraints emulation.** franka-sim no longer presents a
+  perfect channel. Every published `RobotState` opens a cycle; a conforming
+  client answers it with a `RobotCommand` echoing that state's `message_id`
+  (which is what libfranka's `sendRobotCommand` stamps), and a cycle with no
+  such answer before the next state goes out is a lost cycle. All accounting is
+  in cycle space, so a physics stall — which delays state and answer alike —
+  never reads as packet loss.
+  - **`control_command_success_rate` is now real**: the fraction of the last 100
+    cycles answered in time, recomputed every cycle, exactly the window
+    libfranka documents.
+  - **A missed cycle holds the last applied command**: nothing new is
+    dispatched, so the position target stays put, a commanded velocity or twist
+    stays applied and the torque is reused — the FCI's own behaviour for a
+    dropped *controller* packet, applied to every signal. The real robot
+    additionally extrapolates a missed **motion generator** cycle under constant
+    acceleration; franka-sim does not, and the divergence (including the
+    discontinuity trap it hides on hardware) is documented in
+    `docs/robot-state.md`. Emulating it is a roadmap item.
+  - Freshness is bounded on **both** sides: an echo older than the open cycle is
+    late, and an id the server never published is not an answer at all. A
+    datagram that is not fresh is still applied and still checked in full — over
+    a single cycle, the strictest reading — but it never becomes the *sample*
+    the next command is differenced against. A client running permanently one
+    cycle behind is charged for every cycle; the sub-cycle bias at the
+    tick/`sendto` boundary is left in the client's disfavour, because nothing in
+    cycle space can tell that packet from a one-cycle-late one.
+  - `message_id` now starts at **1**, so the first published state can be
+    answered like any other (a command echoing `0` is unparsable and was charged
+    to the client as loss).
+  - **`communication_constraints_violation`** (opt-in, see below): 20
+    consecutive lost cycles latch the error in `errors` *and* `reflex_reason`,
+    set `robot_mode` to `kReflex`, answer the pending `Move` with
+    `kReflexAborted` (which libfranka raises as a `ControlException`), and
+    recapture the arm in the idle hold. The state carrying the error reaches the
+    wire *before* the TCP response, which is the order libfranka's
+    `throwOnMotionError` needs — for motion-limit aborts raised on the UDP
+    thread as well, which wait for a state serialised *after* the error rather
+    than for the next packet to leave, whatever it happens to contain. `AutomaticErrorRecovery` clears `errors`,
+    returns to `kIdle` and re-arms the accounting, so a second violation in the
+    same connection aborts exactly like the first.
+  - Implemented once in the server layer, so all four physics backends and all
+    three mobile-duo bridges get it — the base included, since a body twist is
+    a motion command.
+- **FCI motion-limit and discontinuity checking.** Every commanded signal is now
+  differentiated with backward Euler at the 1 ms cycle and compared against the
+  limits libfranka publishes in `rate_limiting.h` — the same formulas its own
+  documentation spells out, differenced against the last *applied* command over
+  the interval its echoed `message_id` says it travelled (capped at three cycles,
+  because that interval is the client's own number).
+  - **Joint position generator**: `q_c` inside the FR3 joint range
+    (`joint_motion_generator_position_limits_violation`), implied velocity
+    (`..._velocity_limits_violation`), acceleration (`..._velocity_discontinuity`)
+    and jerk (`..._acceleration_discontinuity`), plus a start-pose check
+    (`joint_position_motion_generator_start_pose_invalid`).
+  - **Joint velocity generator**: velocity, acceleration and jerk, one derivative
+    up from the same machinery.
+  - **Cartesian velocity generator** (the mobile base's body twist): translational
+    and rotational velocity, acceleration and jerk, compared as norms the way
+    `limitRate` does.
+  - **Torque controller**: `tau_J_range_violation` for a torque outside the
+    joint's effort limit, `controller_torque_discontinuity` for `kMaxTorqueRate`.
+  - **Non-finite commands are refused whether or not enforcement is on.** Every
+    `value > limit` comparison against a NaN is false, so a NaN passed every
+    check, poisoned the backward differences it was recorded into and reached
+    both the physics backend and the wire. libfranka will not send one
+    (`lowpassFilter` throws on a non-finite value), so this only fires for a
+    hand-rolled client.
+  - **Every command that reaches the simulator has been checked**, fresh or not,
+    first command of a motion or resuming after a gap. The interval it is
+    differenced over comes from its echoed `message_id`, capped at three cycles,
+    so a genuine one-to-three cycle gap — what the sim's own loss looks like —
+    is measured at the rate the client commanded and passes. A long gap can
+    still trip a discontinuity, which is the honest consequence of holding
+    rather than extrapolating.
+  - **Checking and reporting are always on**: a violation logs a rate-limited
+    warning naming the joint or axis, the value and the limit, once per error
+    class per motion.
+- **`--enforce-motion-limits`** (and `FRANKA_SIM_ENFORCE_MOTION_LIMITS=1`) makes a
+  violation abort the motion: the offending command is refused rather than applied,
+  the matching bit is latched in `errors` *and* `reflex_reason`, `robot_mode`
+  becomes `kReflex`, the pending `Move` is answered `kReflexAborted`, and
+  `AutomaticErrorRecovery` clears it. **Off by default** and independent of
+  `--enforce-comm-constraints`.
+- **`--enforce-comm-constraints`** (and `FRANKA_SIM_ENFORCE_COMM_CONSTRAINTS=1`)
+  turns the violation abort on. **Off by default**: tracking and reporting always
+  run, but a sim is routinely driven by scripts and teleop bridges that are not
+  1 kHz realtime loops, so nothing aborts until asked.
+- **`--no-enforce-comm-constraints` / `--no-enforce-motion-limits`**: explicit off
+  switches that override the environment variables, for a run inside a shell,
+  launch file or container that exports one. The variables themselves are now
+  parsed as an allow-list (`1`, `true`, `t`, `yes`, `y`, `on`, `enable`,
+  `enabled`, and any nonzero integer);
+  previously anything non-empty was truthy, so `=disabled` *enabled* enforcement.
+
+### Changed
+
+- **`control_command_success_rate` reports `0.0` when no control or motion
+  generator loop is running**, replacing the previous hard-coded `1.0`. This is
+  the documented hardware behaviour ("shows a value of zero if no control or
+  motion generator loop is currently running", `include/franka/robot_state.h`),
+  and it is what `echo_robot_state` prints against a real robot. A client that
+  reads the field outside a control loop and expects `1.0` will see `0.0`.
+- **`q_d`, `dq_d`, `ddq_d` and `tau_J_d` are now what was *commanded*.** The FCI
+  layer owns them on **arm roles** and no physics backend overwrites them on the
+  publish path.
+  Previously the MuJoCo backend republished `dq_d`/`ddq_d` as the *measured*
+  velocity and a filtered measured acceleration, and its `q_d` copy lagged the
+  applied command by a physics step. libfranka's default command low-pass filter
+  blends every command with these fields, so the lag came straight back out as a
+  wobble in the client's own `q_c` — visible, with the new checks on, as spurious
+  discontinuity errors from the stock `generate_joint_position_motion` example.
+  `dq_d` and `ddq_d` now carry `dq_{c,k-1}` and `ddq_{c,k-1}`: the commanded
+  stream's own backward differences in position mode, the commanded value in
+  velocity mode, and zero between motions. A client that read `dq_d` expecting
+  measured velocity should read `dq` instead.
+
+  Two consequences worth calling out. The **mobile-duo `base` role is excluded**:
+  its motion generator is Cartesian, so the fields the client commands and
+  libfranka filters are `O_dP_EE_c`/`O_dP_EE_d`, and nothing commands its
+  `q_d`/`dq_d`/`ddq_d` at all — they describe the swerve steer/drive joints, so
+  the backend's reading is merged through and they track the wheels. And in a
+  **torque-only session** (`kExternalController`, no motion generator) `q_d` now
+  stays at the standstill setpoint captured when the `Move` was accepted, with
+  `dq_d`/`ddq_d` zero, for the whole session; read `q` for the measured pose.
+- **A `Move` is refused while a reflex is latched**, with
+  `Move::Status::kCommandNotPossibleRejected` — libfranka renders it as "command
+  not possible in the current mode (kReflex)". Previously it was accepted, giving
+  a state that claimed `kMove` and carried a latched error at once, and (for
+  motion limits) a motion whose every command was silently swallowed.
+  `AutomaticErrorRecovery` first, as on hardware.
+- **A `Move` that arrives while a motion is running preempts it.** The running
+  motion is answered `Move::Status::kPreempted` and the robot is recaptured
+  before the new motion is seeded. Previously the new motion inherited the old
+  one's difference history and its opening waypoint was validated against the
+  start-pose tolerance alone, so every extra `Move` bought an unchecked step.
+- **Between motions the state reports the internal controller's hold**, not the
+  previous motion's last command: `q_d` becomes the held joint positions and
+  `dq_d`/`ddq_d`/`tau_J_d` go to zero when a session ends or a new `Move` starts.
+  The mobile base's `O_dP_EE_c`/`O_dP_EE_d` are zeroed by its hold for the same
+  reason — it really has stopped.
+- Every TCP response now goes out under one send lock, and every transition that
+  starts, finishes, preempts or aborts a motion runs under one motion-session
+  lock keyed to a monotonic motion id. Reflex aborts are raised from the
+  state-publish thread *and* the UDP receive thread while the TCP thread answers
+  commands: unserialised, a real violation could be answered `kSuccess`, an abort
+  could kill the motion that had just replaced the one that violated, a stale
+  `motion_generation_finished` datagram could switch a fresh motion's accounting
+  off, and two concurrent `sendall` calls could interleave and desynchronise the
+  frame stream.
+- `AutomaticErrorRecovery` now clears `errors` (`current_errors`) as well as
+  returning `robot_mode` to `kIdle`. `reflex_reason` (`last_motion_errors`) is
+  deliberately left alone — libfranka defines it as the record of what aborted
+  the *previous* motion.
+
 ## [0.4.0] - 2026-08-20
 
 ### ⚠ Breaking

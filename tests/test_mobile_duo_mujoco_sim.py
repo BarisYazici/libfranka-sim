@@ -355,9 +355,11 @@ def test_every_role_snapshot_has_the_expected_keys_and_shapes(scene):
         for key in ("q", "dq", "ddq", "q_d", "dq_d", "ddq_d", "tau_J"):
             assert np.asarray(state[key]).shape == (7,), f"{role}/{key}"
         assert np.asarray(state["O_T_EE"]).shape == (16,)
-        # dq_d/ddq_d echo the measured values, as the Genesis scene does.
-        assert state["dq_d"] is state["dq"]
-        assert state["ddq_d"] is state["ddq"]
+        # q_d/dq_d/ddq_d are published for shape compatibility only: on an arm
+        # role the FCI layer owns those fields and the publish loop drops the
+        # backend's copy (see COMMANDED_STATE_FIELDS), so what the snapshot puts
+        # in them never reaches a client. Asserting that dq_d *is* dq here used
+        # to read as a promise about the wire; it is not one.
 
 
 def test_base_snapshot_pads_the_four_wheel_joints_into_seven(scene):

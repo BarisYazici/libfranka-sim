@@ -48,8 +48,9 @@ def test_robot_state_initialization():
     """Test robot state initialization with default values"""
     state = RobotState()
 
-    # Check initial values
-    assert state.state["message_id"] == 0
+    # Check initial values. Ids start at 1: the first state is published before
+    # the first update(), and a command echoing 0 is dropped by the server.
+    assert state.state["message_id"] == 1
     assert state.state["robot_mode"] == RobotMode.kIdle.value
     assert state.state["motion_generator_mode"] == 0
     assert state.state["controller_mode"] == 0

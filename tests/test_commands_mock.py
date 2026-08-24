@@ -332,13 +332,23 @@ def test_velocity_control_desired_states(tcp_client, udp_client, sim_server, moc
     command_msg += struct.pack("<7d", *([0.0] * 7))  # tau_J_d
     command_msg += struct.pack("<B", 0)  # torque_command_finished
 
+    # Snapshot dq_d at the moment the command is handed to the simulator. This
+    # client sends one datagram and then goes quiet, so twenty cycles later the
+    # communication-constraints emulation ramps the commanded velocity to a safe
+    # stop; reading the state afterwards would read that ramp, not the echo.
+    reported = []
+    mock_genesis_sim.update_joint_velocities.side_effect = lambda dq: reported.append(
+        list(sim_server.robot_state.state["dq_d"])
+    )
+
     udp_client.sendto(command_msg, ("localhost", sim_server.udp_socket.getsockname()[1]))
 
     # Wait for state update
     time.sleep(0.1)
 
     # Verify that dq_d was updated to match commanded velocities
-    assert np.allclose(sim_server.robot_state.state["dq_d"], desired_velocities)
+    assert reported, "the velocity command never reached the simulator"
+    assert np.allclose(reported[0], desired_velocities)
 
 
 def test_torque_control_desired_states(tcp_client, udp_client, sim_server, mock_genesis_sim):

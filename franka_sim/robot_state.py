@@ -61,13 +61,18 @@ class RobotState:
     def __init__(self):
         """Initialize the robot state with default values."""
         self.state = self._initialize_state()
-        self._message_id = 0
+        # Ids start at 1, not 0. The first state is published *before* the
+        # first update(), so a 0 here would put a message_id of 0 on the wire --
+        # and _handle_commands drops any command echoing 0 as unparsable, so the
+        # client's perfectly good answer to that first state was thrown away and
+        # charged to it as a lost cycle.
+        self._message_id = self.state["message_id"]
         logger.info("Robot state initialized")
 
     def _initialize_state(self) -> Dict[str, Any]:
         """Initialize the robot state dictionary with default values."""
         return {
-            "message_id": 0,
+            "message_id": 1,  # see __init__: the first published state uses it
             "q": [0.0] * 7,  # Joint positions
             "q_d": [0.0] * 7,  # Desired joint positions
             "dq": [0.0] * 7,  # Joint velocities
@@ -79,10 +84,13 @@ class RobotState:
             "theta": [0.0] * 7,  # Motor positions
             "dtheta": [0.0] * 7,  # Motor velocities
             "robot_mode": RobotMode.kIdle.value,  # Store as integer value
-            # The sim applies every received command, so report a perfect command
-            # success rate (libfranka's communication_test / controllers read this;
-            # 0.0 would look like the controller is dropping every command).
-            "control_command_success_rate": 1.0,
+            # Rewritten every publish cycle from the rolling window in
+            # franka_sim.comm_constraints; this is only the value seen before a
+            # control loop has run. Zero, because that is what the robot
+            # reports then: control_command_success_rate "shows a value of zero
+            # if no control or motion generator loop is currently running"
+            # (libfranka include/franka/robot_state.h).
+            "control_command_success_rate": 0.0,
             # Transformation matrices (4x4 column-major)
             "O_T_EE": list(_IDENTITY_4X4),
             "O_T_EE_d": list(_IDENTITY_4X4),
