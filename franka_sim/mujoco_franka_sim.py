@@ -29,7 +29,10 @@ import numpy as np
 from franka_sim.control_modes import ControlMode
 from franka_sim.sim_common import (
     FR3_FORCE_LIMITS,
+    PositionFeedforward,
     RealtimeFactorMonitor,
+    close_passive_viewer,
+    launch_passive_viewer,
     pose_to_column_major,
     resolve_fr3_joint_damping,
 )
@@ -268,6 +271,9 @@ class MujocoFrankaSim:
         self.model = None
         self.data = None
         self.viewer = None
+        #: The viewer's own render thread, so stop() can wait for it to finish
+        #: its GL teardown; see sim_common.close_passive_viewer.
+        self._viewer_thread = None
         self.running = False
         self.prefix = ""
 
@@ -283,6 +289,15 @@ class MujocoFrankaSim:
         self.latest_torques = np.zeros(7)
         self.latest_joint_positions = ARM_INITIAL_Q.copy()
         self.latest_joint_velocities = np.zeros(7)
+        # POSITION mode's velocity feedforward: the commanded velocity the
+        # damping term servos against, differenced over the number of physics
+        # steps the target actually took to change (see PositionFeedforward for
+        # why that is not the same as "one step"). Seeded to the initial pose so
+        # the settle loop's constant target starts at dq_c = 0, and re-seeded by
+        # set_control_mode() on every switch into POSITION mode so a stale
+        # baseline from an old streaming session or a different control mode
+        # never produces a first-step spike.
+        self._position_feedforward = PositionFeedforward(ARM_INITIAL_Q)
 
         # Per-finger targets (m), each 0..MAX_FINGER_TRAVEL. Start fully open.
         self.max_finger_width = 2 * MAX_FINGER_TRAVEL  # total opening
@@ -369,12 +384,26 @@ class MujocoFrankaSim:
 
     # -- command interface -------------------------------------------------
 
+    @property
+    def prev_position_target(self) -> np.ndarray:
+        """The POSITION target the feedforward is currently differencing from."""
+        return self._position_feedforward.previous
+
     def set_control_mode(self, mode: ControlMode) -> None:
         """Set the control mode for the robot (lock-free atomic reference swap)."""
         if not isinstance(mode, ControlMode):
             raise ValueError(f"Mode must be a ControlMode enum, got {type(mode)}")
         logger.info("Switching control mode to: %s", mode.value)
         self.control_mode = mode
+        if mode == ControlMode.POSITION:
+            # Discontinuous-target entry point: a fresh Move into POSITION mode
+            # and the idle hold (which sets the target to the current q before
+            # calling this) both land here. Snap the feedforward baseline to
+            # whatever target is current right now -- and zero the held dq_c
+            # with it -- so the very next physics step sees dq_c = 0 rather than
+            # differencing against, or coasting on, a baseline left over from an
+            # older streaming session or another mode.
+            self._position_feedforward.reset(self.latest_joint_positions)
 
     def update_torques(self, torques) -> None:
         """Publish the latest commanded torques for the physics thread.
@@ -425,6 +454,21 @@ class MujocoFrankaSim:
         TORQUE mode passes the client's command through unchanged -- the same
         contract the real FCI offers. The clamp is MuJoCo's equivalent of the
         Genesis sim's ``set_dofs_force_range``.
+
+        POSITION mode's damping term is not plain ``-KD*dq``: undamped, it
+        damps against zero velocity, so it fights any commanded motion and
+        adds a ``(KD/KP)*qdot`` lag behind the target -- at these gains ~0.1s
+        of velocity's worth of position error, enough on its own to fail
+        libfranka's tracking guard (RMSE(q, q_c) < 6e-3 rad) on an ordinary
+        point-to-point motion. Instead it damps against the commanded
+        velocity ``dq_c``, produced once per physics step by
+        :class:`~franka_sim.sim_common.PositionFeedforward`: a backward
+        difference of the target taken over the number of steps it took to
+        change, held across the steps where nothing arrived, and dropped to
+        zero once the stream stops. A held target -> dq_c = 0 -> identical to
+        the old law. A target that jumps (teleport with enforcement off)
+        produces one step of large dq_c; the FR3_FORCE_LIMITS clip below is
+        what bounds that, same as it already bounds every other mode.
         """
         mode = self.control_mode
         if mode == ControlMode.TORQUE:
@@ -434,8 +478,10 @@ class MujocoFrankaSim:
             if mode == ControlMode.VELOCITY:
                 tau = ARM_VELOCITY_KV * (self.latest_joint_velocities - dq)
             else:
-                error = self.latest_joint_positions - self.data.qpos[self.arm_qpos_adr]
-                tau = ARM_POSITION_KP * error - ARM_POSITION_KD * dq
+                target = self.latest_joint_positions
+                dq_c = self._position_feedforward.step(target, self.dt)
+                error = target - self.data.qpos[self.arm_qpos_adr]
+                tau = ARM_POSITION_KP * error + ARM_POSITION_KD * (dq_c - dq)
         return np.clip(tau, -FR3_FORCE_LIMITS, FR3_FORCE_LIMITS)
 
     def finger_control_force(self) -> np.ndarray:
@@ -553,22 +599,22 @@ class MujocoFrankaSim:
             self.initialize_simulation()
 
         if self.enable_vis and self.viewer is None:
-            import mujoco.viewer
-
-            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self.viewer, self._viewer_thread = launch_passive_viewer(self.model, self.data)
 
         self.running = True
         self.run_simulation()
 
     def stop(self) -> None:
-        """Stop the physics loop and close the viewer."""
+        """Stop the physics loop and close the viewer.
+
+        Idempotent: a second call (a second Ctrl+C, or the finally-block after
+        an explicit stop) finds no viewer left and returns immediately.
+        """
         self.running = False
-        if self.viewer is not None:
-            try:
-                self.viewer.close()
-            except Exception:
-                logger.exception("Error closing the MuJoCo viewer")
-            self.viewer = None
+        viewer, self.viewer = self.viewer, None
+        thread, self._viewer_thread = self._viewer_thread, None
+        if viewer is not None:
+            close_passive_viewer(viewer, thread, logger)
 
 
 def main():

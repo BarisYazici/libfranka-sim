@@ -18,12 +18,19 @@ documentation is explicit about what happens when it is not:
     successful received packet."
     -- libfranka v10, ``docs/system_requirements.rst`` (Packet Handling)
 
-    **The sim does not do the extrapolation half of that.** A missed cycle
-    simply leaves the last applied command in place: the position target stays
-    where it was, a commanded velocity or twist stays at its last real value,
-    the torque is held -- which is the controller half of the quotation applied
-    to every signal. Continuing a *motion generator* under constant
-    acceleration is a roadmap item; see ``docs/robot-state.md``.
+    **The sim does both halves.** A missed *motion generator* cycle is
+    extrapolated under the acceleration frozen at the start of the gap, and the
+    extrapolated waypoint is dispatched to physics and published back in
+    ``q_d``/``dq_d``/``ddq_d`` (and ``O_T_EE_c``/``O_T_EE_d`` on a pose motion)
+    exactly as Control reports its own. A missed *controller* cycle holds the
+    last torque, which is the quotation's second half. The arithmetic lives in
+    :meth:`franka_sim.motion_limits.MotionLimitChecker.extrapolate`; this module
+    only says *which* cycles were missed. See ``docs/robot-state.md``.
+
+    Extrapolation stops at :data:`MAX_CONSECUTIVE_LOST_CYCLES`, where the robot
+    stops too: past that the reference simply holds while the violation below is
+    latched, so a client that has genuinely gone away leaves the arm at a
+    standstill rather than flying off along its last trajectory.
 
     "If ``>=20`` packets are lost in a row the control loop is stopped with the
     ``communication_constraints_violation`` exception."
@@ -153,6 +160,23 @@ class CycleOutcome:
     #: has to be able to tell whether the motion that violated is still the
     #: current one -- see ``FrankaSimServer._abort_with_error``.
     motion_id: int = 0
+    #: ``message_id`` of the state whose cycle this outcome closed -- the cycle
+    #: the client either answered or lost. The *previously* published id, not
+    #: the one being published now, and the id the caller stamps on the
+    #: extrapolated command it substitutes for a lost answer, so the resumed
+    #: real command is still exactly one cycle away from the history. Reported
+    #: rather than recomputed as ``published_id - 1`` because nothing here
+    #: promises the caller's ids advance by exactly one.
+    closed_id: int = 0
+    #: True on the tick where :attr:`consecutive_lost` first *reaches*
+    #: :data:`MAX_CONSECUTIVE_LOST_CYCLES` -- whether or not enforcement is on,
+    #: which is what distinguishes it from :attr:`violation_triggered`. It is
+    #: the moment the caller must stop extrapolating and hold: the robot stops
+    #: there too, and a reference that kept integrating past it would carry the
+    #: arm away on the trajectory of a client that is no longer there. Once per
+    #: run of losses by construction -- the counter passes the bound exactly
+    #: once on its way up, and any answered cycle resets it to zero.
+    bound_reached: bool = False
 
 
 class CommConstraintTracker:
@@ -323,12 +347,12 @@ class CommConstraintTracker:
         ``sendto`` is charged to the client; see :meth:`command_received`.
         """
         with self._lock:
-            outcome = self._close_cycle_locked()
+            outcome = self._close_cycle_locked(self._published_id)
             self._received_in_cycle = False
             self._published_id = published_id
             return outcome
 
-    def _close_cycle_locked(self) -> CycleOutcome:
+    def _close_cycle_locked(self, closed_id: int) -> CycleOutcome:
         if not (self._motion and self._armed):
             return CycleOutcome(
                 active=False,
@@ -337,6 +361,7 @@ class CommConstraintTracker:
                 consecutive_lost=self._consecutive_lost,
                 violation_triggered=False,
                 motion_id=self._motion_id,
+                closed_id=closed_id,
             )
 
         received = self._received_in_cycle
@@ -365,6 +390,12 @@ class CommConstraintTracker:
             consecutive_lost=self._consecutive_lost,
             violation_triggered=triggered,
             motion_id=self._motion_id,
+            closed_id=closed_id,
+            # Equality, not ">=": the counter walks up one at a time, so it
+            # stands on the bound for exactly one tick of any run of losses.
+            # No latch needed, and a client that recovers and loses another
+            # twenty gets told again.
+            bound_reached=not received and self._consecutive_lost == self._max_consecutive_lost,
         )
 
     # -- reporting ---------------------------------------------------------
@@ -417,3 +448,15 @@ class CommConstraintTracker:
         """Token of the running motion, 0 when none is."""
         with self._lock:
             return self._motion_id
+
+    @property
+    def max_consecutive_lost(self) -> int:
+        """Losses in a row this tracker stops at; :data:`MAX_CONSECUTIVE_LOST_CYCLES`.
+
+        Read by the publish loop to decide how long to keep extrapolating a
+        silent client's trajectory: exactly as far as the robot does, and not
+        one cycle further. Exposed because the constructor takes an override and
+        a caller that read the module constant instead would disagree with a
+        tracker built with a different bound.
+        """
+        return self._max_consecutive_lost

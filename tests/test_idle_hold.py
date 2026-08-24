@@ -48,19 +48,70 @@ BASE_TWIST = [0.25, -0.1, 0.0, 0.0, 0.0, 0.4]
 # --- shared wire helpers -----------------------------------------------------
 
 
+#: Wall-clock budget for one TCP exchange with the server, drain included. A
+#: test that outlives it has hit a bug, not a slow box.
+TCP_DEADLINE_S = 5.0
+
+
+def recv_exactly(sock, size, deadline):
+    """Read exactly ``size`` bytes before ``deadline``, or fail the test.
+
+    A bare ``sock.recv(n)`` is allowed to return fewer bytes than asked for, so
+    reading a 12-byte header with one call is a latent desync: everything after
+    a short read is parsed off the wrong offset. And with no deadline a drain
+    loop waiting for a reply that will never come hangs the whole run instead of
+    reporting a failure.
+    """
+    original = sock.gettimeout()
+    chunks, remaining = [], size
+    try:
+        while remaining:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                pytest.fail(f"timed out reading {size} bytes from the FCI TCP socket")
+            sock.settimeout(budget)
+            try:
+                chunk = sock.recv(remaining)
+            except (socket.timeout, TimeoutError):
+                pytest.fail(f"timed out reading {size} bytes from the FCI TCP socket")
+            if not chunk:
+                pytest.fail("the FCI TCP socket closed mid-message")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        sock.settimeout(original)
+    return b"".join(chunks)
+
+
 def perform_handshake(tcp_client, udp_port=1338, host="localhost"):
     """Connect handshake (libfranka v10): version + UDP port in, status + version out."""
     tcp_client.connect((host, COMMAND_PORT))
     payload = struct.pack("<HH", 10, udp_port)
     header = MessageHeader(command=Command.kConnect, command_id=1, size=12 + len(payload))
     tcp_client.sendall(header.to_bytes() + payload)
-    tcp_client.recv(12)
-    status, _ = struct.unpack("<BH", tcp_client.recv(3))
+    deadline = time.monotonic() + TCP_DEADLINE_S
+    recv_exactly(tcp_client, 12, deadline)
+    status, _ = struct.unpack("<BH", recv_exactly(tcp_client, 3, deadline))
     return status == ConnectStatus.kSuccess
 
 
 def send_move(tcp_client, controller_mode, motion_generator_mode, command_id=2):
-    """Send a Move and consume the kMotionStarted + kSuccess responses."""
+    """Send a Move and drain TCP through this command's own reply.
+
+    Move gets exactly one reply per command id: kMotionStarted, sent the
+    moment the Move is accepted. The *terminal* response (kSuccess via
+    StopMove or a motion-finished datagram, or an abort status) only arrives
+    once the motion actually ends -- so it is not read here.
+
+    A caller starting a second motion on a connection where the previous one
+    already finished (e.g. via a `motion_finished` UDP datagram) can still
+    have that first motion's terminal response sitting unread on the socket
+    when this fires; that response is not for `command_id`, so it is drained
+    and discarded here rather than left for the caller to trip over.
+
+    The drain has a deadline: a reply for `command_id` that never arrives is a
+    bug to report, not a reason to hang the suite.
+    """
     payload = struct.pack(
         "<II3d3d",
         controller_mode.value,
@@ -74,8 +125,12 @@ def send_move(tcp_client, controller_mode, motion_generator_mode, command_id=2):
     )
     header = MessageHeader(command=Command.kMove, command_id=command_id, size=12 + len(payload))
     tcp_client.sendall(header.to_bytes() + payload)
-    tcp_client.recv(16)
-    tcp_client.recv(16)
+    deadline = time.monotonic() + TCP_DEADLINE_S
+    while True:
+        response_header = MessageHeader.from_bytes(recv_exactly(tcp_client, 12, deadline))
+        recv_exactly(tcp_client, 4, deadline)  # status (1 byte) + padding (3 bytes)
+        if response_header.command_id == command_id:
+            break
 
 
 def pack_robot_command(message_id=1, o_dp_ee_c=None, tau_j_d=None, motion_finished=False):
@@ -95,7 +150,31 @@ def pack_robot_command(message_id=1, o_dp_ee_c=None, tau_j_d=None, motion_finish
     return message
 
 
+def wait_for_udp_socket(server, timeout=2.0, poll_interval=0.01):
+    """Block until ``server.udp_socket`` exists *and* is bound to a real port.
+
+    It is created on the broadcast thread, and -- since nothing in this
+    codebase calls ``bind()`` on it, it only ever sends -- stays at port 0
+    until the publish loop's first ``sendto()`` implicitly binds it.
+    Addressing a datagram to port 0 raises ``OSError: [Errno 22]``.
+
+    Both conditions are waited out by watching ``states_sent``, the count of
+    state datagrams the publish loop has actually put on the wire: it can only
+    have moved if that loop reached its ``sendto()``, which means the socket
+    exists and is bound. Watching the port instead used the bind as a proxy for
+    the send -- the weaker of the two signals, and one an explicit ``bind()``
+    in the server would have quietly broken.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if server.states_sent > 0 and server.udp_socket is not None:
+            return
+        time.sleep(poll_interval)
+    raise AssertionError("server's UDP socket never became ready (created and bound)")
+
+
 def send_robot_command(udp_client, server, **kwargs):
+    wait_for_udp_socket(server)
     udp_client.sendto(
         pack_robot_command(**kwargs), ("localhost", server.udp_socket.getsockname()[1])
     )

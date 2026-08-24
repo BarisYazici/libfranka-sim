@@ -22,6 +22,7 @@ Enforcement is off by default (see :data:`ENFORCE_ENV_VAR`), so the tests that
 want the abort ask for it explicitly.
 """
 
+import logging
 import select
 import socket
 import struct
@@ -179,6 +180,32 @@ def test_consecutive_losses_reset_on_any_answered_cycle():
     assert tracker.tick(201).consecutive_lost == 0
 
 
+def test_the_bound_is_the_documented_literal_twenty():
+    """Twenty. Not "whatever the constant says".
+
+    Every other test in this file spells the bound as
+    ``MAX_CONSECUTIVE_LOST_CYCLES``, which is right for reading but means a
+    mutation of the constant itself changes what all of them assert and none of
+    them notices. The number is not derivable from anything in this repo -- it is
+    stated in the FCI documentation, "After 20 consecutively dropped packets, the
+    robot ``will stop`` with the ``communication_constraints_violation`` error"
+    (libfranka ``docs/network_requirements.rst``) -- so it is pinned as a
+    literal, once, here.
+    """
+    assert MAX_CONSECUTIVE_LOST_CYCLES == 20
+
+    tracker = CommConstraintTracker(enforce=True)
+    tracker.start_motion()
+    stream(tracker, 3)
+    triggered_at = None
+    for cycle in range(1, 30):
+        outcome = tracker.tick(100 + cycle)
+        if outcome.violation_triggered:
+            triggered_at = outcome.consecutive_lost
+            break
+    assert triggered_at == 20
+
+
 def test_the_violation_trips_on_the_twentieth_consecutive_loss():
     """Twenty or more packets lost in a row (libfranka docs/overview.rst)."""
     tracker = CommConstraintTracker(enforce=True)
@@ -194,6 +221,74 @@ def test_the_violation_trips_on_the_twentieth_consecutive_loss():
 
     assert triggered_at == MAX_CONSECUTIVE_LOST_CYCLES
     assert tracker.violated is True
+
+
+def test_the_outcome_names_the_cycle_it_closed():
+    """The extrapolation needs an id, and it is the *previous* published state's.
+
+    A tick closes the cycle the last state opened and opens the one this state
+    starts, so the cycle that was just lost belongs to the id before this one.
+    The publish loop stamps that id on the waypoint it substitutes, which is
+    what leaves the client's resumed command exactly one cycle from the applied
+    history (see ``MotionLimitChecker.extrapolate``). Reported rather than
+    inferred as ``published_id - 1``: nothing here promises the caller's ids
+    advance by one, and the *first* tick of a session has no predecessor at all.
+    """
+    tracker = CommConstraintTracker()
+    tracker.start_motion()
+
+    assert tracker.tick(41).closed_id == 0  # nothing published before this one
+    tracker.command_received(41)
+    assert tracker.tick(42).closed_id == 41
+    # ...and ids that jump are reported as they are, not as 42 + 1.
+    assert tracker.tick(90).closed_id == 42
+
+
+def test_the_extrapolation_bound_is_reported_whether_or_not_enforcement_is_on():
+    """Where the robot stops extrapolating, and where a *reporting* sim must too.
+
+    ``violation_triggered`` only fires when enforcement is on, because it is an
+    instruction to abort. The bound is not: it is the point past which a
+    reference that kept integrating would carry the arm away on the trajectory
+    of a client that is no longer there, and that has to stop happening whether
+    or not the sim is also going to stop the motion.
+    """
+    for enforce in (False, True):
+        tracker = CommConstraintTracker(enforce=enforce)
+        tracker.start_motion()
+        stream(tracker, 3)
+
+        reached = [
+            outcome.consecutive_lost
+            for outcome in (
+                tracker.tick(100 + cycle)
+                for cycle in range(3 * MAX_CONSECUTIVE_LOST_CYCLES)
+            )
+            if outcome.bound_reached
+        ]
+
+        assert reached == [MAX_CONSECUTIVE_LOST_CYCLES], f"enforce={enforce}"
+
+
+def test_the_bound_is_reported_again_for_a_second_run_of_losses():
+    """Once per run, not once per motion: a client that recovers can lose it again.
+
+    Unlike the violation latch, which is a terminal state the client has to
+    recover from, this is a statement about one gap. The counter walks up one at
+    a time and any answered cycle sends it back to zero, so it stands on the
+    bound exactly once per run with no latch needed.
+    """
+    tracker = CommConstraintTracker(enforce=False)
+    tracker.start_motion()
+    stream(tracker, 3)
+
+    runs = 0
+    for _ in range(2):
+        for cycle in range(MAX_CONSECUTIVE_LOST_CYCLES + 3):
+            runs += 1 if tracker.tick(200 + runs + cycle).bound_reached else 0
+        stream(tracker, 5, start_id=900 + runs)
+
+    assert runs == 2
 
 
 def test_the_violation_triggers_once_and_stays_latched():
@@ -694,7 +789,28 @@ class WireClient:
     # -- UDP ---------------------------------------------------------------
 
     def read_state(self):
-        data, address = self.udp.recvfrom(4096)
+        """Return the newest published state, draining any backlog first.
+
+        Real libfranka reads UDP state on its own background thread, always
+        draining at ~1 kHz regardless of what the calling thread is blocked on
+        -- including a pending TCP call such as ``automaticErrorRecovery()``.
+        This test client is single-threaded, so a wait on the server side (see
+        ``FrankaSimServer._wait_for_standstill``) lets several state datagrams
+        pile up unread while this client is blocked in
+        :meth:`automatic_error_recovery`. UDP is FIFO, so a plain ``recvfrom``
+        would return the *oldest* of those instead of the current state.
+        Draining whatever is already buffered and keeping the newest is what
+        makes this stand-in behave like the background thread it replaces.
+        """
+        newest = None
+        while True:
+            readable, _, _ = select.select([self.udp], [], [], 0)
+            if not readable:
+                break
+            newest = self.udp.recvfrom(4096)
+        if newest is None:
+            newest = self.udp.recvfrom(4096)
+        data, address = newest
         self.server_udp_address = address
         assert len(data) == _ROBOT_STATE_PACKER.size
         values = _ROBOT_STATE_PACKER.unpack(data)
@@ -805,7 +921,9 @@ def start_torque_motion(client_factory):
     assert wire.move(ControllerMode.kExternalController, MotionGeneratorMode.kNone) == (
         MoveStatus.kMotionStarted
     )
-    wire.read_move_response()  # the kSuccess that follows the first published state
+    # No second Move response follows kMotionStarted: Move gets exactly one
+    # immediate reply, and the terminal one (kSuccess/abort) only arrives
+    # once the motion actually ends -- it does not, here.
     wire.stream(SUCCESS_RATE_WINDOW, tau_j_d=TORQUES)
     return wire
 
@@ -817,7 +935,11 @@ def test_a_streaming_client_reports_a_perfect_success_rate(serve, client):
 
     state = wire.stream(SUCCESS_RATE_WINDOW, tau_j_d=TORQUES)
 
-    assert state[SUCCESS_RATE_INDEX] == pytest.approx(1.0)
+    # Same one-cycle slack every other over-the-wire success-rate assertion
+    # carries: the publisher is soft real time, so a state can go out between
+    # the client's recv and its send and cost the window one cycle. The default
+    # 1e-6 relative tolerance was strict enough to flake on exactly that.
+    assert state[SUCCESS_RATE_INDEX] == pytest.approx(1.0, abs=0.02)
 
 
 def test_the_success_rate_falls_on_a_gap_and_climbs_back(serve, client):
@@ -853,46 +975,182 @@ def test_a_gap_never_aborts_the_motion_by_default(serve, client):
 
 
 def test_a_lost_torque_cycle_reuses_the_last_torque(serve, client):
-    """FCI reuses the torques of the last successfully received packet."""
+    """FCI reuses the torques of the last successfully received packet.
+
+    The controller half of the packet-handling rule, and the half that does
+    *not* extrapolate: a torque is not a waypoint, so there is nothing to
+    integrate and the last one simply stays applied. Pinned by count as well as
+    by value -- the simulator must not be commanded at all on a lost cycle, or a
+    future change to the motion-generator extrapolation could quietly start
+    driving torque through gaps too.
+    """
     server = serve()
     wire = start_torque_motion(client)
+    # Two silent cycles first, so the last streamed answer is certainly through
+    # the receive path before the count is taken -- otherwise this asserts
+    # against a datagram still in flight rather than against the gap.
+    wire.drop(2)
+    commands_before = server.genesis_sim.update_torques.call_count
 
-    state = wire.drop(10)
+    state = wire.drop(3 * MAX_CONSECUTIVE_LOST_CYCLES)
 
     assert np.array(state[TAU_J_D_SLICE]) == pytest.approx(TORQUES, abs=1e-5)
     assert np.array(server.genesis_sim.update_torques.call_args.args[0]) == pytest.approx(TORQUES)
+    # The idle hold writes zero torque once when the enforced abort fires; this
+    # server is unenforced, so nothing at all should have been written.
+    assert server.genesis_sim.update_torques.call_count == commands_before
 
 
-def test_a_missed_cycle_holds_the_last_commanded_position(serve, client):
-    """A gap freezes the waypoint stream; the sim does not extrapolate it.
+def test_a_missed_cycle_extrapolates_the_commanded_position(serve, client):
+    """A gap continues the waypoint stream, and the wire says so.
 
-    The real FCI would continue the trajectory under constant acceleration
-    (``docs/system_requirements.rst``). This sim holds instead -- a deliberate
-    divergence, documented in ``docs/robot-state.md`` -- so the reported ``q_d``
-    and the simulator's target both stay exactly where the last real command put
-    them, however long the client stays quiet.
+    The real FCI "takes the previous waypoints and performs a linear
+    extrapolation (keep acceleration constant and integrate) for the missed time
+    step" (``docs/system_requirements.rst``), and what it extrapolated is what
+    comes back in ``q_d`` -- "even in case of packet losses"
+    (``docs/overview.rst``). This sim held instead, for a long time, and the
+    divergence is now gone.
+
+    The stream is a clean 1 rad/s ramp (one millirad per cycle) whose commanded
+    acceleration is zero, so the frozen-acceleration extrapolation is a plain
+    arithmetic progression at exactly the same millirad per cycle -- and it runs
+    for :data:`MAX_CONSECUTIVE_LOST_CYCLES` - 1 cycles before the bound stops it
+    and the reference holds. Both halves are asserted: a runaway would overshoot
+    the plateau, and the old hold behaviour never leaves the last commanded
+    value at all.
     """
     server = serve()
     wire = client()
     wire.connect()
     wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
-    wire.read_move_response()
 
     step = 0.001
     for waypoint in range(1, 21):
         wire.read_state()
         wire.answer(q_c=[waypoint * step] * 7)
     last_commanded = 20 * step
+    # One cycle short of the bound is the last one extrapolated: the bound
+    # itself is where the robot stops, and so does this.
+    plateau = last_commanded + (MAX_CONSECUTIVE_LOST_CYCLES - 1) * step
 
-    # Long enough to cover the point where an extrapolation would have been
-    # bounded, so a runaway of any size would show.
+    # Long enough to cover the bound several times over, so a runaway of any
+    # size would show up in the plateau.
     cycles = 3 * MAX_CONSECUTIVE_LOST_CYCLES
-    held = [np.array(wire.drop(1)[Q_D_SLICE]).mean() for _ in range(cycles)]
+    published = [np.array(wire.drop(1)[Q_D_SLICE]).mean() for _ in range(cycles)]
 
-    assert held[-1] == pytest.approx(last_commanded, abs=1e-6)
-    assert max(held) == pytest.approx(last_commanded, abs=1e-6)
+    assert published == sorted(published), "the reference must never go backwards"
+    assert published[0] < published[-1], "a gap must not freeze the reference"
+    # A cycle of slack: the publisher is soft real time, so the client's last
+    # answer can land a cycle either side of the state it was racing, which
+    # moves the whole progression by at most one step.
+    assert published[-1] == pytest.approx(plateau, abs=1.5 * step)
+    assert max(published) == pytest.approx(plateau, abs=1.5 * step)
+    # ...and the arm was driven through the gap, not left behind at the last
+    # real waypoint. Physics receives the extrapolated targets, exactly as it
+    # receives the commanded ones.
     applied = np.asarray(server.genesis_sim.update_joint_positions.call_args.args[0])
-    assert applied == pytest.approx([last_commanded] * 7, abs=1e-9)
+    assert applied == pytest.approx([published[-1]] * 7, abs=1e-9)
+
+
+def test_the_extrapolation_stops_at_the_bound_and_the_violation_latches(serve, client):
+    """Twenty missed cycles: the reference holds, the reflex fires, the arm is recaptured.
+
+    The previous attempt at this feature left the state *unsafe* past the bound
+    -- it kept integrating, and a client that had simply gone away took the arm
+    with it. Termination is therefore pinned explicitly here: extrapolation
+    stops, the last reference holds, and the existing communication-constraints
+    latch and abort machinery runs exactly as it did before, unchanged.
+    """
+    server = serve(enforce=True)
+    wire = client()
+    wire.connect()
+    wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
+
+    step = 0.001
+    for waypoint in range(1, 21):
+        wire.read_state()
+        wire.answer(q_c=[waypoint * step] * 7)
+
+    assert wire.read_move_response() == MoveStatus.kReflexAborted
+    state = wire.read_state()
+
+    assert state[ERRORS_SLICE][VIOLATION] == 1
+    assert state[REFLEX_REASON_SLICE][VIOLATION] == 1
+    assert state[ROBOT_MODE_INDEX] == RobotMode.kReflex
+    assert server.comm.violated is True
+    # The reference stopped where the bound left it, and the arm is back under
+    # the internal controller's hold rather than still flying along the ramp.
+    published = np.array(state[Q_D_SLICE]).mean()
+    assert published <= 20 * step + MAX_CONSECUTIVE_LOST_CYCLES * step + 1e-9
+    assert server.control_mode is ControlMode.POSITION
+    assert server.genesis_sim.update_torques.call_args.args[0] == [0.0] * 7
+
+    # ...and it stays put: nothing publishes another waypoint after the abort.
+    settled = [np.array(wire.drop(1)[Q_D_SLICE]).mean() for _ in range(10)]
+    assert settled == pytest.approx([settled[0]] * len(settled), abs=1e-9)
+
+
+def test_an_unenforced_bound_holds_the_reference_without_aborting(serve, client, caplog):
+    """Off by default, the sim reports the bound and holds -- it does not stop the motion.
+
+    The same two-flag contract every other emulated reflex has: the *behaviour*
+    (extrapolate, then hold) is always on because it is what the robot's
+    reference does, while the *abort* is opt-in. What a client running without
+    ``--enforce-comm-constraints`` gets instead is the log line.
+    """
+    server = serve(enforce=False)
+    wire = client()
+    wire.connect()
+    wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
+
+    step = 0.001
+    for waypoint in range(1, 21):
+        wire.read_state()
+        wire.answer(q_c=[waypoint * step] * 7)
+
+    with caplog.at_level(logging.WARNING, logger="franka_sim.franka_sim_server"):
+        settled = [
+            np.array(wire.drop(1)[Q_D_SLICE]).mean()
+            for _ in range(3 * MAX_CONSECUTIVE_LOST_CYCLES)
+        ]
+
+    assert server.comm.violated is False
+    assert not any(wire.read_state()[ERRORS_SLICE])
+    # The tail is flat: the bound stopped the extrapolation even with nothing
+    # enforcing anything.
+    assert settled[-10:] == pytest.approx([settled[-1]] * 10, abs=1e-9)
+    assert any("no longer extrapolating" in record.getMessage() for record in caplog.records)
+
+
+def test_extrapolation_does_not_double_count_the_communication_accounting(serve, client):
+    """A substituted waypoint is not an answer, and the success rate must not think so.
+
+    The one wire-level way this feature could have gone quietly wrong: the
+    extrapolated command flows through the same dispatch path a received
+    datagram does, and if it also reached the tracker the sim would report a
+    client's packet loss back to it as perfect communication. The rate here is
+    computed from the client's own arithmetic -- it dropped ``lost`` of the last
+    hundred cycles -- and has to match whether or not anything was extrapolated
+    into those cycles.
+    """
+    serve()
+    wire = client()
+    wire.connect()
+    wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
+
+    step = 0.001
+    for waypoint in range(1, SUCCESS_RATE_WINDOW + 1):
+        wire.read_state()
+        wire.answer(q_c=[waypoint * step] * 7)
+    before = wire.read_state()
+
+    lost = 10
+    state = wire.drop(lost + 1)
+
+    assert np.array(state[Q_D_SLICE]).mean() > np.array(before[Q_D_SLICE]).mean()
+    assert state[SUCCESS_RATE_INDEX] == pytest.approx(
+        (SUCCESS_RATE_WINDOW - lost) / SUCCESS_RATE_WINDOW, abs=0.02
+    )
 
 
 def test_a_missed_cycle_still_costs_the_success_rate(serve, client):
@@ -901,7 +1159,6 @@ def test_a_missed_cycle_still_costs_the_success_rate(serve, client):
     wire = client()
     wire.connect()
     wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kJointPosition)
-    wire.read_move_response()
 
     for waypoint in range(1, SUCCESS_RATE_WINDOW + 1):
         wire.read_state()
@@ -984,7 +1241,6 @@ def test_the_base_role_is_held_to_the_same_constraints(serve, client, mock_base_
     wire = client()
     wire.connect()
     wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
-    wire.read_move_response()
     wire.stream(30, o_dp_ee_c=twist)
 
     # A held twist keeps the base rolling through a short gap...
@@ -1030,7 +1286,6 @@ def test_the_base_role_reports_the_swerve_joints_it_is_driving(serve, client, mo
     wire = client()
     wire.connect()
     wire.move(ControllerMode.kJointImpedance, MotionGeneratorMode.kCartesianVelocity)
-    wire.read_move_response()
 
     twist = [0.25, -0.1, 0.0, 0.0, 0.0, 0.4]
     first = wire.stream(5, o_dp_ee_c=twist)
@@ -1224,7 +1479,6 @@ def test_a_motion_that_finishes_without_streaming_is_still_answered(serve, clien
     assert wire.move(ControllerMode.kExternalController, MotionGeneratorMode.kNone) == (
         MoveStatus.kMotionStarted
     )
-    wire.read_move_response()  # the kSuccess that follows the first published state
 
     wire.read_state()
     wire.answer(tau_j_d=TORQUES, motion_finished=True)
@@ -1365,7 +1619,6 @@ def test_dropping_n_cycles_shows_up_as_n_percent_of_loss(live_server, client):
     wire = client()
     wire.connect()
     wire.move(ControllerMode.kExternalController, MotionGeneratorMode.kNone)
-    wire.read_move_response()
 
     torques = [0.0] * 7
     full = wire.stream(SUCCESS_RATE_WINDOW + 20, tau_j_d=torques)
@@ -1385,7 +1638,6 @@ def test_a_long_silence_stops_the_arm_and_recovery_brings_it_back(live_server, c
     wire = client()
     wire.connect()
     wire.move(ControllerMode.kExternalController, MotionGeneratorMode.kNone)
-    wire.read_move_response()
 
     # Get the arm genuinely moving, then go silent.
     spin_up = [8.0, -8.0, 8.0, -8.0, 4.0, -4.0, 2.0]
@@ -1408,8 +1660,8 @@ def test_a_long_silence_stops_the_arm_and_recovery_brings_it_back(live_server, c
     assert np.abs(np.array(state[DQ_SLICE])).max() < 0.05, "the arm is still moving after the abort"
 
     assert wire.automatic_error_recovery() == 0
-    # Only kMotionStarted this time: the kSuccess that follows the first
-    # published state is sent once per connection.
+    # Move gets exactly one immediate reply, kMotionStarted; the terminal
+    # response only arrives once this motion actually ends.
     assert (
         wire.move(ControllerMode.kExternalController, MotionGeneratorMode.kNone, command_id=12)
         == MoveStatus.kMotionStarted

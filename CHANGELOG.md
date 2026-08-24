@@ -9,6 +9,215 @@ breaking changes — these are called out explicitly.
 
 ### Added
 
+- **Packet-loss extrapolation — a missed motion-generator cycle now continues
+  the trajectory, as the FCI does.** This was the last documented divergence in
+  the communication layer. Control "takes the previous waypoints and performs a
+  linear extrapolation (keep acceleration constant and integrate) for the missed
+  time step" and reports what it extrapolated back as `q_d`/`dq_d`/`ddq_d`
+  "even in case of packet losses"; franka-sim held the last command instead.
+  - **One substitute waypoint per missed cycle**, at the acceleration **frozen**
+    when the gap began — computed once from the backward differences of the last
+    two commands that actually arrived, never re-derived from the sim's own
+    extrapolated samples. Per interface: `q_c` gets `v += a dt` and then
+    `q += v dt`; `dq_c` gets `dq += a dt` with no jerk term; `O_T_EE_c` gets the
+    same law per translation axis and a rotation composed on the right by the
+    axis-angle increment `(ω + α dt) dt`; `O_dP_EE_c` extends at frozen
+    twist-acceleration; `elbow_c[0]` follows the 1-D position law while
+    `elbow[1]`, a branch flag with no derivative, is held.
+
+    The order of those two integrals on the position-like signals is
+    load-bearing, and it is what makes the law self-consistent with the backward
+    differencing it feeds: the first difference of an extrapolated waypoint is
+    exactly the velocity stored with it, and the second difference is exactly the
+    frozen acceleration. A stream whose acceleration is genuinely constant is
+    therefore extrapolated onto its own next waypoints **exactly**, and resumes
+    reporting exactly the acceleration it was commanding — pinned for gaps of 1
+    to 19 cycles and accelerations of 0.5 to 5 rad/s². The trapezoidal
+    `q += v dt + a dt²/2` leaves a half-step of slack against the differencing
+    every cycle; it accumulates, and the resume reports `a·(gap/2 + 1)` — enough
+    to abort a conforming 5 rad/s² client after a **two**-cycle gap.
+  - **A joint-velocity motion's opening command no longer seeds a phantom
+    acceleration.** `dq_c` shares its differencer with `dq_c`'s position-mode
+    sibling, but the two disagree about which stored field the frozen fallback
+    has to zero: on a position stream the frozen quantity is `second`
+    (acceleration), on a velocity stream it is `first` — `second` there is an
+    unread jerk. Zeroing the wrong one left a flagged acceleration in full
+    control of a following gap; an opening `dq_c` within
+    `START_VELOCITY_TOLERANCE` (0.1 rad/s) of `dq_d` was excused by the start
+    check but still differenced against the seeded history as if it were a
+    continuation, implying up to 100 rad/s² from a single sub-tolerance step and
+    running a nineteen-cycle gap out to 20× the only value the client ever sent.
+    The joint-velocity generator's opening command now rebases the history, the
+    same way the position and Cartesian-pose generators already do, and the
+    flat-freeze fallback zeroes the field each generator actually integrates.
+  - **A flagged command cannot seed a gap.** With enforcement off a command that
+    breaks a limit is reported and still applied — that is what the switch is
+    for — but its backward differences are no longer what a following gap
+    freezes. One duplicated datagram differences to zero velocity and `-v/dt` of
+    acceleration; frozen and integrated for nineteen cycles that dispatched a
+    reference running backwards at nineteen times the commanded speed
+    (0.127 rad/s forwards → 2.419 rad/s backwards) into physics and onto the
+    wire. The gap now freezes from the last command the checker did not flag, or,
+    where there is no adjacent clean one, from the commanded velocity with the
+    acceleration zeroed. Enforced behaviour is unchanged: a refused command never
+    enters the history at all.
+  - **Physics receives the extrapolated targets and the wire publishes them.**
+    The substitute goes through the same dispatch a received datagram does, so
+    the arm keeps moving through a gap and `q_d`/`dq_d`/`ddq_d` (and
+    `O_T_EE_c`/`O_T_EE_d` on a pose motion) advance with it — which is what stops
+    a client's own 100 Hz command low-pass (`ControlLoop::convertMotion`, gain
+    0.3859) from being dragged off its trajectory by a frozen reference.
+  - **The extrapolation is checked like a command and is not clamped.** An
+    extrapolation that runs out past the velocity envelope or a joint stop
+    latches the same error a client commanding it would. That is the documented
+    behaviour, not collateral damage: it is the mechanism behind libfranka's
+    warning that intermittent drops "could trigger `discontinuity` errors even
+    when your source signals conform with the interface specification".
+  - **It stops at 20 consecutive misses**, where the robot stops. Past the bound
+    the last reference holds — a client that has genuinely gone away leaves the
+    arm standing still rather than flying off — and the existing
+    `communication_constraints_violation` latch and abort run unchanged
+    (enforced: reflex and `kReflexAborted`; unenforced: a log line).
+  - **Torque still holds**, which is also hardware's behaviour: "if a controller
+    command packet is dropped, FCI will reuse the torques of the last successful
+    received packet."
+  - **Always on**, independent of both strictness switches, because it is not a
+    check — it is what the robot's reference *is* while the client is quiet.
+  - **A datagram that turns up late replaces the guess it stood in for.** The
+    FCI drops a command that missed its 1 ms window; this sim applies it, so the
+    two choices collide the moment extrapolation exists — the substitute
+    waypoint and the late datagram are the *same* step, one guessed and one
+    measured, and differencing them against each other reports a reference that
+    travelled nowhere followed by an enormous deceleration. Measured aborting a
+    conforming client's approach against Franka's own smoke suite at a
+    `control_command_success_rate` of 0.99. The extrapolations a late datagram
+    supersedes are now discarded and it is differenced against the last command
+    that actually arrived, over the interval it really travelled. A replay or a
+    reordered packet gets no rewind (its id is one the history is already built
+    on), and neither does a *fresh* command — which is what makes the resume
+    trap below fire rather than being quietly absorbed.
+
+    The run of losses stays rewindable **until a fresh command closes it**, not
+    until the first late datagram of it: a receive thread that was descheduled
+    hands over a whole backlog at once and every datagram in it is the true
+    answer to one of the run's cycles. Rewinding only for the first left the rest
+    applied-but-not-recorded, the history frozen *k* cycles in the past while the
+    id it claimed to sit at was dragged forward to the current cycle — 127 rad/s²
+    out of a two-cycle receive-thread stall, 1273 out of an eleven-cycle one,
+    linear in the stall and every one of them an abort under enforcement. The id
+    the history sits at now advances by exactly the one cycle each extrapolation
+    integrates, so it can never claim motion the reference did not travel.
+
+    Rewind, check and record are also **one operation** on the checker
+    (`absorb_command`), under a single hold of its lock. As three separate calls
+    they left two windows for the publish thread's own extrapolation to land in,
+    and either one re-created the same false abort at 64–191 rad/s² on an
+    ordinary conforming ramp. And the rewind is now only final once the command
+    is *accepted*: a late datagram that enforcement refuses leaves the
+    extrapolated reference standing, where before it rolled the reference back
+    and recorded nothing in its place, dispatching the next extrapolated cycle to
+    physics as a backward jump the size of the gap.
+  - **An extrapolated command is never dispatched under a newer motion.** A
+    `Move` accepted between building a substitute on the publish thread and
+    dispatching it rewrites `motion_generator_mode`/`controller_mode`, which is
+    what the dispatch branches on; the motion token is now re-read inside the
+    dispatch's own `_hold_lock`, which the `Move` path takes too.
+  - **`extrapolate()` refuses a repeated or backward `message_id`.** Its caller
+    (the publish loop) owns a strictly-increasing id, not client data, and
+    calling it twice for the same id integrated a *second* cycle of motion into
+    the history while `_applied_id` — which advances by at most one per call —
+    stood still, leaving the next real command differenced over an interval its
+    own bookkeeping said was one cycle when the history had actually moved two.
+    Now an assertion, since nothing but a caller bug can trigger it.
+  - **The real-robot resume trap is now reproducible in sim.** A client that
+    pauses mid-ramp and resumes from *its own* last waypoint commands a step
+    backwards the size of the whole gap, and the sim latches the discontinuity
+    hardware would; resuming from the reported `q_d` differences clean over the
+    standard millisecond. `docs/robot-state.md` documents both halves.
+- **Cartesian motion-generator checking — `kCartesianPosition` is no longer a
+  silent hole.** The commanded pose stream was decoded off the wire and dropped,
+  so Franka's own `arm_smoke_tests` cases for Cartesian errors never got an abort
+  and hung forever. `O_T_EE_c` and `elbow_c` now route into the same checker,
+  freshness and coalesced-cycle plumbing as the joint signals, and every error the
+  pose interface can raise on hardware is raised here. The indices and their
+  precedence are pinned against the smoke suite, which passes on real robots:
+  - a step in `O_T_EE_c` is `cartesian_motion_generator_velocity_discontinuity`
+    (19), **not** the envelope's 18 — the interface-relative naming rule the
+    joint generators already followed, now on the Cartesian half: an
+    acceleration-limit break on a commanded *pose* is named one derivative down,
+    and jerk lands one further up at 20;
+  - the first `O_T_EE_c` is checked against the robot's measured `O_T_EE` and
+    outranks every discontinuity —
+    `cartesian_position_motion_generator_start_pose_invalid` (16);
+  - a non-rigid or non-finite matrix is
+    `cartesian_position_motion_generator_invalid_frame_flag` (31) and is
+    **refused whether or not enforcement is on**, mirroring libfranka's
+    client-side `checkMatrix` as a server-side sanity refusal;
+  - the elbow gets its three errors: `..._start_elbow_invalid` (22),
+    `..._elbow_sign_inconsistent` (21) and `..._elbow_limit_violation` (17), the
+    last covering `kMaxElbowVelocity`/`Acceleration`/`Jerk` on `elbow_c[0]`.
+  - Rotational rates come from the axis-angle of `R_prev^T · R_curr` — a log map
+    written with numpy alone, with clamped-trace and near-π branches so an
+    only-1e-5-orthonormal commanded matrix can never hand `acos` a NaN.
+  - **The arm still does not move on the pose interface.** There is no inverse
+    kinematics stage; this is a checking layer, and the deliverable is the abort.
+    With enforcement *off* the checks only log, so a smoke test waiting for an
+    abort still hangs — that residual is documented in `docs/compatibility.md`.
+- **Arm-role `kCartesianVelocity` is checked too.** The twist checks existed but
+  were reachable only from the mobile duo's base role; an arm-role Cartesian
+  velocity motion was judged on nothing at all. Its `O_dP_EE_c` now goes through
+  the identical path, so a twist step aborts with
+  `cartesian_motion_generator_acceleration_discontinuity` (20) on either role.
+  The elbow checks that ride along with it are arm-only: `STEERING_DRIVE`
+  (the base) has no elbow of any kind and never records one, so a base client
+  that happened to set `valid_elbow` used to get `start_elbow_invalid`
+  re-latched every cycle against a swerve steering angle — that generator now
+  skips the elbow checks entirely, which is a fix, not "unchanged".
+- **`O_T_EE_d` and `O_T_EE_c` are no longer a permanent identity.** They are FCI
+  fields, not the physics backend's, and they now follow the real robot's
+  semantics — the Cartesian twin of what `q_d`/`dq_d` already did:
+  - **idle, between motions, and under any non-Cartesian generator** both report
+    the *measured* `O_T_EE`, republished every cycle. That is the internal
+    controller's hold pose, which is what the robot reports as commanded when it
+    is the one holding the flange;
+  - **during a `kCartesianPosition` motion** `O_T_EE_c` is the last pose the
+    client commanded and `O_T_EE_d` is the pose the generator is tracking; a lost
+    cycle *extrapolates* both, exactly as `q_d` is extrapolated;
+  - **when the motion ends, however it ends** — motion-finished datagram, reflex
+    abort, StopMove, a client that simply vanishes — both snap back to the
+    measured pose.
+
+  This was not cosmetic. A libfranka Cartesian-pose motion generator initialises
+  and holds from `O_T_EE_d` (Franka's own smoke helpers open every pose motion
+  with `std::array<double, 16> cmd = state.O_T_EE_d;`) and libfranka's command
+  low-pass filter blends each new command with `O_T_EE_c`
+  (`ControlLoop<CartesianPose>::convertMotion`). With both stubbed to identity,
+  *every* pose motion streamed a pose metres and a full rotation from the robot
+  and tripped `cartesian_position_motion_generator_start_pose_invalid` on cycle 0
+  — a sim artifact that hid five of the smoke suite's real Cartesian checks
+  behind it. Against Franka's older `smoke_test_errors` suite this takes the
+  error binary from 10/21 to 15/21, turning
+  `CartesianMotionGeneratorVelocityDiscontinuity`,
+  `CartesianPositionMotionGeneratorInvalidFrame`,
+  `CartesianMotionGeneratorElbowSignInconsistent`,
+  `CartesianMotionGeneratorStartElbowInvalid` and
+  `CartesianMotionGeneratorElbowLimitViolationHardware` from false start-pose
+  failures into real passes. **Arm roles only** — the mobile-duo base role's
+  `O_dP_EE_d`/`O_dP_EE_c` echo and its dead-reckoned `O_T_EE` are untouched,
+  guarded by the same role check the rest of the commanded-field ownership uses.
+- **`elbow_c` joins `elbow_d`, and both now echo a commanded elbow.** Outside a
+  Cartesian motion — and inside one whose commands carry no elbow — they report
+  the measured `(q[2], sign(q[3]))`; while either Cartesian generator streams an
+  elbow they echo it, and they snap back when the motion ends. `delbow_c` and
+  `ddelbow_c` remain zero stubs.
+- **`elbow` and `elbow_d` are no longer a zero stub.** They report
+  `(q[2], sign(q[3]))` — the redundancy angle is joint 3 on an FR3 and the branch
+  flag is the sign of joint 4, so both are a reading of `q`. This is what makes
+  the elbow interface reachable at all: libfranka's `checkElbow` throws
+  client-side unless the flag is exactly ±1, so a client building
+  `CartesianPose{O_T_EE_d, elbow_d}` from a zero-filled `elbow_d` never got a
+  datagram onto the wire. Arm roles only.
+
 - **FCI communication-constraints emulation.** franka-sim no longer presents a
   perfect channel. Every published `RobotState` opens a cycle; a conforming
   client answers it with a `RobotCommand` echoing that state's `message_id`
@@ -19,19 +228,14 @@ breaking changes — these are called out explicitly.
   - **`control_command_success_rate` is now real**: the fraction of the last 100
     cycles answered in time, recomputed every cycle, exactly the window
     libfranka documents.
-  - **A missed cycle holds the last applied command**: nothing new is
-    dispatched, so the position target stays put, a commanded velocity or twist
-    stays applied and the torque is reused — the FCI's own behaviour for a
-    dropped *controller* packet, applied to every signal. The real robot
-    additionally extrapolates a missed **motion generator** cycle under constant
-    acceleration; franka-sim does not, and the divergence (including the
-    discontinuity trap it hides on hardware) is documented in
-    `docs/robot-state.md`. Emulating it is a roadmap item.
+  - **A missed cycle is extrapolated for a motion generator and held for the
+    torque controller**, which is what the FCI does with each — see the
+    packet-loss extrapolation entry at the top of this release.
   - Freshness is bounded on **both** sides: an echo older than the open cycle is
     late, and an id the server never published is not an answer at all. A
     datagram that is not fresh is still applied and still checked in full — over
-    a single cycle, the strictest reading — but it never becomes the *sample*
-    the next command is differenced against. A client running permanently one
+    the same server-observed interval as any other command — but it never
+    becomes the *sample* the next command is differenced against. A client running permanently one
     cycle behind is charged for every cycle; the sub-cycle bias at the
     tick/`sendto` boundary is left in the client's disfavour, because nothing in
     cycle space can tell that packet from a one-cycle-late one.
@@ -56,8 +260,8 @@ breaking changes — these are called out explicitly.
   differentiated with backward Euler at the 1 ms cycle and compared against the
   limits libfranka publishes in `rate_limiting.h` — the same formulas its own
   documentation spells out, differenced against the last *applied* command over
-  the interval its echoed `message_id` says it travelled (capped at three cycles,
-  because that interval is the client's own number).
+  the interval the server itself observed between them, which the client's echoed
+  `message_id` may bound from above but never widen.
   - **Joint position generator**: `q_c` inside the FR3 joint range
     (`joint_motion_generator_position_limits_violation`), implied velocity
     (`..._velocity_limits_violation`), acceleration (`..._velocity_discontinuity`)
@@ -78,11 +282,13 @@ breaking changes — these are called out explicitly.
     hand-rolled client.
   - **Every command that reaches the simulator has been checked**, fresh or not,
     first command of a motion or resuming after a gap. The interval it is
-    differenced over comes from its echoed `message_id`, capped at three cycles,
-    so a genuine one-to-three cycle gap — what the sim's own loss looks like —
-    is measured at the rate the client commanded and passes. A long gap can
-    still trip a discontinuity, which is the honest consequence of holding
-    rather than extrapolating.
+    differenced over is the server's own: how many states it has published since
+    the command the applied history sits at (`MotionLimitChecker.note_published`).
+    A gap of any length is therefore measured at the rate the client actually
+    commanded, and an echo naming a state the server never published buys no
+    discount, because the interval is bounded by that count. The three-cycle
+    `MAX_COALESCED_CYCLES` cap survives only as the fallback for callers that
+    drive the checker with no publish loop behind it.
   - **Checking and reporting are always on**: a violation logs a rate-limited
     warning naming the joint or axis, the value and the limit, once per error
     class per motion.
@@ -102,8 +308,53 @@ breaking changes — these are called out explicitly.
   parsed as an allow-list (`1`, `true`, `t`, `yes`, `y`, `on`, `enable`,
   `enabled`, and any nonzero integer);
   previously anything non-empty was truthy, so `=disabled` *enabled* enforcement.
+- **The safety controller: `joint_velocity_violation` (index 3).** A per-cycle
+  check of *measured* joint velocity against the position-based envelope,
+  evaluated at the measured configuration, active in **every** control mode —
+  including `startTorqueControl`, where no commanded velocity exists at all and
+  a torque that accelerates a joint past the envelope is the only way to see the
+  error. This is a different error from
+  `joint_motion_generator_velocity_limits_violation` (13), which judges the
+  *command*; when 13 fires during a motion, 3 is latched alongside it in the
+  same abort rather than one preempting the other. That pairing is not a
+  verified hardware pin — it follows the dev comment sitting under a
+  `TODO(qu_zh): Verify the change` in Franka's hardware smoke suite ("Both error
+  can appear. However with the current RCU joint_velocity_violation appear much
+  early as we shape the limit", `smoke_test_errors.cpp:110-127`), which is a
+  developer's account of the behaviour and says itself that it is unverified.
+  Reporting is always on;
+  aborting follows `--enforce-motion-limits` and is identical to every other
+  violation (error bit, `kReflex`, `Move` answered `kReflexAborted`). A 0.1 rad/s
+  margin over the envelope keeps integrator noise from firing it; the margin is
+  not applied when the only question is which name an already-certain violation
+  gets. Skipped on a mobile-*base* server, whose joints are not FR3 joints.
 
 ### Changed
+
+- **Motion-limit errors now use the interface-relative discontinuity names the
+  robot uses.** Which discontinuity a violation is called depends on the channel
+  the client commands, not on the derivative that broke its limit, and a
+  discontinuity outranks the velocity-envelope check when one step breaks both.
+  Pinned against Franka's hardware smoke suite. If you match on error names, the
+  ones that changed are:
+  - a mid-motion step in **`q_c`** now latches
+    `joint_motion_generator_velocity_discontinuity` (14), previously
+    `joint_motion_generator_velocity_limits_violation` (13);
+  - a step in **`dq_c`** — including one away from the reported `dq_d` on the
+    motion's first cycle — now latches
+    `joint_motion_generator_acceleration_discontinuity` (15), previously 14 or
+    13, and the jerk check on that interface maps to 15 as well;
+  - a step in **`O_dP_EE_c`** (the mobile base twist) now latches
+    `cartesian_motion_generator_acceleration_discontinuity` (20), previously
+    `cartesian_motion_generator_velocity_discontinuity` (19) or the envelope's
+    18. Index 19 is now unreachable: it belongs to a Cartesian *pose*
+    generator, which this server does not serve.
+
+  Unchanged: `joint_position_motion_generator_start_pose_invalid` (11) still
+  outranks every discontinuity on a motion's first cycle, and the torque
+  controller still reports `tau_J_range_violation` before
+  `controller_torque_discontinuity` — the one ordering here with no hardware
+  evidence either way, now pinned by a test so a change to it is deliberate.
 
 - **`control_command_success_rate` reports `0.0` when no control or motion
   generator loop is running**, replacing the previous hard-coded `1.0`. This is
@@ -162,6 +413,179 @@ breaking changes — these are called out explicitly.
   returning `robot_mode` to `kIdle`. `reflex_reason` (`last_motion_errors`) is
   deliberately left alone — libfranka defines it as the record of what aborted
   the *previous* motion.
+
+### Fixed
+
+- **The state publisher no longer manufactures the discontinuity it then
+  reports.** Under `--enforce-motion-limits`, an ordinary approach motion would
+  intermittently abort mid-flight with
+  `joint_motion_generator_velocity_discontinuity` at a
+  `control_command_success_rate` of 0.97-0.99 — hundreds of rad/s² attributed to
+  a client whose own signal never left the envelope. Three server-side causes,
+  all of which end in the same place: **the client's low-pass filter is closed
+  around the `q_d` this server publishes.** `ControlLoop<JointPositions>::
+  convertMotion` filters every waypoint toward `robot_state.q_d` with a fixed
+  1 ms gain (0.386 at libfranka's default 100 Hz cutoff), so a `q_d` that is
+  stale by even two cycles pulls the client's *own* commanded stream off its
+  trajectory, and the sim differences the kink it caused.
+  - **The 1 kHz pacer fired catch-up bursts.** A cycle that overran was made up
+    by publishing the next state immediately behind it — two states 60-90 µs
+    apart, measured. The client cannot answer the first in the time the second
+    takes to arrive, so the second necessarily carried a `q_d` predating that
+    answer. States are now spaced at least 0.8 ms apart however long the cycle
+    before them ran, and the pacing sleep moved to just before the send so the
+    schedule governs the moment the state leaves.
+  - **The publish loop ran ahead of its own receive path.** With the UDP receive
+    thread descheduled for a few milliseconds, states went out whose `q_d`
+    described the last command the server had managed to apply while the answers
+    to those very cycles sat unread in its own socket. A new drain gate
+    (`FrankaSimServer._drain_gate`), immediately before the accounting and the
+    send, holds the state back while a datagram is queued unread — restoring, for
+    a stall that hits one thread and not the other, the invariant the
+    communication accounting already assumes: a simulator that stalls delays the
+    state publish and the client's answer alike.
+  - **A late datagram was differenced over one cycle instead of the cycles it
+    travelled.** `fresh=False` forced the interval to 1, so a command two cycles
+    ahead of the applied history read as twice its own velocity — 16.9 rad/s²
+    where the honest interval gives 6.75. It now gets the same server-observed
+    interval as any other command; a replay or reordered packet, whose id is no
+    newer than the history's, still floors at one cycle.
+
+  Measured on the old-wire smoke suite (`smoke_test_errors`), two flakiest tests,
+  40 iterations on one idle host: **14 spurious aborts before, 1 after.** The
+  residual needed a stall long enough to freeze the whole process (10-40 ms
+  observed) and was the hold-not-extrapolate divergence, which the packet-loss
+  extrapolation entry at the top of this release closes.
+- **`StopMove` no longer ends the session -- a second `Move` on the same
+  connection now actually receives `RobotState`.** `handle_stop_move_command`
+  used to clear both `transmitting_state` and `connection_running`, which are
+  what the 1 kHz publish loop (and the connection's own watchdog) read to keep
+  going; either flag going false ended the UDP broadcast for good, since
+  nothing but a fresh `Connect` ever set them back. On the real robot
+  `StopMove` ends the *motion*, not the stream -- `RobotState` keeps
+  publishing continuously from `Connect` to disconnect. That gap was
+  invisible on a single-motion session but broke every session that does a
+  second `Move` after a `StopMove` on the same connection: libfranka's
+  `ActiveControl` does exactly that on `cancelMotion()` ->
+  `StopMove` -> `AutomaticErrorRecovery` -> `Move`, and the TCP command
+  thread (`handle_tcp_messages`) does not check either flag, so the second
+  `Move`'s `kMotionStarted` still arrived over TCP -- only for the client's
+  next UDP receive to hang until it timed out. Neither flag is cleared by
+  `StopMove` any more; both are cleared only by an actual disconnect or
+  server shutdown, matching the motion-finished-on-its-own path, which never
+  stopped the loop either. See `franka_sim/franka_sim_server.py`'s
+  `handle_stop_move_command` and `docs/robot-state.md`.
+
+- **A commanded velocity-envelope violation now also latches
+  `joint_velocity_violation`.** `JointMotionGeneratorVelocityLimitsViolationHardware`
+  (and `JointMotionGeneratorPositionLimitsViolationHardware`, which crosses the
+  envelope the same way) expects `joint_velocity_violation` in the
+  `ControlException` message. That pairing is not a verified hardware pin --
+  it follows the dev comment sitting under a `TODO(qu_zh): Verify the change`
+  in Franka's hardware smoke suite ("Both error[s] can appear. However with
+  the current RCU joint_velocity_violation appear[s] much earl[ier]",
+  `smoke_test_errors.cpp:110-127`), which is a developer's account of the
+  behaviour and says itself that it is unverified. The commanded-envelope
+  check now latches both 3 and 13 unconditionally whenever a motion is
+  running, so either name a caller matches on is present; the pure
+  safety-controller path (measured-only, e.g. torque mode with no commanded
+  velocity at all) is unchanged and still latches 3 alone. See
+  `franka_sim/motion_limits.py`'s `Violation.extra_error_index` and
+  `docs/robot-state.md`.
+
+- **`AutomaticErrorRecovery` no longer replies before the arm has stopped.**
+  The handler used to answer instantly, so a client recovering from a
+  high-speed abort (observed at ~2.6 rad/s) could start its next motion while
+  the arm was still decelerating under the idle hold; the new motion's own
+  client-side start-pose guard would then see measured `q` drifting off the
+  commanded `q` it had just sent and throw a spurious "Performance threshold
+  reached" a few milliseconds in, on a motion that had done nothing wrong. The
+  handler now polls the physics backend directly (not the cached
+  `RobotState.state["dq"]`, which only ever reflects whatever the 1 kHz
+  publish loop last copied into it) until measured `dq` has stayed below
+  0.005 rad/s for 50 consecutive 1 ms
+  cycles, capped at 0.7 s (comfortably under libfranka's own 1 s TCP receive
+  timeout on the response -- a 3 s cap was tried first and reliably broke the
+  connection instead). On timeout it replies success anyway and logs a
+  warning, so a caller can never hang. The wait runs on the per-connection TCP
+  thread, not the state-publish loop, so it does not stall state broadcast.
+  See `docs/robot-state.md` and `docs/compatibility.md`.
+
+- **A `kCartesianPosition` `Move` no longer aborts with a joint error.** The
+  limit checker was seeded with whatever control mode the *previous* motion had
+  left behind, because `kCartesianPosition` matches none of the server's physics
+  branches. It therefore read the zero-filled `q_c` of a Cartesian
+  `RobotCommand` as a joint position command and aborted live clients with
+  `joint_motion_generator_position_limits_violation` (joint 4's range does not
+  contain 0). Every motion-generator check is now gated on the generator the
+  accepted `Move` actually asked for: `q_c` only for `kJointPosition`, `dq_c`
+  only for `kJointVelocity`, `tau_J_d` only for `kExternalController`, and
+  nothing motion-generator-related for `kCartesianPosition`. `O_dP_EE_c` is
+  checked only for `kCartesianVelocity` **on a mobile-base server** — a
+  single-arm server has no Cartesian-velocity physics branch, so a
+  `kCartesianVelocity` `Move` there falls into the same unchecked category as
+  `kCartesianPosition` and its twist is not judged at all. The new
+  safety-controller check is the one exception and stays armed in all modes.
+
+- **A fast reconnect no longer times out on the new session's first UDP
+  receive.** `_handle_commands` used to read `self.udp_socket` at runtime
+  instead of the socket it was actually started with, so its hangup/error
+  branch cleared `self.connection_running` unconditionally. After a fast
+  reconnect that flag belongs to the *new* session -- a stale thread, still
+  unwinding on the *old*, closed socket, killed the new session's flag out
+  from under it, and its broadcast loop exited before sending a single
+  state datagram. The new client then saw `libfranka: UDP receive: Timeout`
+  on a connection that never did anything wrong. `start_command_receiver`
+  now captures the socket once and passes it to `_handle_commands` as an
+  argument; every place that would act on `connection_running` first checks
+  that this thread's captured socket `is` still `self.udp_socket`.
+
+- **A `Move` no longer gets a second, unsolicited response.** The broadcast
+  loop used to send a bogus `kSuccess` reply for the current motion right
+  after its first UDP state datagram -- even though `handle_move_command`
+  had already answered the same `Move` with `kMotionStarted` over TCP.
+  libfranka never expected that second reply: it sat unread in the client's
+  response map keyed by command id, and when the motion later aborted,
+  `Robot::throwOnMotionError` found the stale `kSuccess` ahead of the real
+  terminal response and raised `ProtocolException("Unexpected reply to a
+  Move command")` instead of the intended `ControlException`. The extra
+  send is removed; the terminal response (`kSuccess` via `StopMove` or a
+  motion-finished datagram, or an abort status via the pack-stamped
+  `_pending_move_response` machinery) is still sent exactly once, as before.
+
+- **franka-sim no longer configures the root logger on import.** A
+  module-level `logging.basicConfig(level=logging.ERROR)` in
+  `franka_sim_server.py` ran as a side effect of importing the library
+  (pulled in transitively by `franka_sim/__init__`), installing a root
+  handler that won the first-`basicConfig()`-wins race and silently capped
+  every other logger -- including `run_server.main()`'s own, explicitly
+  guarded `basicConfig()` call -- at `ERROR`. `python -m franka_sim.run_server`
+  now shows its `INFO` startup lines (e.g. "Command handler thread started")
+  as intended; embedding applications are free to configure logging
+  themselves.
+
+- **`StopMove` no longer clobbers a latched `kReflex`.** Since `StopMove` stopped
+  ending the session (see above), the publish loop keeps streaming `RobotState`
+  after it -- but `handle_stop_move_command` unconditionally wrote `robot_mode`
+  back to `kIdle`, so an enforced abort's `errors` stayed latched while
+  `robot_mode` claimed the arm was fine for the whole recovery window. It now
+  takes the same guard `_finish_motion` already used: `robot_mode` is only
+  written to `kIdle` when it is not already `kReflex`, so a reflex survives a
+  `StopMove` exactly as it survives a motion finishing normally, until
+  `AutomaticErrorRecovery` clears it.
+
+- **A `Move` arriving before the first `RobotState` publish cycle no longer
+  false-aborts on its correct opening pose.** The motion-limit checker's
+  Cartesian seed (`_motion_limit_seed_state`) read `O_T_EE` out of
+  `self.robot_state.state`, which is still the identity the wire struct was
+  constructed with until the publish loop's first cycle has run. A `Move`
+  landing in that window got its real first pose judged against that identity
+  and aborted with `cartesian_position_motion_generator_start_pose_invalid`
+  (observed: `Violation` index 16, 0.57 m off). It now reads the physics
+  backend directly for `O_T_EE`, the same way `_publish_hold_setpoint` already
+  did for `q`; when the backend cannot answer either, the start-pose and
+  start-elbow checks are skipped for that motion instead of judging them
+  against a guess.
 
 ## [0.4.0] - 2026-08-20
 

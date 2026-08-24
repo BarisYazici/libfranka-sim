@@ -222,7 +222,8 @@ class WireClient:
         )
         header = MessageHeader(command=Command.kMove, command_id=2, size=12 + len(payload))
         self.tcp.sendall(header.to_bytes() + payload)
-        self.tcp.recv(16)
+        # Move gets exactly one immediate reply (kMotionStarted); the
+        # terminal one (kSuccess/abort) only arrives once the motion ends.
         self.tcp.recv(16)
 
     def read_state(self):

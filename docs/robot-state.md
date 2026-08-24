@@ -106,14 +106,15 @@ constant for the life of the connection.
 | --- | --- | --- |
 | `O_T_EE` | **physics** | Measured flange (`link7`) pose, converted to a column-major 4×4. Because all the frame offsets below are identity, this is the **flange** pose — *not* a hand or fingertip TCP pose, even with `--gripper-physics`. |
 | `O_T_EE` *(mobile-duo `base` role)* | **approximation** | Not physics-measured. Open-loop dead reckoning: `x, y, theta` Euler-integrated from the commanded body twist. No wheel contact or slip feeds back — the pose is exactly what you commanded, integrated. |
-| `O_T_EE_d` | **stub** | Permanent identity. |
-| `O_T_EE_c` | **stub** | Permanent identity. The commanded Cartesian pose *is* decoded off the wire and then dropped — not even echoed back. |
+| `O_T_EE_d` | **derived** *(idle)* / **echo** *(pose motion)* | Between motions, and during every motion whose generator is not the Cartesian pose one, this is the **measured** `O_T_EE` — the pose the internal controller is holding, republished every cycle. During a `kCartesianPosition` motion it is the commanded pose the generator is tracking, extrapolated through a lost cycle exactly as `q_d` is; it snaps back to the measured pose the moment the motion ends, however it ends. It used to be a permanent identity, and that was not harmless: a libfranka Cartesian-pose motion generator initialises and holds from this field, so an identity opened every pose motion metres away from the robot and tripped `cartesian_position_motion_generator_start_pose_invalid` on cycle 0. *(Arm roles only — the mobile-duo base bridge is unchanged.)* |
+| `O_T_EE_c` | **derived** *(idle)* / **echo** *(pose motion)* | The last pose the client commanded, or — idle, between motions, under a non-Cartesian generator — the measured `O_T_EE`, same as `O_T_EE_d`. libfranka reads this one too: it is the reference its command low-pass filter blends the next `O_T_EE_c` with (`ControlLoop<CartesianPose>::convertMotion`), so a stub here dragged every command the client sent towards whatever the sim invented. The commanded pose is also decoded, differentiated and [checked](#motion-limits-and-discontinuities) against the pose generator's limits — but it is never *applied*: the arm does not move. |
 | `F_T_EE`, `F_T_NE` | **stub** | Permanent identity. The flange↔EE offset is never modelled. |
 | `NE_T_EE`, `EE_T_K` | **echo** | Identity until set; `SetNEToEE` / `SetEEToK` values are reflected back in subsequent states, exactly as the real robot reports them — but the frames are not used in any kinematics. |
-| `O_dP_EE_d`, `O_dP_EE_c` | **echo** *(base role only)* | On the mobile-duo base's Cartesian-velocity path, both echo the commanded body twist. For arm roles and the single-arm sim they are permanent-zero stubs. |
+| `O_dP_EE_d`, `O_dP_EE_c` | **echo** *(base role only)* | On the mobile-duo base's Cartesian-velocity path, both echo the commanded body twist. For arm roles and the single-arm sim they are permanent-zero stubs. Same caveat as `delbow_c` below: a `kCartesianPosition` client running libfranka's own `limit_rate = true` feeds its rate limiter from `O_dP_EE_c`/`O_ddP_EE_c` (`limitRate<CartesianPose>`, `src/rate_limiting.cpp`), and on an arm role both are permanent zero here — so client-side rate limiting on the *pose* interface is judging against a signal the sim never actually populates, and can misbehave silently. |
 | `O_ddP_EE_c`, `O_ddP_O` | **stub** | Permanent zero. |
-| `elbow`, `elbow_d` | **stub** | Permanent `[0.0, 0.0]`. The 7-DOF elbow redundancy angle is not modelled at all. |
-| `elbow_c`, `delbow_c`, `ddelbow_c` | **stub** | Permanent `[0.0, 0.0]`. Decoded off the wire, never stored. |
+| `elbow` | **derived** | `(q[2], sign(q[3]))` — the redundancy angle *is* joint 3 on an FR3 and the branch flag *is* the sign of joint 4, so this is a reading of `q` rather than a model. It was a permanent `[0.0, 0.0]` stub until the [elbow checks](#motion-limits-and-discontinuities) landed — and a zero branch flag is one libfranka refuses to send (`checkElbow` throws client-side unless it is exactly ±1), which made the elbow interface unreachable from a real client. *(Arm roles only; the mobile-duo base bridge has no elbow.)* |
+| `elbow_d`, `elbow_c` | **derived** *(idle)* / **echo** *(Cartesian motion)* | The same `(q[2], sign(q[3]))` reading whenever nothing commands an elbow — idle, between motions, under a joint generator, or under a Cartesian motion whose commands carry no elbow at all (`valid_elbow` clear). While either Cartesian generator *is* streaming one, both echo it, held through lost cycles and snapping back to the measured elbow when the motion ends. `elbow_c` is also decoded and checked on both Cartesian generators (start elbow, sign consistency, velocity/acceleration/jerk). *(Arm roles only.)* |
+| `delbow_c`, `ddelbow_c` | **stub** | Permanent `[0.0, 0.0]` — the elbow's commanded derivatives are never published. libfranka reads them only inside `limitRate`, i.e. only when a client opts into rate limiting. |
 
 ### Load and inertia
 
@@ -151,8 +152,8 @@ observer in the sim today.
 | `motion_generator_mode` | **faithful** | Set from the `Move` request's motion-generator mode, reset to `kIdle` on motion end or `StopMove`. Correct. |
 | `controller_mode` | **faithful** | Set from the `Move` request's controller mode, reset to `kOther` on motion end. Also gates which physics branch the UDP command loop takes. Correct. |
 | `robot_mode` | **approximation** | `kIdle`, `kMove` and — on a communication-constraints violation — `kReflex`. `kOther`, `kGuiding`, `kUserStopped` and `kAutomaticErrorRecovery` exist in the enum but the sim never produces them. |
-| `errors` (`current_errors`) | **approximation** | Twelve of the 41 booleans are real: `communication_constraints_violation` (25) plus the eleven [motion-limit errors](#motion-limits-and-discontinuities) — indices 11–16, 18–20, 32 and 34. Each is latched by the condition it names and cleared by `AutomaticErrorRecovery`. The rest — collision reflexes, power and Cartesian-position limits — are permanently `false`. |
-| `reflex_reason` (`last_motion_errors`) | **approximation** | The same twelve bits, latched as the record of what aborted the previous motion. Deliberately *not* cleared by `AutomaticErrorRecovery`, matching libfranka's "the errors that aborted the previous motion". |
+| `errors` (`current_errors`) | **approximation** | Eleven of the 41 booleans can really be latched: `communication_constraints_violation` (25), the safety controller's `joint_velocity_violation` (3), and the [motion-limit errors](#motion-limits-and-discontinuities) at indices 11–15, 18, 20, 32 and 34. Each is latched by the condition it names and cleared by `AutomaticErrorRecovery`. Indices 16 and 19 belong to a Cartesian *pose* generator this server does not serve, so nothing sets them; the rest — collision reflexes, power and Cartesian-position limits — are permanently `false`. |
+| `reflex_reason` (`last_motion_errors`) | **approximation** | The same bits, latched as the record of what aborted the previous motion. Deliberately *not* cleared by `AutomaticErrorRecovery`, matching libfranka's "the errors that aborted the previous motion". |
 | `control_command_success_rate` | **faithful** | The real thing: the fraction of the last 100 control cycles that were answered in time, recomputed every cycle. `0.0` when no control or motion-generator loop is running — which is what the robot reports then, not a stub. See [communication constraints](#communication-constraints) below. |
 
 ## TCP commands
@@ -161,8 +162,8 @@ observer in the sim today.
 | --- | --- | --- |
 | `Connect` (0) | **implemented** | Parses version and UDP port, always replies `kSuccess` with `library_version=10`. It does **not** check the client's requested version — a protocol-9 client gets past `Connect` and then fails on the state layout. |
 | `Move` (1) | **implemented** | Full support for joint position, joint velocity, torque (`kExternalController`) and — mobile-duo base only — Cartesian velocity. Validates the controller mode and rejects bad payloads with `kInvalidArgumentRejected`. Replies `kMotionStarted` immediately; the `kSuccess` follows from the state loop. |
-| `StopMove` (2) | **implemented** | Freezes the sim (arm holds current `q` at zero torque, base commands zero twist), sends a final idle-mode state frame, and unblocks any pending `Move`. |
-| `AutomaticErrorRecovery` (10) | **implemented** | Sets `robot_mode = kIdle` and replies `kSuccess`. A pure protocol-level unblock — it clears no errors (none are ever latched) and restores no physics state. This is what lets `franka_hardware` / franka_ros2 finish activation. |
+| `StopMove` (2) | **implemented** | Freezes the sim (arm holds current `q` at zero torque, base commands zero twist) and unblocks any pending `Move`. Ends the *motion*, not the session: the UDP `RobotState` stream keeps publishing (now reporting the idle hold) and the TCP connection stays open, so a client can send another `Move` on the same connection — matching the real FCI, which streams continuously from `Connect` to disconnect. |
+| `AutomaticErrorRecovery` (10) | **implemented** | Clears `errors` (but not `reflex_reason`, the record of what aborted the previous motion), re-arms the communication and motion-limit accounting, sets `robot_mode = kIdle`, and re-engages the idle hold. The reply is deferred until the arm is at (near) standstill or a 0.7 s cap elapses — see [Enabling the violation](#enabling-the-violation) below. This is what lets `franka_hardware` / franka_ros2 finish activation. |
 | `GetRobotModel` (11) | **implemented** | Returns the bundled FR3 URDF (or `--urdf`) as UTF-8 with a `kSuccess` byte, for the client to build its Pinocchio model from. |
 | `SetCollisionBehavior` (3) | **accepted, not enforced** | Parses and logs the thresholds, replies `kSuccess`. The values are never stored or used — consistent with the contact/collision fields being permanent zeros. |
 | `SetJointImpedance` (4) | **accepted, not enforced** | Parses `K_theta`, replies `kSuccess`. Never applied: the position-mode PD gains are fixed constants in the physics backends. |
@@ -182,7 +183,10 @@ observer in the sim today.
 
     `kCartesianPosition` is the one remaining trap: the enum accepts it, so `Move`
     returns `kMotionStarted`, but no physics branch handles it and the arm never
-    moves.
+    moves. It is no longer *silent*, though — the commanded pose and elbow stream
+    is validated against the pose generator's full set of hardware limits, and
+    under `--enforce-motion-limits` a bad one aborts with the error the robot
+    would give. See [what is checked](#what-is-checked-and-what-it-latches).
 
 ## Gripper fidelity
 
@@ -245,37 +249,93 @@ loss.
 
 A datagram that arrives but is *not* fresh is still applied — within a cycle a
 late command is the freshest intent there is — and it is still **checked in
-full**, over a single cycle, which is the strictest reading available. What it
-never becomes is a *sample* of your trajectory: it is not recorded, so the next
-command is still differenced against the last one that answered its own cycle.
+full**, over the same server-observed interval as any other command: the state
+it answers is one this server published, so how far it has travelled is not your
+claim to make. What it never becomes is a *sample* of your trajectory: it is not
+recorded, so the next command is still differenced against the last one that
+answered its own cycle.
 
 ### What the sim does with a lost cycle
 
 | Behaviour | Status | Detail |
 | --- | --- | --- |
 | `control_command_success_rate` | always on | Fraction of the last 100 cycles answered in time, recomputed every cycle. `0.0` between motions. While the window is still filling, the divisor is what it holds — so three answered cycles read `1.0`, not `0.03`. |
-| The last command is **held** | always on | Nothing new is dispatched. The position target stays where it was, a commanded velocity or twist stays applied, the torque is reused. |
-| `communication_constraints_violation` | **opt-in** | 20 consecutive lost cycles abort the motion. Off by default. |
+| The motion generator is **extrapolated** | always on | One substitute waypoint per missed cycle, at the acceleration frozen when the gap began. It is dispatched to physics and published back in `q_d`/`dq_d`/`ddq_d` (and `O_T_EE_c`/`O_T_EE_d` on a pose motion), so the arm keeps moving and the reference you read back keeps advancing. |
+| The last torque is **held** | always on | A torque is not a waypoint. "If a controller command packet is dropped, FCI will reuse the torques of the last successful received packet" — so `tau_J_d` simply stays applied. |
+| Extrapolation **stops at 20** | always on | Where the robot stops, the reference stops. Past the bound the last extrapolated value holds, so a client that has genuinely gone away leaves the arm standing still rather than flying off along the trajectory it was on. |
+| `communication_constraints_violation` | **opt-in** | 20 consecutive lost cycles abort the motion. Off by default; unenforced, the bound is logged instead. |
 
-Holding is the FCI's behaviour for a dropped *controller* packet — "if a
-controller command packet is dropped, FCI will reuse the torques of the last
-successful received packet" — applied to every signal.
+The extrapolation is what the robot does — "the robot takes the previous
+waypoints and performs a linear extrapolation (keep acceleration constant and
+integrate) for the missed time step" (`docs/system_requirements.rst`) — and it
+runs whether or not either strictness switch is on, because it is not a check.
+It is what the reference *is* while you are quiet. The switches still decide only
+whether a violation aborts.
 
-!!! warning "The sim does not extrapolate a missed motion-generator cycle"
+The law, per interface, freezes the highest derivative the last two **real**
+commands implied and integrates below it:
 
-    The real FCI does: "the robot takes the previous waypoints and performs a
-    linear extrapolation (keep acceleration constant and integrate) for the missed
-    time step" (`docs/system_requirements.rst`). franka-sim holds the last
-    waypoint instead. Through a gap your commanded target therefore *stops*
-    advancing here where on hardware it would keep moving, and the `q_d` you read
-    back says so.
+| Interface | Missed cycle |
+| --- | --- |
+| `q_c` | semi-implicit Euler, in this order: `v += a dt` first, then `q += v dt`; `a` frozen |
+| `dq_c` | `dq += a dt`, `a` frozen — no jerk term |
+| `O_T_EE_c` | translation per axis by the same semi-implicit law; rotation composed on the right by the axis-angle increment `(ω + α dt) dt` |
+| `O_dP_EE_c` | twist extended at frozen twist-acceleration |
+| `elbow_c` | `elbow[0]` on the 1-D position law; `elbow[1]` **held** — a branch flag has no derivative |
+| `tau_J_d` | held |
 
-    Emulating the extrapolation is a roadmap item. See
-    [the discontinuity trap it hides](#the-real-robot-trap-the-sim-cannot-show-you)
-    for why that matters beyond fidelity for its own sake.
+Frozen, not continued. The acceleration is read once, from the backward
+differences of the last two commands that actually arrived, and it does not get
+re-derived from the sim's own extrapolated samples: doing that compounds, and
+integrating *jerk* instead of freezing acceleration turns twenty milliseconds of
+silence into a runaway rather than an extrapolation.
 
-A held cycle still counts as lost for the success rate: holding the command is not
-the same as pretending the packet arrived.
+!!! warning "The extrapolation is checked, not exempt — and it is not clamped"
+
+    Each substitute waypoint goes through exactly the same limit checks a command
+    you sent would. An extrapolation that runs out past the velocity envelope or
+    a joint stop latches the same error, and that is deliberate: it is precisely
+    the mechanism behind libfranka's warning that intermittent drops "could
+    trigger `discontinuity` errors even when your source signals conform with the
+    interface specification". A sim that clamped it would be quietly kinder than
+    the robot in the one situation you most need it to be honest about. See
+    [the real-robot trap](#the-real-robot-trap-you-can-now-reproduce).
+
+An extrapolated cycle still counts as lost for the success rate: continuing the
+trajectory is not the same as pretending the packet arrived.
+
+!!! note "A datagram that turns up late replaces the guess it stood in for"
+
+    One deliberate departure from the robot, and it exists because of an earlier
+    one. The FCI *drops* a command that missed its 1 ms window; franka-sim
+    applies it, because a simulator is routinely driven by clients that are not
+    1 kHz control loops and dropping their datagrams would leave the arm inert.
+
+    Those two choices collide once missed cycles are extrapolated: the
+    extrapolation for cycle *N* already took one cycle's worth of motion, and
+    the datagram that turns up late for cycle *N* carries the same step —
+    measured rather than guessed. Differencing the two against each other would
+    report a reference that travelled nowhere and then a huge deceleration, on a
+    client that did nothing wrong. So when the real answer arrives, the
+    extrapolations it supersedes are thrown away and it is differenced against
+    the last command that actually arrived, over the interval it really
+    travelled.
+
+    Only for a datagram *inside* the extrapolated run. A replay, a duplicate or
+    a reordered packet echoes an id the history is already built on, gets no
+    rewind, and never touches the history — and a **fresh** command, the client
+    resuming after a real pause, is judged against the extrapolated reference
+    unrewound. That last one is what makes the trap below fire.
+
+    This rewind only helps a backlog that drains in the order it was sent. Over
+    loopback that is the only order it can arrive in, but on a real network a
+    stalled receive thread can hand over the same backlog out of order — the
+    datagrams that are not the run's oldest still-unanswered id get no rewind
+    and are differenced against the reference as it stands, which can draw a
+    spurious `discontinuity` report (and, with enforcement on, an abort) partway
+    through an otherwise-conforming drain.
+
+
 
 ### Enabling the violation
 
@@ -315,6 +375,28 @@ same time. `AutomaticErrorRecovery` clears `errors`, returns `robot_mode` to
 `kIdle` and re-arms the accounting; a new `Move` then runs normally, and a second
 violation in the same connection aborts exactly like the first.
 
+**The `AutomaticErrorRecovery` reply is deferred until the arm is at (near)
+standstill**, matching the real robot: recovery from a fast abort inherently
+completes with the arm stopped, because the internal controller has already
+been decelerating it since the abort latched. The sim used to reply the
+instant the request arrived, so a client recovering from a high-speed abort
+(observed here at ~2.6 rad/s) could start its next motion while the arm was
+still decelerating under the idle hold, and its own start-pose guard would
+then see measured `q` drifting off the commanded `q` it had just sent and
+throw a spurious client-side error a few milliseconds later. The handler now
+polls the physics backend directly — not the cached `RobotState`, which only
+ever reflects whatever the 1 kHz publish loop last copied into it — until
+measured `dq` has stayed below 0.005 rad/s for 50 consecutive 1 ms cycles,
+capped at **0.7 s**. That cap is
+not 3 s: libfranka's own TCP receive timeout on the response
+(`libfranka/src/network.h`, `tcp_timeout` defaults to
+`std::chrono::seconds(1)`) is a hard 1 s, and a wait that runs past it does
+not degrade gracefully — the client's `Poco::TimeoutException` surfaces as
+"libfranka: TCP connection got interrupted" and the connection is gone. 0.7 s
+leaves headroom under that ceiling; if the arm has not settled by then the
+handler replies success anyway and logs a warning, rather than ever risking
+the 1 s wire deadline.
+
 The base bridge of the [mobile duo](mobile-duo.md) is held to the same contract —
 a body twist is a motion command — and its stop is a zero twist, not a joint hold.
 
@@ -350,29 +432,170 @@ The previous values are the ones the sim *applied*, and they are also the `q_d` 
 `dq_d` / `ddq_d` it reports back, so you can compute every one of these numbers
 before you send the command.
 
-`dt` is one cycle for a conforming 1 kHz client. Two of your datagrams landing in
-one poll is the sim's own artefact — the receive loop keeps only the newest — so
-the interval is taken from the echoed `message_id` instead of assumed, capped at
-three cycles. The cap matters because the id is *your* number: without it, echoing
-an id a thousand cycles old would divide every commanded derivative by a thousand
-and walk 50 rad/s steps straight past the checks.
+`dt` is one cycle for a conforming 1 kHz client. When a cycle goes unanswered, or
+the receive path gets to a datagram late, the next command the history records
+sits further back than a millisecond, so the interval is **the server's own
+count** — how many states it has published since the command the history sits at
+— instead of an assumed millisecond. Your echoed `message_id` is honoured only up
+to that count: it is *your* number, and without the bound, echoing an id a
+thousand cycles old would divide every commanded derivative by a thousand and
+walk 50 rad/s steps straight past the checks.
 
 ### What is checked, and what it latches
 
+Rows are in **precedence order within each generator**: the first row whose
+condition trips is the error you get. Only the signal belonging to the motion's
+*active* generator is examined — a joint-position motion is judged on `q_c` and
+nothing else, and a `kCartesianPosition` motion is judged on `O_T_EE_c` and
+`elbow_c` and nothing else. That last one is **checked but inert**: the pose
+generator has no physics branch behind it, so the commanded stream is judged in
+full while the arm stays exactly where it is.
+
+The safety controller (`joint_velocity_violation`, 3) is **not in this table**,
+because it is not in this precedence chain. It judges *measured* `dq`, on the
+state-publish thread, once per cycle, in every control mode including pure
+torque — it never preempts any row below and no row below preempts it. The one
+place the two meet is that a commanded velocity-envelope violation (13) latches
+3 alongside itself; see [below](#joint_velocity_violation-3-the-safety-controller).
+
 | Generator | Check | Limit | Error latched (index) |
 | --- | --- | --- | --- |
-| joint position | first `q_c` matches the robot's `q_d` | 0.1 rad (sim choice, see below) | `joint_position_motion_generator_start_pose_invalid` (11) |
 | joint position | `q_c` inside the joint range | FR3 URDF `<limit lower= upper=>` | `joint_motion_generator_position_limits_violation` (12) |
-| joint position / velocity | implied velocity | [position-based](#the-position-based-joint-velocity-limits): 2.62/5.26/4.18 rad/s away from the stops, shrinking to zero at them | `joint_motion_generator_velocity_limits_violation` (13) |
+| joint position | first `q_c` matches the robot's `q_d` | 0.1 rad (sim choice, see below) | `joint_position_motion_generator_start_pose_invalid` (11) |
+| joint position | implied acceleration | `kMaxJointAcceleration` = 10 − 1e−3 rad/s² | `joint_motion_generator_velocity_discontinuity` (14) |
+| joint position | implied velocity | [position-based](#the-position-based-joint-velocity-limits): 2.62/5.26/4.18 rad/s away from the stops, shrinking to zero at them | `joint_motion_generator_velocity_limits_violation` (13) |
+| joint position | implied jerk | `kMaxJointJerk` = 5000 − 1e−3 rad/s³ | `joint_motion_generator_acceleration_discontinuity` (15) |
+| joint velocity | first `dq_c` continues from the robot's `dq_d` | 0.1 rad/s (sim choice) | `joint_motion_generator_acceleration_discontinuity` (15) |
+| joint velocity | implied acceleration | `kMaxJointAcceleration` | `joint_motion_generator_acceleration_discontinuity` (15) |
+| joint velocity | implied jerk | `kMaxJointJerk` | `joint_motion_generator_acceleration_discontinuity` (15) |
+| joint velocity | commanded `dq_c` in the envelope | as above | `joint_motion_generator_velocity_limits_violation` (13) |
 | joint velocity | *no* joint-range check | a rate says nothing about where it lands without integrating it — but the velocity limit above shrinks to zero at the stop, so commanding into a limit is caught as a velocity violation, which is what the robot reports too | — |
-| joint position / velocity | implied acceleration | `kMaxJointAcceleration` = 10 − 1e−3 rad/s² | `joint_motion_generator_velocity_discontinuity` (14) |
-| joint position / velocity | implied jerk | `kMaxJointJerk` = 5000 − 1e−3 rad/s³ | `joint_motion_generator_acceleration_discontinuity` (15) |
-| Cartesian velocity (the [mobile base](mobile-duo.md) twist) | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
-| Cartesian velocity | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_velocity_discontinuity` (19) |
+| Cartesian velocity (the [mobile base](mobile-duo.md) twist) | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_acceleration_discontinuity` (20) |
 | Cartesian velocity | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
+| Cartesian velocity | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
+| Cartesian pose (`kCartesianPosition`, **checked but inert**) | `O_T_EE_c` is a homogeneous transformation | `franka::isHomogeneousTransformation`: bottom row `[0,0,0,1]`, rows and columns of the rotation block unit-norm to 1e−5 | `cartesian_position_motion_generator_invalid_frame_flag` (31) — refused even with enforcement off |
+| Cartesian pose | first `O_T_EE_c` matches the robot's measured `O_T_EE` | 0.05 m / 0.1 rad (sim choices, see below) | `cartesian_position_motion_generator_start_pose_invalid` (16) |
+| Cartesian pose | first `elbow_c` matches the robot's `(q[2], sign(q[3]))` | 0.1 rad (sim choice) or a sign mismatch | `cartesian_motion_generator_start_elbow_invalid` (22) |
+| Cartesian pose / velocity | `elbow_c[1]` unchanged mid-motion | any flip of the ±1 branch flag | `cartesian_motion_generator_elbow_sign_inconsistent` (21) |
+| Cartesian pose | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_velocity_discontinuity` (19) |
+| Cartesian pose | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
+| Cartesian pose | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
+| Cartesian pose / velocity | elbow velocity, acceleration, jerk | `kMaxElbowVelocity` 1.5 − 1e−3 rad/s, `kMaxElbowAcceleration` 10 − 1e−3 rad/s², `kMaxElbowJerk` 5000 − 1e−3 rad/s³ | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | torque | \|τ\| | FR3 URDF `<limit effort=>`: 87/87/87/87/12/12/12 Nm | `tau_J_range_violation` (34) |
 | torque | \|dτ/dt\| | `kMaxTorqueRate` = 1000 − 1e−3 Nm/s | `controller_torque_discontinuity` (32) |
 | any | every commanded value is finite | NaN and ±∞ are refused | the limits violation of the generator they arrived in |
+
+The Cartesian rows above are **checked but inert**: neither Cartesian generator
+drives an arm in this sim, so the motion runs with the arm standing still and the
+only thing that happens is the validation. That is deliberate — Franka's own
+`arm_smoke_tests` suite for Cartesian errors needs the *abort*, not the motion,
+and an interface that silently swallowed its command stream left those tests
+waiting forever for an error that never came.
+
+One index in the enum is deliberately unreachable here:
+`start_elbow_sign_inconsistent` (24), which by its name is the start-time twin of
+21. Nothing pins it — the smoke suite's start-elbow test perturbs `elbow[0]` and
+leaves the sign alone, and libfranka refuses to *send* a branch flag that is not
+exactly ±1 — so both halves of the start-elbow check report 22 instead, the one
+index the suite does pin. See `START_ELBOW_SIGN_INCONSISTENT_INDEX`.
+
+**With enforcement off, an arm-role Cartesian motion is inert and never ends.**
+The violation is logged by name, but nothing aborts and nothing moves, so a smoke
+test waiting for an error waits forever. The abort is the deliverable here;
+`--enforce-motion-limits` is what turns it on.
+
+### Which discontinuity you get depends on the interface
+
+The enum has two discontinuity names per generator family, and which one a
+violation gets is **not** decided by the derivative that broke its limit. It is
+decided by the derivative *you command*: the robot names a discontinuity one
+step above the commanded channel.
+
+| You command | first difference | second difference |
+| --- | --- | --- |
+| `q_c` | velocity → **14** `joint_motion_generator_velocity_discontinuity` | acceleration → **15** `joint_motion_generator_acceleration_discontinuity` |
+| `dq_c` | acceleration → **15** | jerk → **15** |
+| `O_T_EE_c` | velocity → **19** `cartesian_motion_generator_velocity_discontinuity` | acceleration → **20** |
+| `O_dP_EE_c` | acceleration → **20** `cartesian_motion_generator_acceleration_discontinuity` | jerk → **20** |
+| `tau_J_d` | rate → **32** `controller_torque_discontinuity` | — |
+
+The second half of the rule is a precedence: **a discontinuity beats the
+velocity-envelope check.** A step is large enough to break the envelope, the
+acceleration limit and the jerk limit all at once, and the robot still returns
+exactly one name — the discontinuity. So a 1 rad step in `q_c` is 14, never 13; a
+50 rad/s step in `dq_c` is 15, never 13 or 14; a twist step is 20, never 18. The
+envelope error (13/18) is what you get for a signal that is *smoothly* too fast.
+
+Start-pose outranks every *discontinuity*: a bad **first** cycle of a
+joint-position motion is `joint_position_motion_generator_start_pose_invalid`
+(11) however large the jump, because you have not commanded a trajectory yet,
+you have commanded a place to begin. It does **not** outrank the joint-range
+check — `_check_position` tests `q_c` against the joint range (12) before it
+reaches the first-command branch at all, so an opening waypoint that is both
+out of range *and* away from `q_d` is reported as 12, not 11.
+
+That ordering (12 before 11) is a sim choice with **no hardware evidence behind
+it**. The smoke suite's `JointPositionMotionGeneratorStartPoseInvalid` offsets
+`q_d` by 0.2 rad on joint 1 (`smoke_errors.cpp:216`), which is comfortably
+inside the joint's range, so it exercises 11 alone and says nothing about which
+name a first waypoint breaking both should get. If hardware evidence ever turns
+up saying start-pose comes first, the fix is to reorder the code, not this
+paragraph.
+
+Ordering between `tau_J_range_violation` (34) and `controller_torque_discontinuity`
+(32) for a command that breaks both is the one precedence here that is **not**
+pinned to hardware evidence; the sim reports the range violation. See the comment
+on `MotionLimitChecker._check_torque`.
+
+### `joint_velocity_violation` (3): the safety controller
+
+`joint_velocity_violation` is a **different error** from
+`joint_motion_generator_velocity_limits_violation` (13), and the difference is
+what it looks at:
+
+* **13 is Control judging your command.** The velocity you asked for — implied by
+  `q_c`, or written directly as `dq_c` — is outside the envelope.
+* **3 is the robot watching itself.** The *measured* `dq` is outside the envelope,
+  whatever you commanded. It fires in every control mode, including
+  `startTorqueControl`, where there is no commanded velocity at all: a torque
+  that accelerates a joint past the envelope trips it.
+
+When 13 trips while a motion is running, **the sim latches 3 alongside it, in
+the same abort** — both bits set in `errors`/`reflex_reason`, so the
+`ControlException` your client sees names both errors. That pairing is not a
+verified hardware pin: it follows the dev comment sitting under a
+`TODO(qu_zh): Verify the change` on both
+`JointMotionGeneratorPositionLimitsViolationHardware` and
+`JointMotionGeneratorVelocityLimitsViolationHardware` in the hardware smoke
+suite (`smoke_test_errors.cpp:110-127`), which reads "Both error[s] can appear.
+However with the current RCU joint_velocity_violation appear[s] much
+earl[ier] as we shape the limit" and says itself that it is unverified — i.e.
+a developer's account, not a pinned hardware behaviour, that hardware does not
+pick one name over the other but raises both, with 3 the one a caller notices
+first because the limit-shaping controller reacts to the arm leaving the
+envelope before Control finishes objecting to the command that put it there.
+The sim latches both unconditionally so that either name a caller matches on
+is present.
+
+The **pure safety-controller path** is unaffected: a violation raised by
+`check_measured_velocity` alone (measured `dq` outside the envelope with no
+commanded-envelope check involved at all, e.g. `startTorqueControl`, where
+there is no commanded velocity to judge) still latches 3 by itself, with no
+13 to pair it with.
+
+The sim allows a 0.1 rad/s margin above the envelope before firing, because the
+measured signal comes out of a physics integrator and carries settling ring and
+contact spikes that the analytic envelope does not. That is ~4 % of the tightest
+envelope value the FR3 has in free space, far below the excursions that matter
+and far above the jitter a conforming motion produces. The margin is not applied
+when the only question is *which name* an already-certain violation gets.
+
+Like every other check here, this one always logs and only aborts under
+`--enforce-motion-limits`; the abort is identical to the others — the bit in
+`errors`/`reflex_reason`, `kReflex`, and the pending `Move` answered
+`kReflexAborted`. It is skipped on a mobile-*base* server, whose steering and
+drive joints are not FR3 joints; the duo's arms are ordinary arm servers and do
+get it.
 
 **Non-finite commands are refused whether or not enforcement is on.** Every
 `value > limit` comparison against a NaN is false, so a NaN passes each check
@@ -384,10 +607,11 @@ can only arrive from a client that is not libfranka. There is no `Error`
 enumerator for it, so it is reported as the limits violation of its generator.
 
 The Cartesian limits are compared as *norms* of the translational and rotational
-halves, because that is how `limitRate` treats `O_dP_EE_c`. Note the names: a
-`velocity_discontinuity` is an **acceleration** limit and an
-`acceleration_discontinuity` is a **jerk** limit — libfranka's own naming, kept as
-is so a message can be grepped against the real robot's vocabulary.
+halves, because that is how `limitRate` treats `O_dP_EE_c`. Note the names: on a
+*position* interface a `velocity_discontinuity` is an **acceleration** limit and
+an `acceleration_discontinuity` is a **jerk** limit — libfranka's own naming,
+kept as is so a message can be grepped against the real robot's vocabulary. On a
+*velocity* interface everything shifts by one; see the table above.
 
 ### The position-based joint velocity limits
 
@@ -474,26 +698,63 @@ runs normally.
   that your control loop starts with the last commanded value observed in the
   robot state"). 0.1 rad is loose enough that the simulator's own tracking error
   can never manufacture the error and tight enough to catch a client that jumps
-  into a motion from a stale pose.
-* **The interval a command is differenced over comes from its echoed
-  `message_id`**, not from an assumed millisecond — capped at three cycles. A
-  one-to-three cycle gap, which is what the sim's own loss looks like, is
-  therefore measured at the rate you actually commanded and passes.
+  into a motion from a stale pose. Both revisions of Franka's smoke suite pin the
+  same counter-example and pin it identically — `moveJointPositionMotionGenerator`
+  `StartPoseInvalid` opens with `std::array<double, 7> discontinuity{{0.2}}`, i.e.
+  **+0.2 rad on joint 1**, in the old `libfranka/test/smoke` tree and in the
+  current `arm_smoke_tests` alike — and libfranka does not attenuate it: the
+  command low-pass takes its reference from the command itself on the first cycle
+  (`initialized_filter_` is false, `ControlLoop<JointPositions>::convertMotion`),
+  so the sim sees the full 0.2 rad. 0.1 rad therefore catches both suites with
+  2× margin, and nothing in either suite constrains it from below.
+
+    The Cartesian start checks follow that precedent rather than inventing one:
+    **0.05 m and 0.1 rad** for the first `O_T_EE_c` against the measured
+    `O_T_EE`, and **0.1 rad** for the first `elbow_c` against `q[2]` — the
+    rotation and elbow numbers are the joint-space 0.1 rad reused, since both are
+    angles, and 0.05 m is its translational counterpart. Nothing pinned is
+    sensitive to the choice: Franka's own smoke tests offset by 10 m and 0.5 rad,
+    three orders of magnitude and five times clear of them. All three are
+    constructor arguments on `MotionLimitChecker` if your client needs a
+    different contract.
+
+    One more Cartesian departure, in the other direction: libfranka scales its
+    *own* rotational limits by `kFactorCartesianRotationPoseInterface` (0.99)
+    when it rate-limits a `CartesianPose` client-side. The sim does **not** apply
+    that 1% on the server side — nothing published says Control's own bound is
+    0.99× rather than the plain `kMaxRotational*`, and shrinking it here would
+    refuse a rotation libfranka itself considers legal at the boundary.
+* **The interval a command is differenced over is the server's own observation**
+  of how many states it published since the applied command, not an assumed
+  millisecond and not your echo (which bounds it from above, never widens it). A
+  command that reaches the sim late is therefore measured over the time it
+  really took, not over an assumed millisecond — so a stalled receive path costs
+  you nothing.
+
+    What a *gap* costs you is a separate question, and the answer is not "nothing":
+    the reference keeps moving through one under frozen acceleration, so it is
+    your own signal's **jerk** that decides whether you resume clean. A stream
+    whose acceleration is genuinely constant is extrapolated onto its own next
+    waypoints exactly, to the last bit, and resumes reporting exactly the
+    acceleration it was commanding — for gaps of 1 to 19 cycles, which is the
+    whole window before the robot stops anyway. A stream still ramping its
+    acceleration parts company with the frozen one at a rate set by its jerk, and
+    a long enough gap will trip a discontinuity. That is the hardware behaviour,
+    and the trap below is what it looks like.
 
     There is no grace cycle, and there was: the first command after a gap used to
     skip the differential checks entirely, which let the resume waypoint be
     anywhere in the joint range. A full-range teleport reached physics with the
     checker reporting no violation at all.
 
-    The cap is why a *long* gap can still trip a discontinuity. That is the honest
-    consequence of holding rather than extrapolating — the robot would have
-    carried your trajectory forward and you would resume on a signal it was
-    already tracking, while here the history stays where the gap began.
+    A *long* gap no longer inflates anything either, because the history does not
+    stand still through one: every missed cycle is extrapolated and recorded, so
+    the interval back to the applied command is one millisecond again the moment
+    you resume — exactly as on hardware.
 
-### The real-robot trap the sim cannot show you
+### The real-robot trap you can now reproduce
 
-This one is worth knowing about even though — *because* — franka-sim does not
-reproduce it.
+This one is a well-worn way to lose an afternoon, and franka-sim reproduces it.
 
 On real hardware a missed cycle is extrapolated: Control continues the motion
 signal under constant acceleration for the cycles it did not hear from you. Its
@@ -504,20 +765,33 @@ large enough to trip `joint_motion_generator_velocity_discontinuity` or
 `joint_motion_generator_acceleration_discontinuity`.
 
 The trap is that this happens to *correct* clients. A trajectory that is smooth by
-construction can trip it. So can resuming on the value the robot itself
-extrapolated to. libfranka warns about the mechanism in one line — intermittent
-drops "could trigger `discontinuity` errors even when your source signals conform
-with the interface specification" (`docs/overview.rst`) — and it is a well-worn
-way to lose an afternoon hunting a bug that is not in your trajectory generator at
-all. If a controller runs clean against this sim and then trips discontinuity
-reflexes on hardware, packet loss is the first thing to look at, not your
-splines.
+construction can trip it. So can resuming on the value **you** last sent, which is
+the natural thing for a paused control loop to do: the robot's reference did not
+pause with you, so picking up where you left off commands a step backwards the
+size of the whole gap. libfranka warns about the mechanism in one line —
+intermittent drops "could trigger `discontinuity` errors even when your source
+signals conform with the interface specification" (`docs/overview.rst`).
 
-franka-sim **holds** the last command instead of extrapolating it, so it cannot
-put you in that state — a gap here freezes the target, and the grace cycle above
-covers the resume. Emulating the extrapolation is a roadmap item, and reproducing
-this failure class in sim, where you can drop cycles on purpose and watch it
-happen, is much of the point of doing it.
+The sim used to **hold** the last command instead of extrapolating it, so it could
+not put you in that state — a gap here froze the target, the resume looked clean,
+and the one bug a sim2real user most needs to find was exactly the one this
+channel could not show them. It does now. Drop cycles on purpose, resume from your
+own last waypoint, and the sim latches the discontinuity hardware would:
+
+```text
+motion limit violated: joint_motion_generator_velocity_discontinuity:
+q_c joint 1 = -763.94 rad/s^2, limit 9.999 rad/s^2
+```
+
+Resume from the `q_d` in the robot state instead — the field libfranka documents
+as carrying `q_{c,k-1}` "even in case of packet losses", which during a gap is
+the value the sim extrapolated to — and the same resume differences clean over
+the standard millisecond. That is the whole remedy, and it is the same one that
+works on the robot.
+
+If a controller runs clean against this sim and then trips discontinuity reflexes
+on hardware, packet loss is still worth looking at before your splines — but the
+sim will now find it for you first if you ask it to.
 
 ## Roadmap: what is still an ideal channel
 
@@ -526,14 +800,12 @@ happen, is much of the point of doing it.
   `self_collision_avoidance_violation`, `power_limit_violation` and the Cartesian
   *position* limits, none of which the sim can detect because it models neither
   contact forces nor an inverse-kinematics stage.
-* **Cartesian pose and impedance control.** `kCartesianPosition` is not served at
-  all, so the pose motion generator's limits and its `cartesian_motion_generator_joint_*`
-  errors have nothing to check.
-* **Packet-loss extrapolation.** A missed cycle holds the last command here; the
-  robot continues the motion signal under constant acceleration. Emulating it is
-  what would let you reproduce
-  [the discontinuity trap](#the-real-robot-trap-the-sim-cannot-show-you) in sim,
-  on demand, instead of meeting it for the first time on hardware.
+* **Cartesian pose and impedance control.** `kCartesianPosition` is *checked* but
+  never applied: the commanded pose and elbow stream is judged against the pose
+  generator's full set of limits, but no inverse-kinematics stage turns it into
+  joint targets, so the arm does not move and the
+  `cartesian_motion_generator_joint_*` errors — which are about the joint
+  trajectory the IK would have produced — still have nothing to check.
 
 The encouraging part: **the protocol machinery for all of this is public.** The
 limits, the error enum and the rate-limiting formulas all live in libfranka's own

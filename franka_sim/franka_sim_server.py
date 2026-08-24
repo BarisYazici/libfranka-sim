@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from franka_sim.comm_constraints import (
     COMMUNICATION_CONSTRAINTS_VIOLATION_INDEX,
@@ -48,8 +48,11 @@ from franka_sim.motion_limits import (
 )
 from franka_sim.robot_state import RobotState
 
-# Configure detailed logging for debugging
-logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
+# A library module must not configure the root logger -- that's the
+# embedding application's call (see run_server.main()'s guarded
+# basicConfig). A module-level basicConfig() here installs a root handler
+# on import, which "wins" the first-call race and silently caps every
+# other logger (including run_server's own) at the level given here.
 logger = logging.getLogger(__name__)
 
 
@@ -73,7 +76,94 @@ logger = logging.getLogger(__name__)
 #: there is, and filtering it out simply froze ``q_d`` at the first frame and
 #: pinned ``dq_d``/``ddq_d`` to zero on the bridge the teleop reads. See
 #: :attr:`FrankaSimServer._server_owned_state_fields`.
-COMMANDED_STATE_FIELDS = ("q_d", "dq_d", "ddq_d", "tau_J_d")
+#:
+#: ``O_T_EE_d``/``O_T_EE_c`` and ``elbow_d``/``elbow_c`` joined this set once
+#: the Cartesian pose/elbow interfaces became FCI-owned fields in their own
+#: right (see :meth:`FrankaSimServer._publish_commanded_pose` and
+#: :meth:`FrankaSimServer._publish_elbow`), for the identical reason the joint
+#: fields are here: none of the physics backends' ``get_robot_state()``
+#: snapshots actually carry these keys today, so listing them changes nothing
+#: yet, but it keeps this set an honest statement of FCI ownership rather than
+#: one that happens to be accidentally correct only because no backend has
+#: caught up.
+COMMANDED_STATE_FIELDS = (
+    "q_d",
+    "dq_d",
+    "ddq_d",
+    "tau_J_d",
+    "O_T_EE_d",
+    "O_T_EE_c",
+    "elbow_d",
+    "elbow_c",
+)
+
+#: How long :meth:`FrankaSimServer.stop` waits for the gripper server's accept
+#: loop to notice its socket was closed. The wait is normally microseconds --
+#: closing the listening socket drops accept() out immediately -- so this only
+#: bounds the case of a gripper command stuck inside a backend call. Short,
+#: because the thread is a daemon and abandoning it costs nothing.
+GRIPPER_JOIN_TIMEOUT_S = 1.0
+
+#: How close to zero |measured dq| must be, per joint, for
+#: ``FrankaSimServer._wait_for_standstill`` to count a cycle as settled.
+#: The real robot's own ``AutomaticErrorRecovery`` inherently completes with
+#: the arm at rest -- recovery on hardware clears the reflex and hands the
+#: joints back to a holding controller only once the safety layer has stopped
+#: reacting to the abort, and by then the arm has stopped. The sim's own
+#: reflex handler used to reply the instant the TCP request arrived, so a
+#: client that Move'd again straight away started its next motion while the
+#: arm was still decelerating from whatever speed the abort caught it at
+#: (observed here at ~2.6 rad/s); the new motion's client-side start-pose
+#: guard then saw measured q drifting away from the commanded q it had just
+#: sent and threw "Performance threshold reached" a few milliseconds in. This
+#: is a sim choice -- libfranka publishes no settling tolerance of its own --
+#: sized well inside :data:`franka_sim.motion_limits.MEASURED_JOINT_VELOCITY_MARGIN`
+#: (0.1 rad/s) so the wait cannot itself look like "still moving" once the
+#: idle hold has actually caught the arm.
+AUTOMATIC_ERROR_RECOVERY_SETTLE_VELOCITY = 0.005  # rad/s
+
+#: Consecutive settled polls required before the wait is satisfied, at
+#: :data:`AUTOMATIC_ERROR_RECOVERY_POLL_PERIOD` apiece -- 50 x 1 ms = 50 ms.
+#: "Sustained" rather than "one clean sample" so a single lucky reading
+#: between two ring oscillations of a not-yet-caught arm cannot end the wait
+#: early.
+AUTOMATIC_ERROR_RECOVERY_SETTLE_CYCLES = 50
+
+#: How often ``_wait_for_standstill`` re-reads the latest published ``dq``
+#: while waiting. Short on purpose: this runs on the per-connection TCP
+#: thread, not the state-publish loop, so a short poll costs that thread
+#: nothing else is waiting on, and it is what lets the wait notice
+#: :attr:`FrankaSimServer.running` going false promptly during shutdown
+#: instead of sleeping through it.
+AUTOMATIC_ERROR_RECOVERY_POLL_PERIOD = 0.001  # s
+
+#: Hard ceiling on the wait -- capped well under libfranka's own TCP receive
+#: timeout, not the "3 s" figure this constant started at.
+#:
+#: **Not the sim's choice to make generous.** libfranka's ``Network``
+#: defaults ``tcp_timeout`` to ``std::chrono::seconds(1)``
+#: (``libfranka/src/network.h``: ``Network(..., std::chrono::milliseconds
+#: tcp_timeout = std::chrono::seconds(1), ...)``), and that is the client's
+#: own receive timeout on *every* TCP command response, ``AutomaticErrorRecovery``
+#: included -- there is no per-command override for it. A 3 s wait was tried
+#: against the real gtest smoke suite and reproduced exactly this: the reply
+#: arrived correctly, but ~1.000 s after the request the client had already
+#: decided the connection was dead (Poco's ``TimeoutException`` surfaces to
+#: the caller as "libfranka: TCP connection got interrupted" /
+#: "libfranka: UDP receive: Timeout"), and every later test on that connection
+#: then failed too as the client kept retrying against a server still mid-wait
+#: from the *previous* abort. Going over 1 s here is not "slower, but still
+#: correct" -- it silently breaks the wire protocol.
+#:
+#: 0.7 s leaves ~300 ms of margin under that 1 s ceiling for scheduling
+#: jitter and the response's own transmission, while still being comfortably
+#: above the 50 ms the settle-cycle count needs for a motion that is actually
+#: decelerating under the idle hold. On a run where the arm has not settled
+#: by then, the timeout path below fires and replies success anyway -- a
+#: partial wait that reduces the residual velocity the next motion starts
+#: against, which is strictly better than the pre-fix instant reply, even
+#: when it cannot certify full standstill within budget.
+AUTOMATIC_ERROR_RECOVERY_TIMEOUT = 0.7  # s
 
 #: Single-arm physics backends, mapped to the module and class implementing the
 #: simulator contract this server consumes. Imported lazily in
@@ -88,6 +178,14 @@ SINGLE_ARM_PHYSICS = {
 #: Backend used when the caller does not inject a simulator or name one. MuJoCo
 #: holds real time at the 1 ms step the FCI serves; Genesis needs 2.5 ms.
 DEFAULT_PHYSICS = "mujoco"
+
+#: Closest two consecutive ``RobotState`` datagrams may be published, as a
+#: fraction of the 1 ms cycle. The FCI publishes one state per cycle and expects
+#: one answer per state; two states microseconds apart give the client no cycle
+#: to answer the first in, and the second then carries a ``q_d`` that predates
+#: that answer -- which libfranka's own low-pass filter closes around. See the
+#: pacing arithmetic in ``FrankaSimServer.start_state_transmission``.
+_MIN_STATE_SPACING = 0.8
 
 
 def resolve_sim_class(physics: str = DEFAULT_PHYSICS):
@@ -194,6 +292,11 @@ class FrankaSimServer:
         # once-per-session _engage_idle_hold(). Mirrors
         # SwerveBase._twist_rejected.
         self._mobile_hold_logged = False
+        # Latch so the "no O_T_EE available to seed a motion" warning in
+        # _motion_limit_seed_state fires once per connection, not once per
+        # Move -- a client that never lets the publish loop get ahead of it
+        # would otherwise log every single motion start.
+        self._seed_pose_fallback_logged = False
 
         # Idle hold (see _engage_idle_hold): True once this session's control
         # has ended and the simulator has been recaptured, cleared by the next
@@ -233,22 +336,60 @@ class FrankaSimServer:
         #: ``kReflexAborted`` can wait for a state that was packed *after* the
         #: error, not merely sent after it. Written only by the publish thread.
         self._states_packed = 0
+        #: State datagrams this connection's publish loop has actually put on
+        #: the wire. Rises monotonically within a connection and is zeroed by
+        #: :meth:`reset_state` when the next one starts. Written only by the
+        #: publish thread, and an ``int`` rebind is atomic under the GIL, so
+        #: readers need no lock. It exists so a caller can wait on the *event*
+        #: "this session is broadcasting" instead of inferring it from a side
+        #: effect: :attr:`udp_socket` is never explicitly bound (see
+        #: :meth:`start_robot_state_transmission`), so its ``getsockname()``
+        #: port stays 0 until the first ``sendto`` implicitly binds it, and that
+        #: is what waiters used to key off.
+        self.states_sent = 0
         #: ``message_id`` that was current when the running motion's ``Move``
         #: was accepted, and whether any control command of it has arrived yet.
         #: Together they identify a ``*_finished`` datagram left over from the
         #: previous motion; see :meth:`_finish_motion`.
         self._motion_epoch_id = 0
         self._motion_has_commands = False
+        #: Whether this motion has actually echoed a client-commanded pose /
+        #: elbow into ``O_T_EE_d``/``O_T_EE_c`` and ``elbow_d``/``elbow_c``.
+        #: Until the first such command the commanded Cartesian fields keep
+        #: tracking the measured pose, which is the internal controller's hold;
+        #: see :meth:`_publish_commanded_pose`. Cleared by every ``Move`` and by
+        #: :meth:`reset_state`, and made inert the moment the motion generator
+        #: leaves the Cartesian modes (:meth:`_echoing_commanded_pose`), so a
+        #: session that ends any way at all snaps back to the measured pose.
+        self._commanded_pose_echoed = False
+        self._commanded_elbow_echoed = False
+
+        # Shutdown bookkeeping. stop() can be reached from several directions
+        # at once -- the KeyboardInterrupt handler, a second Ctrl+C landing
+        # inside the first one's teardown, an embedding application's own exit
+        # hook -- and the accept loop's finally clause calls cleanup()
+        # concurrently once its listening socket goes away. Both must therefore
+        # be idempotent, and both key off these: the first caller does the work
+        # and logs it, later ones return early (stop) or stay quiet (cleanup).
+        self._stop_lock = threading.Lock()
+        self._stopping = False
+        self._cleanup_logged = False
 
         # Communication-constraints emulation (see franka_sim.comm_constraints).
-        # One tracker per connection, rebuilt by reset_state(). A missed cycle
-        # holds the last applied command; nothing is extrapolated.
+        # One tracker per connection, rebuilt by reset_state(). A missed
+        # motion-generator cycle is extrapolated (see
+        # _extrapolate_missed_cycle); a missed torque cycle holds, as on
+        # hardware.
         self.enforce_comm_constraints = (
             enforcement_enabled_by_env()
             if enforce_comm_constraints is None
             else enforce_comm_constraints
         )
         self.comm = CommConstraintTracker(enforce=self.enforce_comm_constraints)
+        #: Readiness poller for :meth:`_drain_gate`, rebuilt whenever the UDP
+        #: socket is replaced (a reconnect hands out a new fd).
+        self._drain_poller: Optional["select.poll"] = None
+        self._drain_poller_fd: int = -1
 
         # Motion-limit emulation (see franka_sim.motion_limits). One checker
         # per connection, rebuilt by reset_state(), differencing every received
@@ -321,8 +462,11 @@ class FrankaSimServer:
         self.current_motion_id = 0
         self._pending_move_response = None
         self._states_packed = 0
+        self.states_sent = 0
         self._motion_epoch_id = 0
         self._motion_has_commands = False
+        self._commanded_pose_echoed = False
+        self._commanded_elbow_echoed = False
         self.client_socket = None
         self.tcp_thread = None
         self.udp_socket = None
@@ -331,6 +475,7 @@ class FrankaSimServer:
         self.control_mode = ControlMode.NONE
         self.connection_running = False
         self._mobile_hold_logged = False
+        self._seed_pose_fallback_logged = False
         # The hold itself is *not* undone here -- the simulator keeps holding
         # the pose it was recaptured at until the next Move commands something
         # else. Only the once-per-session latch is rearmed.
@@ -450,36 +595,63 @@ class FrankaSimServer:
     def start_command_receiver(self):
         """Start UDP command receiver on specified port"""
         try:
-            self.command_thread = threading.Thread(target=self._handle_commands)
+            # Capture the socket *now*, at thread-start time, rather than
+            # letting the thread re-read self.udp_socket on every loop turn.
+            # self.udp_socket is per-server-instance, not per-thread: a fast
+            # reconnect swaps it out for a new session while this thread's
+            # own poll loop may still be unwinding on the old fd. Passing the
+            # socket in as an argument gives the thread a fixed identity to
+            # compare against, so it can tell "my socket is dead" apart from
+            # "a newer session's socket is dead" -- see _handle_commands.
+            sock = self.udp_socket
+            if sock is None:
+                logger.error("start_command_receiver called with no udp_socket set")
+                return
+            self.command_thread = threading.Thread(target=self._handle_commands, args=(sock,))
             self.command_thread.daemon = True
             self.command_thread.start()
 
         except Exception as e:
             logger.error(f"Error starting command receiver: {e}", exc_info=True)
 
-    def _handle_commands(self):
-        """Handle incoming UDP robot commands"""
+    def _handle_commands(self, udp_socket):
+        """Handle incoming UDP robot commands.
+
+        ``udp_socket`` is the specific socket this thread was started for
+        (see ``start_command_receiver``), captured once and never re-read
+        from ``self.udp_socket``. That distinction matters on a fast
+        reconnect: ``self.connection_running`` is a single flag on the
+        server instance, shared by whichever session is current, not scoped
+        to this thread. If a stale thread -- still polling the *old*,
+        closed socket -- cleared ``connection_running`` unconditionally on
+        hangup, it would kill the flag out from under the *new* session
+        that has since replaced it, and that new session's broadcast loop
+        would exit before sending a single state datagram. The client would
+        then see "libfranka: UDP receive: Timeout" on a session that never
+        did anything wrong. So every place below that would act on
+        ``connection_running`` first checks ``udp_socket is self.udp_socket``
+        -- i.e. that this thread is still the live session's thread.
+        """
         logger.info("Command handler thread started")
 
         try:
             logger.info("Starting UDP command polling")
             # Setup poll object for UDP socket
             poller = select.poll()
-            logger.debug(f"Command socket file descriptor: {self.udp_socket.fileno()}")
-            poller.register(self.udp_socket.fileno(), select.POLLIN)
+            logger.debug(f"Command socket file descriptor: {udp_socket.fileno()}")
+            poller.register(udp_socket.fileno(), select.POLLIN)
             logger.debug(f"Poller: {poller}")
             timeout = 1  # 1ms timeout
 
             # RobotCommand packet size (matches the client's RobotCommand struct).
             expected_size = 8 + (7 * 8 + 7 * 8 + 16 * 8 + 6 * 8 + 2 * 8 + 1 + 1) + (7 * 8 + 1)
 
-            # Bound this thread to the current connection (connection_running),
-            # not the server lifetime, so stale command threads do not pile up
-            # across connections and race on self.udp_socket.
-            while self.running and self.connection_running:
-                udp_socket = self.udp_socket
-                if udp_socket is None:
-                    break
+            # Bound this thread to the current connection (connection_running)
+            # *and* to its own socket's identity (udp_socket is self.udp_socket):
+            # once a reconnect swaps self.udp_socket out, this loop must not
+            # keep spinning on the fd that belongs to a session that no longer
+            # exists -- see the identity-invariant note in the docstring above.
+            while self.running and self.connection_running and udp_socket is self.udp_socket:
                 events = poller.poll(timeout)
                 if not events:
                     continue
@@ -487,9 +659,14 @@ class FrankaSimServer:
                 command = None
                 for fd, event in events:
                     if not (event & select.POLLIN):
-                        # Socket hung up / errored -> the connection is gone.
-                        self.connection_running = False
-                        break
+                        # Socket hung up / errored -> the connection is gone
+                        # -- but only clear connection_running if this is
+                        # still the live session's socket. A stale thread's
+                        # own (now-closed) fd reporting POLLHUP/POLLNVAL says
+                        # nothing about whatever session replaced it.
+                        if udp_socket is self.udp_socket:
+                            self.connection_running = False
+                        return
 
                     try:
                         data, addr = udp_socket.recvfrom(expected_size)
@@ -581,18 +758,30 @@ class FrankaSimServer:
                     # refuse must not reach the simulator, and must not enter
                     # the history the next command is differenced against.
                     #
+                    # Rewind, check and record are **one** operation on the
+                    # checker, taken under a single hold of its lock. A datagram
+                    # that missed its cycle may still be the real answer to a
+                    # cycle the publish loop has already extrapolated; the robot
+                    # would have dropped it, this sim applies it, so the guess it
+                    # replaces has to be thrown away first or the two are
+                    # differenced against each other and report a deceleration
+                    # nobody commanded. Doing that in three separate calls left
+                    # two windows for the publish thread's own extrapolate() to
+                    # land in, and either one re-created the false abort the
+                    # rewind exists to prevent. See
+                    # MotionLimitChecker.absorb_command -- which also explains
+                    # why a *fresh* command is not rewound, and why a replay gets
+                    # no rewind: it is applied, because it is still the freshest
+                    # intent there is, but it is not a later sample of the
+                    # client's trajectory and never becomes the baseline the next
+                    # one is differenced against.
+                    #
                     # Nothing gets past this on its way to physics, whether or
                     # not it was fresh: an unchecked path here was a way to walk
                     # a 40 rad/s step into the simulator behind a stale echo.
-                    if not self._accept_within_motion_limits(command, fresh=fresh):
+                    if not self._absorb_within_motion_limits(command, fresh=fresh):
                         continue
 
-                    # A command that did not answer its own cycle is applied --
-                    # it is still the freshest intent there is -- but it is not
-                    # a later sample of the client's trajectory, so it never
-                    # becomes the baseline the next one is differenced against.
-                    if fresh:
-                        self.motion_limits.record(command)
                     self._dispatch_control_command(command)
 
         except Exception as e:
@@ -685,7 +874,7 @@ class FrankaSimServer:
                 )
                 self.current_motion_id = 0  # Reset motion ID after sending response
 
-    def _dispatch_control_command(self, command) -> None:
+    def _dispatch_control_command(self, command, *, motion_generation=None) -> None:
         """Route one UDP RobotCommand to the simulator, unless the hold is on.
 
         Split out of :meth:`_handle_commands` so the whole simulator-facing part
@@ -693,10 +882,34 @@ class FrankaSimServer:
         already in flight when the session ended must not be applied *after*
         :meth:`_engage_idle_hold` recaptured the arm, or the hold would be
         immediately overwritten by a dead session's last torque.
+
+        ``motion_generation`` is the motion this command was built for, for a
+        caller that built it a moment ago rather than receiving it: the
+        extrapolation path (:meth:`_extrapolate_missed_cycle`). The branches
+        below dispatch on ``motion_generator_mode``/``controller_mode``, which a
+        ``Move`` accepted in the meantime has already changed, so a substitute
+        built under the old motion's generator must not be applied under the new
+        one's. Checked here rather than at the call site because here is inside
+        the same ``_hold_lock`` the dispatch itself runs in, and the ``Move``
+        path takes that lock too. A received datagram passes None: it was
+        checked and recorded against whatever motion was running when it
+        arrived, and the pre-existing idle-hold gate is what covers it.
         """
         with self._hold_lock:
             if self._idle_hold:
                 return
+            if motion_generation is not None and motion_generation != self._motion_generation:
+                # The motion this substitute belongs to is over; a new one owns
+                # the generator fields now.
+                return
+
+            # The commanded *Cartesian* fields, before the generator branches
+            # below and outside them: a ``kCartesianPosition`` motion can run
+            # under either controller (``kJointImpedance`` or
+            # ``kExternalController``), so only the motion-generator mode says
+            # whether the client is streaming a pose at all -- and none of the
+            # branches below is reached for the kJointImpedance case.
+            self._echo_commanded_cartesian(command)
 
             # Update Genesis simulator based on control mode
             if (
@@ -705,6 +918,19 @@ class FrankaSimServer:
                 and self.robot_state.state["motion_generator_mode"]
                 == LibfrankaMotionGeneratorMode.kJointPosition
             ):
+                # Target first, mode second -- the same rule (and the same
+                # reason) as _switch_to_hold_position. The physics thread reads
+                # target and mode without a lock, so switching into POSITION
+                # before publishing this command's target lets a step land in
+                # between and servo towards the *previous* target at kp=4500.
+                # It also matters for the velocity feedforward: entering
+                # POSITION mode re-seeds its baseline from whatever target is
+                # current at that instant (see PositionFeedforward.reset), so
+                # doing it before the write seeds it from a dead session's last
+                # q_c and turns this command into one huge dq_c on the next
+                # step. Publishing first makes the baseline this very command,
+                # which is exactly the no-spike invariant the reset is for.
+                self.genesis_sim.update_joint_positions(command["q_c"])
                 if self.control_mode is not ControlMode.POSITION:
                     logger.info("Setting control mode to POSITION")
                     self.genesis_sim.set_control_mode(ControlMode.POSITION)
@@ -714,7 +940,6 @@ class FrankaSimServer:
                 # Update q_d with commanded positions
                 self.robot_state.state["q_d"] = list(command["q_c"])
                 self._publish_commanded_derivatives("dq_d", "ddq_d")
-                self.genesis_sim.update_joint_positions(command["q_c"])
                 self.genesis_sim.update_torques([0.0] * 7)
             elif (
                 self.robot_state.state["controller_mode"]
@@ -750,6 +975,96 @@ class FrankaSimServer:
                 # Update tau_J_d with commanded torques
                 self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
                 self.genesis_sim.update_torques(command["tau_J_d"])
+
+    def _echo_commanded_cartesian(self, command) -> None:
+        """Echo a Cartesian generator's commanded pose and elbow into the state.
+
+        The Cartesian half of what :meth:`_dispatch_control_command` already
+        does for ``q_d``/``dq_d``: ``O_T_EE_d`` and ``O_T_EE_c`` are the FCI
+        layer's fields, not the physics backend's, and on hardware they carry
+        the pose the motion generator is tracking. libfranka reads *both* --
+        ``O_T_EE_d`` is what a pose motion generator initialises and holds from,
+        and ``O_T_EE_c`` is the reference its command low-pass filter blends the
+        next command with (``src/control_loop.cpp``, ``ControlLoop<CartesianPose>
+        ::convertMotion``) -- so during a ``kCartesianPosition`` motion both
+        have to be the commanded stream or the client's own filter drags every
+        command towards whatever the sim published instead.
+
+        ``O_T_EE_c`` is the last pose the client commanded; ``O_T_EE_d`` is the
+        one the generator is tracking, which in this sim is the same value
+        because a commanded pose is applied instantly (well -- checked
+        instantly; nothing drives the arm from it, see ``docs/compatibility.md``).
+        A *lost* cycle reaches this method too: the publish loop extrapolates the
+        pose across it and dispatches the result down this same path
+        (:meth:`_extrapolate_missed_cycle`), so both fields keep advancing along
+        the commanded trajectory exactly as ``q_d`` does, which is what the robot
+        reports -- "the last received c values (after the low pass filter and the
+        extrapolation due to packet losses)" (``docs/overview.rst``).
+
+        The elbow rides along with either Cartesian generator
+        (``CartesianPose::hasElbow`` / ``CartesianVelocities::hasElbow``) and is
+        echoed only when the client actually sent one -- ``valid_elbow`` is its
+        own statement that it did, and ``elbow_c`` is zero-filled otherwise.
+
+        **Arm roles only.** The mobile base's Cartesian generator commands a
+        *twist*; its ``O_dP_EE_d``/``O_dP_EE_c`` echo and its dead-reckoned
+        ``O_T_EE`` are handled by :meth:`_handle_cartesian_velocity` and are
+        deliberately untouched here, the same role guard the rest of the
+        commanded-field ownership uses (:data:`COMMANDED_STATE_FIELDS`).
+        """
+        if self.mobile_base:
+            return
+        mode = self.robot_state.state["motion_generator_mode"]
+        if mode == LibfrankaMotionGeneratorMode.kCartesianPosition:
+            # Flag first, fields second: the publish loop reads
+            # _commanded_pose_echoed (via _echoing_commanded_pose) without a
+            # lock to decide whether to leave O_T_EE_d/c alone or overwrite
+            # them with the measured pose, so a publish cycle landing between
+            # the flag and the fields could still see "not echoing yet" and
+            # stamp the measured pose over this motion's very first commanded
+            # one -- the same ordering rule _dispatch_control_command already
+            # applies to target-then-mode.
+            self._commanded_pose_echoed = True
+            pose = list(command["O_T_EE_c"])
+            self.robot_state.state["O_T_EE_c"] = pose
+            self.robot_state.state["O_T_EE_d"] = pose
+        elif mode != LibfrankaMotionGeneratorMode.kCartesianVelocity:
+            return
+        if command.get("valid_elbow"):
+            self._commanded_elbow_echoed = True
+            elbow = list(command["elbow_c"])
+            self.robot_state.state["elbow_c"] = elbow
+            self.robot_state.state["elbow_d"] = elbow
+
+    def _echoing_commanded_pose(self) -> bool:
+        """Whether ``O_T_EE_d``/``O_T_EE_c`` currently belong to a client stream.
+
+        Two conditions, and the second is what makes the snap-back automatic: a
+        pose command must have been echoed *and* the motion generator must still
+        be ``kCartesianPosition``. Every way a motion ends -- a
+        ``motion_generation_finished`` datagram, a reflex abort, StopMove, a
+        client that simply disappears -- puts the mode back to ``kIdle``, so the
+        publish loop resumes reporting the measured pose without any teardown
+        path having to remember to say so.
+        """
+        return (
+            self._commanded_pose_echoed
+            and self.robot_state.state["motion_generator_mode"]
+            == LibfrankaMotionGeneratorMode.kCartesianPosition
+        )
+
+    def _echoing_commanded_elbow(self) -> bool:
+        """Whether ``elbow_d``/``elbow_c`` currently belong to a client stream.
+
+        :meth:`_echoing_commanded_pose`'s twin, widened by one mode: an elbow is
+        commandable on the Cartesian *velocity* generator too.
+        """
+        return self._commanded_elbow_echoed and self.robot_state.state[
+            "motion_generator_mode"
+        ] in (
+            LibfrankaMotionGeneratorMode.kCartesianPosition,
+            LibfrankaMotionGeneratorMode.kCartesianVelocity,
+        )
 
     def _publish_commanded_derivatives(self, *fields: str) -> None:
         """Report the derivatives the applied command implies, in order.
@@ -814,6 +1129,11 @@ class FrankaSimServer:
                 generation = self._motion_generation
                 self._motion_epoch_id = self.robot_state.state["message_id"]
                 self._motion_has_commands = False
+                # A new motion commands nothing yet: the commanded Cartesian
+                # fields go back to reporting the internal controller's hold
+                # until this motion's first pose/elbow command arrives.
+                self._commanded_pose_echoed = False
+                self._commanded_elbow_echoed = False
 
                 # Update robot state
                 self.robot_state.set_motion_generator_mode(
@@ -835,6 +1155,13 @@ class FrankaSimServer:
                 # A new motion is a new success-rate window.
                 self.comm.start_motion(generation)
 
+                # The generator this motion actually runs, as opposed to
+                # whatever mode the *previous* motion left in
+                # ``self.control_mode``. NONE means "a mode this server accepts
+                # but does not drive", which is what gates the limit checker
+                # below; see the comment there.
+                generator_mode = ControlMode.NONE
+
                 # Set appropriate control mode in Genesis simulator
                 if (
                     move_cmd.controller_mode == ControllerMode.kJointImpedance
@@ -842,14 +1169,14 @@ class FrankaSimServer:
                 ):
                     logger.info("Setting control mode to POSITION")
                     self.genesis_sim.set_control_mode(ControlMode.POSITION)
-                    self.control_mode = ControlMode.POSITION
+                    self.control_mode = generator_mode = ControlMode.POSITION
                 elif (
                     move_cmd.controller_mode == ControllerMode.kJointImpedance
                     and move_cmd.motion_generator_mode == MotionGeneratorMode.kJointVelocity
                 ):
                     logger.info("Setting control mode to VELOCITY")
                     self.genesis_sim.set_control_mode(ControlMode.VELOCITY)
-                    self.control_mode = ControlMode.VELOCITY
+                    self.control_mode = generator_mode = ControlMode.VELOCITY
                 elif (
                     self.mobile_base
                     and move_cmd.motion_generator_mode == MotionGeneratorMode.kCartesianVelocity
@@ -857,11 +1184,43 @@ class FrankaSimServer:
                 ):
                     logger.info("Setting control mode to STEERING_DRIVE")
                     self.genesis_sim.set_control_mode(ControlMode.STEERING_DRIVE)
-                    self.control_mode = ControlMode.STEERING_DRIVE
+                    self.control_mode = generator_mode = ControlMode.STEERING_DRIVE
                 elif move_cmd.controller_mode == ControllerMode.kExternalController:
                     logger.info("Setting control mode to TORQUE")
                     self.genesis_sim.set_control_mode(ControlMode.TORQUE)
-                    self.control_mode = ControlMode.TORQUE
+                    self.control_mode = generator_mode = ControlMode.TORQUE
+                elif move_cmd.motion_generator_mode == MotionGeneratorMode.kCartesianPosition:
+                    # Checked, never driven. There is no physics branch for a
+                    # commanded pose, so ``self.control_mode`` and the backend
+                    # are deliberately left alone -- the arm stays exactly where
+                    # it is for the whole motion. What changes is that the
+                    # client's ``O_T_EE_c``/``elbow_c`` stream is now
+                    # differentiated and judged, so a step in it aborts with the
+                    # hardware error instead of being silently dropped. See
+                    # :meth:`franka_sim.motion_limits.MotionLimitChecker._check_cartesian_pose`.
+                    logger.info(
+                        "Move accepted for kCartesianPosition: the commanded pose is "
+                        "validated but not applied -- the arm will not move"
+                    )
+                    generator_mode = ControlMode.CARTESIAN_POSE
+                elif move_cmd.motion_generator_mode == MotionGeneratorMode.kCartesianVelocity:
+                    # An *arm* role asked for the twist generator (the mobile
+                    # base's own kCartesianVelocity was matched further up and
+                    # really is driven). Same deal: checked, not applied.
+                    logger.info(
+                        "Move accepted for kCartesianVelocity on an arm role: the "
+                        "commanded twist is validated but not applied -- the arm will "
+                        "not move"
+                    )
+                    generator_mode = ControlMode.CARTESIAN_VELOCITY
+                else:
+                    logger.info(
+                        "Move accepted for %s / %s, which this server has no physics "
+                        "branch for: nothing will be dispatched and no motion-generator "
+                        "signal will be checked",
+                        move_cmd.motion_generator_mode.name,
+                        move_cmd.controller_mode.name,
+                    )
 
                 # Seed the limit checker from the state the client is judged
                 # against -- q_d / dq_d / ddq_d / tau_J_d are "always sent back to
@@ -869,8 +1228,21 @@ class FrankaSimServer:
                 # docs/overview.rst), so the client can predict every derivative the
                 # robot will compute. Last, because it needs the control mode the
                 # branches above just decided.
+                #
+                # ``generator_mode``, not ``self.control_mode``: the checker must
+                # judge only the signal *this* motion's generator owns. A
+                # ``kCartesianPosition`` Move does not touch ``self.control_mode``
+                # at all (it has no physics branch), so that field still holds
+                # the previous motion's mode -- and handing *that* to the checker
+                # made it read the zero-filled ``q_c`` of a Cartesian
+                # ``RobotCommand`` as a joint position command and abort live
+                # clients with
+                # ``joint_motion_generator_position_limits_violation``, because
+                # joint 4's range does not contain 0. The safety controller
+                # (measured velocity -> joint_velocity_violation) is armed
+                # regardless of mode; see MotionLimitChecker.start_motion.
                 self.motion_limits.start_motion(
-                    self.control_mode, self._publish_hold_setpoint(), generation
+                    generator_mode, self._motion_limit_seed_state(), generation
                 )
 
                 # First send motion started response
@@ -1115,6 +1487,163 @@ class FrankaSimServer:
         self.robot_state.state.update(setpoint)
         return setpoint
 
+    def _motion_limit_seed_state(self) -> Dict[str, Any]:
+        """The state snapshot a new motion's limit checker is seeded from.
+
+        :meth:`_publish_hold_setpoint` republishes and returns the *commanded*
+        fields -- ``q_d``, ``dq_d``, ``ddq_d``, ``tau_J_d`` -- which is what the
+        joint and torque generators are differenced against. The Cartesian pose
+        generator needs one more thing, and it is a *measured* value rather than
+        a commanded one: the flange pose ``O_T_EE`` the robot is actually in, so
+        the first ``O_T_EE_c`` of a ``kCartesianPosition`` motion can be judged
+        against it (``cartesian_position_motion_generator_start_pose_invalid``).
+
+        ``O_T_EE_d`` is what hardware would be judged against, and this sim now
+        publishes it faithfully (:meth:`_publish_commanded_pose`) -- but between
+        motions it *is* the measured pose, so the two agree and the measured one
+        is used directly. It is also the more honest of the two to seed from:
+        the question the check asks is "are you where the robot is", which is
+        what the smoke suite's 10 m offset breaks, and answering it from a
+        commanded field would let a stale command excuse a stale command.
+
+        Read out of the backend rather than ``self.robot_state.state`` for arm
+        roles, for the same reason :meth:`_publish_hold_setpoint` reads the
+        backend for ``q``: ``self.robot_state.state["O_T_EE"]`` is still the
+        identity the wire struct was constructed with until the publish loop's
+        first cycle has run, and a ``Move`` that arrives before then would have
+        its correct first pose judged against that identity and false-aborted
+        (observed repro: ``Violation`` index 16, 0.57 m from identity). The
+        mobile-base branch of ``_publish_hold_setpoint`` already returns the
+        whole state dict, ``O_T_EE`` included, so this only has to add it for
+        arm roles -- and it adds it to the *returned* snapshot only, leaving
+        what gets written back into ``robot_state.state`` exactly as it was.
+
+        When the backend cannot answer either, ``O_T_EE`` is left out of the
+        snapshot entirely rather than filled in from identity: ``start_motion``
+        already treats a missing ``O_T_EE`` as "skip the start-pose check", and
+        :meth:`~franka_sim.motion_limits.MotionLimitChecker._check_elbow_validity`
+        skips its start-elbow half the same way, so a motion armed from a
+        backend that has not produced a frame yet runs with those two start
+        checks off instead of judging them against a guess.
+        """
+        seed = self._publish_hold_setpoint()
+        if "O_T_EE" not in seed:
+            seed = dict(seed)
+            try:
+                backend_pose = self.genesis_sim.get_robot_state().get("O_T_EE")
+            except Exception:  # pragma: no cover - a backend that cannot answer
+                logger.exception("Could not read the simulator to seed O_T_EE")
+                backend_pose = None
+            if backend_pose is None:
+                if not self._seed_pose_fallback_logged:
+                    logger.warning(
+                        "No O_T_EE available from the simulator to seed a new "
+                        "motion's limit checker; skipping the start-pose/"
+                        "start-elbow checks for this motion instead of "
+                        "judging them against identity"
+                    )
+                    self._seed_pose_fallback_logged = True
+            else:
+                seed["O_T_EE"] = list(backend_pose)
+        return seed
+
+    #: Longest the publish loop will hold a state back waiting for the receive
+    #: path to catch up; see :meth:`_drain_gate`. Five cycles: long enough to
+    #: cover the millisecond-scale hiccups that actually happen (a GIL handover,
+    #: a descheduled thread under load -- 2 ms and up, measured), short enough
+    #: that a receive path which is genuinely gone -- a dying connection --
+    #: costs the loop a bounded slowdown rather than a hang.
+    _DRAIN_GATE_TIMEOUT = 0.005
+    #: How long each turn of the gate sleeps. Not a busy-wait: the point of the
+    #: sleep is to *release* this thread's hold on the CPU (and the GIL) so the
+    #: receive thread can run, which is usually all it was waiting for.
+    _DRAIN_GATE_YIELD = 0.00005
+
+    def _drain_gate(self) -> float:
+        """Hold the state back while a command the client already sent is queued.
+
+        The FCI is one loop: a cycle receives the client's answer, applies it,
+        and publishes the state that answer produced. This server splits that
+        across two threads -- the publish loop below and the UDP receive thread
+        in :meth:`_handle_commands` -- and nothing kept them in step. When the
+        receive thread was descheduled for a few milliseconds (CPU contention, a
+        GIL handover behind a 5 ms switch interval) the publish loop sailed on,
+        emitting states whose ``q_d``/``dq_d``/``ddq_d`` still described the last
+        command it had managed to apply, while the client's answers to those very
+        cycles sat unread in this process's own socket buffer.
+
+        That is not a cosmetic lag, because **libfranka's control loop is closed
+        around those fields**. ``ControlLoop<JointPositions>::convertMotion``
+        low-pass filters every waypoint toward ``robot_state.q_d`` with a fixed
+        1 ms gain (``src/control_loop.cpp``; the gain at the default 100 Hz
+        cutoff is 0.386) and, with rate limiting on, clamps it against
+        ``dq_d``/``ddq_d`` as well. Feed a conforming client the *same* stale
+        ``q_d`` for several cycles and its commanded stream stops being smooth:
+        each waypoint is dragged back toward the frozen reference, and when the
+        reference finally moves the filter spends several more cycles catching
+        up. The sim then differences that stream and reports the kink it
+        manufactured as ``joint_motion_generator_velocity_discontinuity``, at
+        hundreds of rad/s^2, against a client that did nothing wrong. That was an
+        intermittent abort in the middle of an ordinary approach motion, at a
+        ``control_command_success_rate`` of 0.97-0.99.
+
+        So the gate restores the invariant the communication accounting already
+        assumes -- "a simulator that stalls delays the state publish and the
+        client's answer alike" (:mod:`franka_sim.comm_constraints`) -- for a
+        stall that hits only one of the two threads. If a datagram is sitting in
+        the socket unread, this cycle's state is not ready to go out yet, so the
+        loop sleeps in short turns (which hands the CPU, and the GIL, to the
+        receive thread) until the socket is empty or
+        :data:`_DRAIN_GATE_TIMEOUT` is up.
+
+        Costs nothing in the ordinary case: the receive path answers a state in
+        ~70 us, so by the time the next one is due the socket has long been
+        drained and the first ``poll(0)`` returns empty.
+
+        Read-only on the socket. It never calls ``recvfrom`` -- the receive
+        thread stays the only consumer -- so polling the same fd from here is
+        safe.
+
+        Returns how long it waited, so the caller can push its 1 kHz deadline
+        out by the same amount. Without that the pacer treats the wait as lost
+        time and fires the next state immediately behind this one, which is the
+        opposite of the point: two states microseconds apart give the client no
+        cycle to answer the first in.
+        """
+        udp_socket = self.udp_socket
+        if udp_socket is None or udp_socket._closed:
+            return 0.0
+        try:
+            fd = udp_socket.fileno()
+        except OSError:
+            return 0.0
+        if fd < 0:
+            return 0.0
+        if self._drain_poller is None or self._drain_poller_fd != fd:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            self._drain_poller = poller
+            self._drain_poller_fd = fd
+        started = time.perf_counter()
+        deadline = started + self._DRAIN_GATE_TIMEOUT
+        while True:
+            try:
+                if not self._drain_poller.poll(0):
+                    return time.perf_counter() - started
+            except OSError:
+                # The socket went away under us (reconnect, shutdown). Nothing
+                # to wait for, and certainly nothing to hang on.
+                return time.perf_counter() - started
+            now = time.perf_counter()
+            if now >= deadline:
+                logger.debug(
+                    "State publish went ahead with a command still unread after "
+                    "%.1f ms; the receive path is behind",
+                    self._DRAIN_GATE_TIMEOUT * 1e3,
+                )
+                return now - started
+            time.sleep(self._DRAIN_GATE_YIELD)
+
     def _account_for_communication_cycle(self) -> None:
         """Run one cycle of the FCI communication-constraints emulation.
 
@@ -1123,19 +1652,35 @@ class FrankaSimServer:
 
         1. close the cycle that the previously published state opened,
         2. publish the rolling ``control_command_success_rate``,
-        3. tell the limit checker that a cycle went unanswered,
-        4. abort the motion once too many cycles are lost in a row.
+        3. tell the limit checker which state is going out, so its differencing
+           interval is the server's own observation and not the client's echo,
+        4. **extrapolate the motion generator across a cycle the client missed**,
+           dispatching the result to physics and publishing it back in the
+           commanded fields (:meth:`_extrapolate_missed_cycle`),
+        5. abort the motion once too many cycles are lost in a row.
 
-        What it deliberately does *not* do is command anything. The real FCI
-        extrapolates a missed motion-generator cycle under constant
-        acceleration; this sim holds the last applied command instead -- nothing
-        is dispatched, so the simulator keeps servoing to the last target it was
-        given, the last commanded velocity or twist stays applied and the last
-        torque is held. That is the FCI's own behaviour for a dropped
-        *controller* packet ("FCI will reuse the torques of the last successful
-        received packet", ``docs/system_requirements.rst``) applied to every
-        signal; the motion-generator extrapolation is a roadmap item, documented
-        as a known divergence in ``docs/robot-state.md``.
+        Step 4 is the one that commands something, and it is what the real FCI
+        does: Control "takes the previous waypoints and performs a linear
+        extrapolation (keep acceleration constant and integrate) for the missed
+        time step" (``docs/system_requirements.rst``), and the extrapolated
+        value is what comes back in ``q_d``/``dq_d``/``ddq_d``
+        (``docs/overview.rst``). A dropped *controller* packet is the exception
+        and is left alone: "FCI will reuse the torques of the last successful
+        received packet", which is what happens here by doing nothing at all.
+
+        Extrapolation runs whether or not either enforcement flag is set,
+        exactly as it does on hardware -- it is not a check, it is what the
+        robot's reference *is* while the client is quiet. The flags still decide
+        only whether a violation aborts.
+
+        The extrapolation stops at
+        :data:`~franka_sim.comm_constraints.MAX_CONSECUTIVE_LOST_CYCLES`
+        consecutive misses, which is where the robot stops the motion. Past that
+        the reference holds: a client that has genuinely gone away leaves the
+        arm standing still rather than flying off along the trajectory it was on
+        when it vanished. That bound is enforced here rather than inside the
+        checker so the checker never has to know how long the gap has been --
+        this is the only place that counts cycles.
 
         Kept out of the transmission loop's body so the loop stays readable and
         this stays testable on its own.
@@ -1147,7 +1692,13 @@ class FrankaSimServer:
         :meth:`CommConstraintTracker.command_received` for why crediting it back
         cannot be done without a wall clock.
         """
-        outcome = self.comm.tick(self.robot_state.state["message_id"])
+        published_id = self.robot_state.state["message_id"]
+        outcome = self.comm.tick(published_id)
+        # The differencing interval the motion-limit checker uses is bounded by
+        # this: how many states the server has actually published since the one
+        # the applied command history sits at. See
+        # :meth:`MotionLimitChecker.cycles_since_applied`.
+        self.motion_limits.note_published(published_id)
 
         # Zero when no control or motion generator loop is running, which is
         # what the real robot reports: control_command_success_rate "shows a
@@ -1158,44 +1709,317 @@ class FrankaSimServer:
         if not outcome.active:
             return
 
+        if outcome.lost:
+            if outcome.consecutive_lost < self.comm.max_consecutive_lost:
+                self._extrapolate_missed_cycle(outcome.closed_id)
+            elif outcome.bound_reached:
+                # The bound the robot stops at. With enforcement on, the abort
+                # below is about to fire and this line is its explanation; with
+                # enforcement off it is the whole report, which is why it is not
+                # inside the ``violation_triggered`` branch.
+                logger.warning(
+                    "%s consecutive lost command cycles: no longer extrapolating "
+                    "the motion generator, holding the last reference%s",
+                    outcome.consecutive_lost,
+                    "" if self.enforce_comm_constraints else " (not enforced)",
+                )
+
         if outcome.violation_triggered:
             self._abort_on_communication_violation(outcome.motion_id)
 
-    def _accept_within_motion_limits(self, command, *, fresh: bool = True) -> bool:
-        """Validate one received command; False if enforcement rejected it.
+    def _extrapolate_missed_cycle(self, closed_id: int) -> None:
+        """Command the waypoint the client did not send, for one missed cycle.
 
-        Always checks and always reports -- a violation logs a rate-limited
-        warning naming the joint or axis, the value and the limit, once per
-        error class per motion. Only with ``--enforce-motion-limits`` does it
-        additionally abort the motion and refuse the command, which is what the
-        real robot does with a signal it cannot follow.
+        The motion-generator half of the FCI's packet-loss behaviour. The
+        arithmetic is the limit checker's -- it already holds the backward
+        differences of the last two real commands, which is the only honest
+        source for the acceleration to freeze (see
+        :meth:`franka_sim.motion_limits.MotionLimitChecker.extrapolate`) -- and
+        what this method owns is the consequences: judging the result, and
+        putting it where a real command would have gone.
 
-        ``fresh`` is False for a datagram that did not answer the cycle it
-        arrived in. It is still checked in full -- everything that reaches
-        physics is -- but over a single cycle rather than over the interval its
-        own echoed id claims, which is the strictest reading available. See
-        :meth:`franka_sim.motion_limits.MotionLimitChecker.check`.
+        Those two are the same plumbing a received command gets, deliberately:
+
+        * the extrapolated waypoint is **checked like a command**, and an
+          extrapolation that runs out past the velocity envelope or a joint stop
+          latches the same error a client commanding it would have. That is not
+          collateral damage, it is the documented hazard -- intermittent drops
+          "could trigger `discontinuity` errors even when your source signals
+          conform with the interface specification" (``docs/overview.rst``) --
+          and a sim that clamped the extrapolation instead would be hiding
+          precisely the failure the client came here to find;
+        * it is then **dispatched through :meth:`_dispatch_control_command`**,
+          the same path a received datagram takes, so the arm keeps moving
+          through the gap and ``q_d``/``dq_d``/``ddq_d`` (and
+          ``O_T_EE_c``/``O_T_EE_d`` on a pose motion) advance with it. Reusing
+          that method rather than writing the fields here is what keeps the
+          FCI-layer field ownership in one place; it also means the hold latch
+          covers this path for free -- a session that ended between the tick and
+          here dispatches nothing.
+
+        ``closed_id`` names the state whose cycle went unanswered. It is stamped
+        on the substitute command, so the checker's applied history sits at that
+        id and the client's resumed command -- which answers a *later* state --
+        is differenced over the standard single cycle.
+
+        Runs on the state-publish thread. Lock order is unchanged from the other
+        publish-thread violation path (:meth:`_run_safety_velocity_check`):
+        ``_motion_lock`` -> checker lock -> ``_hold_lock``, with the dispatch
+        taking ``_hold_lock`` alone and never while another server lock is held.
+
+        **The motion is re-validated inside the dispatch's own lock.** A ``Move``
+        handled on the TCP thread between the extrapolation and the dispatch
+        changes ``motion_generator_mode`` and ``controller_mode``, and
+        :meth:`_dispatch_control_command` branches on exactly those -- so a
+        substitute built for the *old* motion's generator would be routed into
+        the new one's branch and written to fields the old motion never
+        commanded. The re-check is on the server's own motion token, read
+        without taking any checker lock so that the innermost-lock rule holds.
         """
         motion_id = self.motion_limits.motion_id
-        violation = self.motion_limits.check(command, self.robot_state.state["q"], fresh=fresh)
-        if violation is None:
+        generation = self._motion_generation
+        extrapolated = self.motion_limits.extrapolate(closed_id)
+        if extrapolated is None:
+            # Nothing to continue: no motion generator armed, no real command
+            # recorded yet, or a torque controller -- which holds.
+            return
+        command, violation = extrapolated
+
+        if violation is not None:
+            self.motion_limits.report(violation, enforced=self.enforce_motion_limits)
+            if self.enforce_motion_limits:
+                self._latch_and_abort(violation, motion_id)
+                return
+            if violation.fatal:
+                return
+
+        self._dispatch_control_command(command, motion_generation=generation)
+
+    def _absorb_within_motion_limits(self, command, *, fresh: bool) -> bool:
+        """Rewind, validate and record one received command; False if refused.
+
+        The UDP thread's whole interaction with the limit checker, in one call
+        that the checker takes under one hold of its lock -- see
+        :meth:`franka_sim.motion_limits.MotionLimitChecker.absorb_command` for
+        why that indivisibility is load-bearing and not merely tidy.
+
+        Reporting and aborting stay here, outside the checker's lock, so the
+        lock order is exactly what it was: ``_motion_lock`` (taken by
+        :meth:`_latch_and_abort`) -> checker lock, never the reverse, and the
+        checker's lock is still the innermost one anything in this server takes.
+
+        Always reports -- a violation logs a rate-limited warning naming the
+        joint or axis, the value and the limit, once per error class per motion.
+        Only with ``--enforce-motion-limits`` does it additionally abort the
+        motion and refuse the command, which is what the real robot does with a
+        signal it cannot follow. A *fatal* violation (a non-finite command) is
+        refused either way: applying NaN is not permissiveness, it poisons the
+        physics state, the backward differences and the wire. It does not abort,
+        though -- aborting is what the switch is for.
+        """
+        motion_id = self.motion_limits.motion_id
+        outcome = self.motion_limits.absorb_command(
+            command,
+            self.robot_state.state["q"],
+            fresh=fresh,
+            enforce=self.enforce_motion_limits,
+        )
+        if outcome.violation is None:
             return True
 
+        self.motion_limits.report(outcome.violation, enforced=self.enforce_motion_limits)
+        if not self.enforce_motion_limits:
+            return outcome.accepted
+        self._latch_and_abort(outcome.violation, motion_id)
+        return False
+
+    def _latch_and_abort(self, violation, motion_id: int) -> None:
+        """Latch the first violation of a motion and abort it, as one step.
+
+        The check ("is a violation already latched?") and the act (latch, then
+        abort) run from *two* threads -- the UDP receive thread checks each
+        command, the state-publish thread runs the safety controller -- so they
+        have to be indivisible. Two things go wrong otherwise, and the second
+        does not heal:
+
+        * both threads read ``violated`` as False in the same instant and abort
+          twice, answering one ``Move`` with two terminal responses;
+        * the running motion ends and the next one starts between the caller's
+          read of the checker's token and the latch. :meth:`
+          franka_sim.motion_limits.MotionLimitChecker.start_motion` clears the
+          latch for the new motion, so the stale latch lands on *it* -- while
+          :meth:`_abort_with_error`, correctly, refuses to abort a motion whose
+          token no longer matches. The new motion then runs with a violation
+          latched and no reflex behind it, and because the server refuses a
+          ``Move`` while a violation is latched, every later ``Move`` on that
+          connection is answered ``kCommandNotPossibleRejected``. Permanently
+          un-abortable, until ``AutomaticErrorRecovery``.
+
+        Holding ``_motion_lock`` across the whole sequence closes both. The
+        running motion cannot change under us, so re-reading the checker's token
+        *inside* the lock decides once and for all whether this violation still
+        belongs to a live motion -- and if it does, ``_abort_with_error`` (which
+        takes the same re-entrant lock) cannot then refuse it. **The latch and
+        the abort now succeed or fail together**, which is the invariant that
+        makes an un-abortable motion impossible.
+
+        Lock order here is ``_motion_lock`` -> the checker's own lock (taken and
+        released by :attr:`motion_limits.motion_id` and ``latch()``, never held
+        across the call into ``_abort_with_error``) -> ``_hold_lock`` (taken
+        inside ``_abort_with_error`` -> ``_engage_idle_hold``) -> the simulator
+        backend (called from inside ``_hold_lock`` by
+        ``_switch_to_hold_position``). ``_motion_lock`` -> ``_tcp_send_lock`` is
+        a separate nesting used elsewhere (``_finish_motion``,
+        ``handle_stop_move_command``); it does not occur on this path, because
+        ``_abort_with_error`` defers its ``Move`` response and sends it, if at
+        all, from ``_flush_pending_move_response`` after ``_motion_lock`` has
+        already been released. ``_tcp_send_lock`` and ``_hold_lock`` are both
+        leaves -- neither is held while acquiring another server lock -- so no
+        two locks are ever taken in both orders and there is no cycle.
+
+        ``motion_id`` is the checker's token as the caller read it before
+        running its check; 0 means "no motion named", which is what a violation
+        raised between motions (a non-finite datagram) carries.
+        """
+        with self._motion_lock:
+            running = self.motion_limits.motion_id
+            if motion_id != running:
+                logger.info(
+                    "Not latching (%s): the motion that violated is already over",
+                    violation.describe(),
+                )
+                return
+            if running and running != self._motion_generation:
+                # The checker still names a motion the server has moved past:
+                # it is on its way out, so latching would strand its successor.
+                logger.info(
+                    "Not latching (%s): the running motion is being replaced",
+                    violation.describe(),
+                )
+                return
+            if self.motion_limits.violated:
+                # Already latched: a burst of bad commands aborts once.
+                return
+            self.motion_limits.latch()
+            self._abort_with_error(violation.error_indices, violation.describe(), motion_id)
+
+    def _publish_commanded_pose(self, sim_state) -> None:
+        """Report the internal controller's hold pose in ``O_T_EE_d``/``O_T_EE_c``.
+
+        The Cartesian twin of :meth:`_publish_hold_setpoint`. Between motions --
+        and during every motion whose generator is not the Cartesian pose one --
+        the robot is held by its internal controller, so the pose it reports as
+        commanded *is* the pose it is in. These fields were a permanent identity
+        stub for as long as nothing read them, and that was not harmless: a
+        libfranka Cartesian-pose motion generator initialises and holds from
+        ``O_T_EE_d`` (the smoke suite's own helpers open with
+        ``std::array<double, 16> cmd = state.O_T_EE_d;``), so an identity there
+        made *every* pose motion open ten-ish metres and a full rotation away
+        from the robot and trip
+        ``cartesian_position_motion_generator_start_pose_invalid`` on cycle 0 --
+        a sim artifact that hid five of the suite's real Cartesian checks
+        behind it.
+
+        During a ``kCartesianPosition`` motion the two fields belong to the
+        client's stream instead (:meth:`_echo_commanded_cartesian`); the moment
+        that motion ends they snap back here, which is what the real robot does
+        when the internal controller takes the flange back.
+
+        **Arm roles only.** The mobile-duo base bridge's ``O_T_EE`` is
+        dead-reckoned from the commanded twist and its commanded Cartesian
+        fields are ``O_dP_EE_d``/``O_dP_EE_c``; neither is this method's
+        business. Same role guard as :data:`COMMANDED_STATE_FIELDS`.
+        """
+        if self.mobile_base or self._echoing_commanded_pose():
+            return
+        pose = sim_state.get("O_T_EE")
+        if pose is None:
+            return
+        pose = pose.tolist() if hasattr(pose, "tolist") else list(pose)
+        self.robot_state.state["O_T_EE_d"] = pose
+        self.robot_state.state["O_T_EE_c"] = pose
+
+    def _publish_elbow(self, sim_state) -> None:
+        """Report the arm's elbow configuration in ``elbow`` and ``elbow_d``.
+
+        ``elbow[0]`` is the 7-DOF redundancy angle, which on an FR3 *is* joint 3,
+        and ``elbow[1]`` is the branch flag: the sign of joint 4, which libfranka
+        insists is exactly +-1 (``isValidElbow``, ``include/franka/control_tools.h``).
+        Both are a reading of ``q``, so there is nothing to model and nothing to
+        integrate -- which is why these fields were a permanent ``[0.0, 0.0]``
+        stub for as long as no generator consumed them.
+
+        Now one does. A ``kCartesianPosition`` client builds its command as
+        ``franka::CartesianPose{state.O_T_EE_d, state.elbow_d}``, and libfranka
+        refuses to *send* an elbow whose flag is not +-1 -- ``checkElbow`` throws
+        ``std::invalid_argument`` client-side -- so a permanently zero
+        ``elbow_d`` made the elbow interface unreachable: the client threw before
+        a datagram was ever packed. Publishing the real thing is what lets the
+        elbow checks in :mod:`franka_sim.motion_limits` be exercised by a real
+        client at all.
+
+        Arm roles only. On the mobile-duo base bridge ``q`` is the four swerve
+        steer/drive joints, which have no elbow of any kind.
+        """
+        if self.mobile_base:
+            return
+        joints = sim_state.get("q")
+        if joints is None or len(joints) < 4:
+            return
+        elbow = [float(joints[2]), 1.0 if float(joints[3]) >= 0.0 else -1.0]
+        self.robot_state.state["elbow"] = elbow
+        # ``elbow_d``/``elbow_c`` are the *commanded* elbow on hardware. While a
+        # Cartesian generator is streaming one they are that stream's
+        # (:meth:`_echo_commanded_cartesian`); the rest of the time -- idle,
+        # between motions, under a joint generator, or under a Cartesian motion
+        # that commands no elbow at all -- the honest value is the one the
+        # internal controller is holding, which is the measured elbow. Same
+        # reasoning as ``q_d`` between motions; see
+        # :meth:`_publish_hold_setpoint`.
+        if self._echoing_commanded_elbow():
+            return
+        self.robot_state.state["elbow_d"] = list(elbow)
+        self.robot_state.state["elbow_c"] = list(elbow)
+
+    def _run_safety_velocity_check(self, sim_state) -> None:
+        """Run the safety controller against this cycle's measured velocity.
+
+        The one limit check that judges the *robot* rather than the client, and
+        the only one that is not tied to a motion generator: the real robot
+        watches measured ``dq`` against the position-based velocity envelope and
+        latches ``joint_velocity_violation`` when the arm leaves it, in every
+        control mode. Franka's hardware smoke suite pins the case no commanded
+        check could ever cover -- a pure-torque session ramping 3 Nm into joint
+        6 until the arm folds through the envelope, with no commanded velocity
+        anywhere in the session (``moveJointVelocityViolation``).
+
+        Called once per cycle from the state-publish loop with the physics
+        snapshot it has already read, so it costs one comparison per joint and
+        no extra backend call. Reporting is always on; the abort is gated on
+        ``--enforce-motion-limits`` and goes through the same latch-then-abort
+        plumbing as every other violation, so the client sees the identical
+        thing: the error bit in ``errors``/``reflex_reason``, ``kReflex``, and
+        the pending ``Move`` answered ``kReflexAborted``.
+
+        Skipped on a ``mobile_base`` server: the envelope is the FR3's, read out
+        of the arm's own URDF, and a swerve base's steering and drive joints are
+        not FR3 joints. The duo's *arms* run on ordinary arm servers, which do
+        get the check.
+        """
+        if self.mobile_base or sim_state is None:
+            return
+        motion_id = self.motion_limits.motion_id
+        violation = self.motion_limits.check_measured_velocity(
+            sim_state.get("q"), sim_state.get("dq")
+        )
+        if violation is None:
+            return
         self.motion_limits.report(violation, enforced=self.enforce_motion_limits)
         if not self.enforce_motion_limits:
-            # Reported, but applied: the sim stays the permissive channel it
-            # has always been unless asked to be the robot. A *fatal* violation
-            # (a non-finite command) is the exception -- applying NaN is not
-            # permissiveness, it poisons the physics state, the backward
-            # differences and the wire. It is dropped, but it does not abort:
-            # aborting is what the switch is for.
-            return not violation.fatal
-        if not self.motion_limits.violated:
-            # First violation of this motion: latch before aborting, so a burst
-            # of bad commands aborts once.
-            self.motion_limits.latch()
-            self._abort_with_error(violation.error_index, violation.describe(), motion_id)
-        return False
+            # Nothing to refuse: no command caused this, so "reject the
+            # command" is not a remedy. Reported and carried on with.
+            return
+        self._latch_and_abort(violation, motion_id)
 
     def _abort_on_communication_violation(self, motion_id: int) -> None:
         """Stop the motion with ``communication_constraints_violation``."""
@@ -1206,8 +2030,19 @@ class FrankaSimServer:
             motion_id,
         )
 
-    def _abort_with_error(self, error_index: int, reason: str, motion_id: int = 0) -> None:
-        """Stop the motion with one latched error, the way the robot does.
+    def _abort_with_error(
+        self, error_index: Union[int, Sequence[int]], reason: str, motion_id: int = 0
+    ) -> None:
+        """Stop the motion with one or more latched errors, the way the robot does.
+
+        ``error_index`` is usually a single index, but accepts a sequence too:
+        hardware latches *two* bits from a single abort in exactly one case --
+        a commanded velocity-envelope violation (13) that trips while the
+        safety controller is armed also latches ``joint_velocity_violation``
+        (3); see :attr:`franka_sim.motion_limits.Violation.extra_error_index`
+        and the citation there. Every index in the sequence lands in the same
+        state update and the same deferred ``Move`` response, so the client
+        reads them off one abort rather than two.
 
         Shared by every reflex the sim emulates -- the communication-constraints
         violation and each of the motion-limit violations -- because a client
@@ -1244,7 +2079,8 @@ class FrankaSimServer:
         than never, and there is no state to race.
 
         ``error_index`` is the 0-based position of the error in the 41-entry
-        wire arrays, i.e. its ``research_interface::robot::Error`` enumerator.
+        wire arrays, i.e. its ``research_interface::robot::Error`` enumerator --
+        or a sequence of them, all latched in this one abort.
 
         ``motion_id`` is the session token of the motion that violated (see
         :attr:`_motion_generation`). The three threads that start, finish and
@@ -1263,8 +2099,10 @@ class FrankaSimServer:
 
             logger.error("%s -- aborting the motion", reason)
             state = self.robot_state.state
-            state["errors"][error_index] = True
-            state["reflex_reason"][error_index] = True
+            indices = (error_index,) if isinstance(error_index, int) else tuple(error_index)
+            for index in indices:
+                state["errors"][index] = True
+                state["reflex_reason"][index] = True
             state["robot_mode"] = RobotMode.kReflex
             state["motion_generator_mode"] = LibfrankaMotionGeneratorMode.kIdle.value
             state["controller_mode"] = LibfrankaControllerMode.kOther.value
@@ -1363,10 +2201,16 @@ class FrankaSimServer:
 
             # Send one final state with both modes set to idle
             if hasattr(self, "udp_socket") and self.udp_socket:
-                # Update state to idle modes
-                self.robot_state.state["motion_generator_mode"] = 0  # kNone
-                self.robot_state.state["controller_mode"] = 3  # kOther
-                self.robot_state.state["robot_mode"] = RobotMode.kIdle
+                # Update state to idle modes -- unless a reflex is latched, in
+                # which case the modes already left kMove and ``robot_mode``
+                # is kReflex. Overwriting that with kIdle would tell the
+                # client the motion ended cleanly while ``errors`` still says
+                # why it did not, and kReflex is the flag that has to survive
+                # until AutomaticErrorRecovery. Mirrors _finish_motion.
+                if self.robot_state.state["robot_mode"] != RobotMode.kReflex:
+                    self.robot_state.state["motion_generator_mode"] = 0  # kNone
+                    self.robot_state.state["controller_mode"] = 3  # kOther
+                    self.robot_state.state["robot_mode"] = RobotMode.kIdle
 
                 # Send state with new message ID
                 self.robot_state.update()  # This increments message_id
@@ -1375,9 +2219,26 @@ class FrankaSimServer:
                 logger.info(f"Sent final robot state with message_id:\
                           {self.robot_state.state['message_id']}")
 
-            # Stop robot state transmission
-            self.transmitting_state = False
-            logger.info("Stopped robot state transmission")
+            # StopMove ends the *motion*, not the session: the real FCI keeps
+            # streaming RobotState over UDP (now reporting the idle hold set
+            # above) from Connect all the way to disconnect, and a client is
+            # free to send another Move on this same TCP connection --
+            # libfranka's ActiveControl does exactly that on
+            # cancelMotion() -> StopMove -> AutomaticErrorRecovery -> Move.
+            # ``transmitting_state`` is the flag start_robot_state_transmission's
+            # publish loop reads to keep going (see its docstring), and
+            # ``connection_running`` gates that same loop *and* handle_client's
+            # watchdog that ends the whole connection -- clearing either one
+            # here used to tear the session down after the first motion, so a
+            # second Move's kMotionStarted would arrive over TCP (the command
+            # thread does not check either flag) but never see another UDP
+            # datagram, and the client's next receive would hang until it
+            # timed out. Neither flag is touched here any more; both are
+            # cleared only by an actual disconnect (handle_tcp_messages) or
+            # server shutdown (stop()). This mirrors the already-established
+            # pattern for a motion that finishes on its own (see the
+            # motion-finished handler above, which has never stopped the
+            # publish loop either).
 
             # Send Move response to break the waiting loop in the client
             with self._motion_lock:
@@ -1391,9 +2252,6 @@ class FrankaSimServer:
                         "Sent Move success response for motion ID: %s", self.current_motion_id
                     )
                     self.current_motion_id = 0
-
-            # Set connection_running to False instead of self.running
-            self.connection_running = False
 
         except Exception as e:
             logger.error(f"Error handling StopMove command: {e}")
@@ -1658,6 +2516,18 @@ class FrankaSimServer:
         documents the latter as "the errors that aborted the previous motion",
         so it is a record, not a live condition, and recovery must not erase
         it -- ``createControlException`` reads it *after* the abort.
+
+        The response is deferred until the arm is at (near) standstill; see
+        :meth:`_wait_for_standstill`. On the real robot recovery inherently
+        completes there -- an abort caught mid-motion leaves the arm decelerating
+        under the internal controller, and a client that Move's again the instant
+        it gets a reply is Move'ing into an arm that has already stopped. This
+        sim used to reply immediately, so a client recovering from a fast abort
+        could start its next motion while still decelerating from a couple of
+        rad/s, and its own start-pose guard would then see measured q drifting
+        off the commanded q it had just sent and throw a "Performance threshold
+        reached" a few milliseconds later -- on a motion the client did nothing
+        wrong on.
         """
         try:
             # AutomaticErrorRecovery has an empty request; nothing to parse.
@@ -1670,6 +2540,12 @@ class FrankaSimServer:
             self.motion_limits.recover()
             self.robot_state.state["robot_mode"] = RobotMode.kIdle
             self._engage_idle_hold("automatic error recovery")
+
+            # The idle hold above is what does the decelerating -- this only
+            # waits for it to have worked. See _wait_for_standstill for why it
+            # polls rather than sleeping once, and why it lives here rather
+            # than blocking the state-publish loop.
+            self._wait_for_standstill()
 
             # Response is ResponseBase: a single uint8 status (kSuccess = 0).
             total_size = 12 + 4  # Header (12) + status (1) + padding (3)
@@ -1692,6 +2568,102 @@ class FrankaSimServer:
             header_bytes = response_header.to_bytes()
             response_data = struct.pack("<B3x", 1)  # Status 1 = Error
             self._send_tcp(client_socket, header_bytes + response_data)
+
+    def _wait_for_standstill(self) -> None:
+        """Block the calling thread until the arm has settled, or the timeout passes.
+
+        See :data:`AUTOMATIC_ERROR_RECOVERY_TIMEOUT` for why that ceiling is
+        0.7 s rather than the 3 s first tried: libfranka's own TCP receive
+        timeout on the response is a hard 1 s, and going over it does not
+        make the wait "slower but correct" -- it breaks the connection.
+
+        The 0.7 s budget is wall-clock, but what it is waiting on -- the arm
+        ringing down to standstill -- is sim-time. On a scene running below
+        roughly 0.7x real-time factor, 0.7 s of wall clock buys less than
+        0.7 s of simulated settling, so this method routinely runs out the
+        clock before the arm has actually stopped. That is not a bug to chase
+        here: the timeout path below degrades to replying anyway, exactly as
+        designed, and it is the RTF, not this wait, that wants fixing.
+
+        Called from :meth:`handle_automatic_error_recovery_command`, which runs
+        on the per-connection TCP thread (see ``handle_tcp_messages``) -- a
+        thread of its own, separate from the state-publish loop
+        (:meth:`start_robot_state_transmission`, which runs on the connection's
+        accept thread) and from the UDP command receiver
+        (:meth:`_handle_commands`). Blocking it here therefore does not stall
+        either of those. It does hold up the *next* TCP command on this same
+        connection, which is the point: libfranka's ``automaticErrorRecovery()``
+        already blocks the client until this reply arrives, so there is no
+        "other traffic" on this connection to protect it from -- but it must
+        still poll rather than take one long sleep, both so
+        :attr:`FrankaSimServer.running` going false during shutdown is noticed
+        promptly (see the loop condition below) and so the timeout path can log
+        and bail rather than oversleeping a caller that will never settle.
+
+        Queries ``genesis_sim.get_robot_state()`` directly on every poll rather
+        than reading the cached ``dq`` off :attr:`RobotState.state`.
+
+        **That distinction is not cosmetic, even though the publish loop now
+        keeps running through StopMove.** libfranka always sends ``StopMove``
+        before ``AutomaticErrorRecovery`` (confirmed against the real wire:
+        ``handle_stop_move_command`` runs first in every observed recovery
+        sequence). ``handle_stop_move_command`` used to clear
+        ``self.transmitting_state`` -- the flag
+        :meth:`start_robot_state_transmission`'s loop reads to keep
+        publishing -- which stopped the loop and froze
+        ``robot_state.state["dq"]`` at whatever it last was; that stale read
+        was the original version of this bug (see the comment in
+        :meth:`handle_stop_move_command` for why the flag is not cleared
+        there any more). The loop no longer stops for StopMove, but this
+        method still
+        reads the physics backend directly rather than the publish loop's
+        copy: the loop only refreshes ``robot_state.state`` once per 1 kHz
+        cycle, so going straight to ``get_robot_state()`` is still the
+        freshest read available and costs nothing extra, and it stays correct
+        even on any future path that *does* legitimately stop the loop (a
+        real disconnect, server shutdown) while a recovery is still in
+        flight. The physics backend itself has no such gap either way: it
+        keeps stepping and answering ``get_robot_state()`` regardless of
+        whether anything is publishing its output.
+
+        Skipped entirely on a ``mobile_base`` server, matching
+        :meth:`_run_safety_velocity_check`: ``dq`` there is the swerve base's
+        steer/drive joints, not an FR3's, and the base's idle hold is already a
+        zero-twist command rather than a decelerating position hold, so there is
+        no equivalent "still ringing down" state to wait out.
+        """
+        if self.mobile_base:
+            return
+        deadline = time.monotonic() + AUTOMATIC_ERROR_RECOVERY_TIMEOUT
+        settled_cycles = 0
+        while self.running and time.monotonic() < deadline:
+            try:
+                dq = self.genesis_sim.get_robot_state().get("dq")
+            except Exception:
+                # The backend erroring out here is not a reason to hang the
+                # client; fall through to "not settled" and let the timeout
+                # path below reply anyway.
+                logger.exception(
+                    "AutomaticErrorRecovery: could not read the simulator "
+                    "while waiting for standstill"
+                )
+                dq = None
+            if dq is not None and max(abs(value) for value in dq[:7]) < (
+                AUTOMATIC_ERROR_RECOVERY_SETTLE_VELOCITY
+            ):
+                settled_cycles += 1
+                if settled_cycles >= AUTOMATIC_ERROR_RECOVERY_SETTLE_CYCLES:
+                    return
+            else:
+                settled_cycles = 0
+            time.sleep(AUTOMATIC_ERROR_RECOVERY_POLL_PERIOD)
+        if self.running:
+            logger.warning(
+                "AutomaticErrorRecovery: arm did not settle below %.3f rad/s "
+                "within %.1fs; replying success anyway",
+                AUTOMATIC_ERROR_RECOVERY_SETTLE_VELOCITY,
+                AUTOMATIC_ERROR_RECOVERY_TIMEOUT,
+            )
 
     def handle_tcp_messages(self, client_socket):
         """Handle TCP messages in a separate thread"""
@@ -1873,10 +2845,21 @@ class FrankaSimServer:
         """
         try:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Deliberately not bound. This socket only ever *sends*, so the
+            # kernel binds it to an ephemeral port on the first ``sendto``
+            # below; libfranka reads the source port off the datagrams it
+            # receives and answers there, which is what a real FCI does too.
+            # The consequence to know about: until that first send,
+            # ``getsockname()`` reports port 0. The log line below therefore
+            # prints 0 on every session, and anything wanting to know that this
+            # session is broadcasting should watch :attr:`states_sent` rather
+            # than the port -- binding explicitly here would make the port real
+            # *before* any state had gone out, which is a strictly weaker
+            # signal than the one the counter gives.
             # TODO move to somewhere appropriate
             self.start_command_receiver()
 
-            # port of the udp_socket
+            # port of the udp_socket (0 until the first sendto; see above)
             udp_port = self.udp_socket.getsockname()[1]
             logger.debug(f"UDP port: {udp_port}")
             self.client_address = client_address
@@ -1896,6 +2879,10 @@ class FrankaSimServer:
             # this loop would spin well above 1 kHz and burn a whole CPU core.
             period = 0.001  # 1 kHz target broadcast rate
             next_deadline = time.perf_counter()
+            # When the last state actually went out. The pacer keeps every
+            # state at least one cycle behind it; see the deadline arithmetic
+            # at the bottom of the loop.
+            last_send = next_deadline - period
 
             while self.running and self.connection_running and self.transmitting_state:
                 try:
@@ -1918,6 +2905,43 @@ class FrankaSimServer:
                         }
                     )
 
+                    self._publish_commanded_pose(sim_state)
+                    self._publish_elbow(sim_state)
+
+                    # The safety controller: measured velocity against the
+                    # position-based envelope, every cycle, in every control
+                    # mode. Judges the arm, not the command, so it lives here
+                    # rather than on the UDP receive path.
+                    self._run_safety_velocity_check(sim_state)
+
+                    # Everything above is this cycle's work; the pacing sleep
+                    # below is not, and the stats line reports work.
+                    cycle_time = time.time() - cycle_start
+                    total_cycle_time += cycle_time
+                    total_cycles += 1
+
+                    # Pace to the ~1 kHz deadline *here*, with the cycle's work
+                    # already done, so what the schedule governs is the moment
+                    # the state leaves -- which is the only moment the client
+                    # can see. Sleeping at the bottom of the loop instead put
+                    # this cycle's work between the deadline and the send, and
+                    # the minimum-spacing rule below then charged that work to
+                    # every cycle and dragged the publish rate down with it.
+                    remaining = next_deadline - time.perf_counter()
+                    if remaining > 0:
+                        time.sleep(remaining)
+
+                    # Do not close this cycle while the client's answer to the
+                    # previous one is still sitting unread in our own socket:
+                    # the state about to go out would carry a ``q_d`` the client
+                    # has already moved past, and libfranka filters its next
+                    # waypoint toward exactly that field. Immediately before the
+                    # accounting and the send, which is the only moment that
+                    # sees every datagram this cycle could have brought. See
+                    # _drain_gate. Whatever it waits for is this cycle's own
+                    # time, not time to be made up: the deadline moves with it.
+                    next_deadline += self._drain_gate()
+
                     # Close the cycle the previous state opened and open this
                     # one. Done immediately before the send, so "in time for
                     # this cycle" means "arrived before the next state went
@@ -1932,38 +2956,67 @@ class FrankaSimServer:
                     state = self.robot_state.pack_state()
                     if self.udp_socket and not self.udp_socket._closed:
                         self.udp_socket.sendto(state, (client_address, client_udp_port))
+                        last_send = time.perf_counter()
+                        # After the send, so a reader that sees this move knows
+                        # a datagram really went out (and, with it, that the
+                        # socket has been implicitly bound to a real port).
+                        self.states_sent += 1
                         # Inside the guard: a state that was never sent cannot
                         # be the one a deferred kReflexAborted is waiting to
                         # follow.
                         self._flush_pending_move_response()
 
-                    # After first state is sent, send a Move success response
-                    if not first_state_sent:
-                        with self._motion_lock:
-                            motion_id = self.current_motion_id
-                        if motion_id:
-                            self.send_move_response(
-                                self.client_socket,
-                                command_id=motion_id,
-                                status=MoveStatus.kSuccess,
-                            )
+                        # NOTE: the first state datagram does not get a Move
+                        # response here. handle_move_command already answered
+                        # this motion's Move with kMotionStarted when it was
+                        # accepted -- Move gets exactly one reply on the wire,
+                        # and the terminal one (kSuccess via StopMove, or
+                        # kReflexAborted/etc. via _pending_move_response) is
+                        # sent elsewhere. A second kSuccess sent from here
+                        # used to sit unread in libfranka's response map,
+                        # keyed by command id; when the motion later aborted,
+                        # Robot::throwOnMotionError found that stale kSuccess
+                        # ahead of the real terminal response and raised
+                        # ProtocolException("Unexpected reply to a Move
+                        # command") instead of the intended ControlException.
+                        #
+                        # first_state_sent still has to flip exactly once,
+                        # though -- it also gates the q_d seeding above -- so
+                        # it is set unconditionally right after the first
+                        # successful sendto, decoupled from any response.
+                        if not first_state_sent:
                             first_state_sent = True
 
                     # Update state for next iteration
                     self.robot_state.update()
-                    # Calculate cycle statistics (work time, before pacing sleep)
-                    cycle_time = time.time() - cycle_start
-                    total_cycle_time += cycle_time
-                    total_cycles += 1
 
-                    # Sleep until the next 1 kHz deadline (soft real-time).
+                    # Schedule the next state (the sleep itself is above, just
+                    # before the send).
                     next_deadline += period
-                    remaining = next_deadline - time.perf_counter()
-                    if remaining > 0:
-                        time.sleep(remaining)
-                    elif remaining < -period:
-                        # Fell a full cycle behind; resync to avoid a catch-up burst.
-                        next_deadline = time.perf_counter()
+                    # ...but never closer than a whole cycle to the state that
+                    # just went out. A cycle that ran long used to be made up
+                    # by firing the next state immediately behind it -- two
+                    # states microseconds apart -- and that is not a schedule
+                    # the FCI contract allows. The client cannot answer the
+                    # first one in the time the second takes to arrive, so the
+                    # second necessarily carries a ``q_d`` that predates the
+                    # answer to the first; libfranka filters its next waypoint
+                    # toward exactly that field, and the kink that produces is
+                    # what the limit checker then reports as
+                    # ``joint_motion_generator_velocity_discontinuity`` against
+                    # a client that did nothing wrong (see _drain_gate for the
+                    # other half of the same story). One cycle per state, even
+                    # when the cycle before it overran.
+                    #
+                    # The floor is a fraction of a cycle short of the full
+                    # period on purpose. It has to bite on a real overrun --
+                    # the millisecond-plus ones that produced the bursts -- and
+                    # not on the few tens of microseconds ``time.sleep`` routinely
+                    # overshoots by, or every cycle would be charged that
+                    # overshoot and the nominal 1 kHz would drift down to ~900 Hz.
+                    # The client's observed turnaround is well under 100 us, so
+                    # 0.8 ms is still a whole answering window.
+                    next_deadline = max(next_deadline, last_send + _MIN_STATE_SPACING * period)
 
                     # Log statistics every second
                     if time.time() - last_stats_time >= 1.0:
@@ -2009,6 +3062,7 @@ class FrankaSimServer:
 
     def run_server(self):
         """Main server loop that runs in a separate thread when visualization is enabled"""
+        self._arm_shutdown()
         try:
             logger.info("Starting TCP server initialization...")
             # Start TCP server
@@ -2065,6 +3119,18 @@ class FrankaSimServer:
                 except socket.timeout:
                     # Just continue waiting for new connections
                     continue
+                except OSError as e:
+                    # stop() closes the listening socket from another thread --
+                    # that is what breaks this accept() out of its wait. The
+                    # EBADF/EINVAL that follows is the shutdown signal, not a
+                    # failure, and logging it with a traceback made every clean
+                    # Ctrl+C look like a crash.
+                    if not self.running or e.errno in (errno.EBADF, errno.EINVAL):
+                        logger.debug("Accept loop stopping: %s", e)
+                        break
+                    logger.error(f"Connection handling error: {e}", exc_info=True)
+                    self.reset_state()
+                    continue
                 except Exception as e:
                     logger.error(f"Connection handling error: {e}", exc_info=True)
                     if "client_socket" in locals():
@@ -2090,8 +3156,21 @@ class FrankaSimServer:
         self.gripper_thread.start()
         logger.info("Gripper server running in background thread")
 
+    def _arm_shutdown(self):
+        """Re-arm the once-per-run shutdown latches, at the start of a run.
+
+        stop() is idempotent *within a run*, not for the lifetime of the
+        object: a server that is started again (the accept loop is entered
+        afresh, so a new listening socket exists) must be stoppable again, or
+        the second stop() would return early and leak that socket.
+        """
+        with self._stop_lock:
+            self._stopping = False
+            self._cleanup_logged = False
+
     def start(self):
         """Start the TCP server and Genesis simulator"""
+        self._arm_shutdown()
         try:
             self.running = True
             logger.info("Starting server and simulation")
@@ -2143,8 +3222,20 @@ class FrankaSimServer:
         aborting the rest of cleanup() and leaking the SO_REUSEPORT listener.
         Binding the reference once up front makes both calls operate on the
         same object regardless of what happens to the attribute afterwards.
+
+        Idempotent: stop() calls it, and so does the accept loop's finally
+        clause once stop() has closed the socket underneath it. Every step is
+        None-guarded, so the repeat run is a no-op; only the announcement is
+        suppressed, because two "Cleaning up server resources..." lines per
+        shutdown read like two shutdowns.
         """
-        logger.info("Cleaning up server resources...")
+        with self._stop_lock:
+            first_cleanup = not self._cleanup_logged
+            self._cleanup_logged = True
+        if first_cleanup:
+            logger.info("Cleaning up server resources...")
+        else:
+            logger.debug("Cleaning up server resources (already cleaned)...")
 
         # Stop all running operations
         self.running = False
@@ -2204,18 +3295,63 @@ class FrankaSimServer:
         self.running = False
 
     def stop(self):
-        """Stop the server and clean up resources"""
+        """Stop the server and release every resource it owns.
+
+        Idempotent and non-raising. Shutdown is the one path that has to
+        survive being called badly: twice (a second Ctrl+C), concurrently
+        (accept thread vs. main thread), or with one of its stages already
+        broken. A stage that raised used to skip every stage after it, which
+        is how a Ctrl+C could leave the listening socket bound or the viewer's
+        GL context alive.
+
+        Ordered so nothing is torn down while something else still uses it:
+        stop accepting and close the sockets (which is also what breaks the
+        accept/receive loops out of their waits), then the gripper server,
+        then the simulator -- whose viewer teardown is the slowest step and
+        the one the network threads must already be gone for. Every join is
+        bounded; every serving thread is a daemon, so a join that does time
+        out can never keep the process alive.
+        """
+        with self._stop_lock:
+            if self._stopping:
+                logger.debug("stop() already in progress or done")
+                return
+            self._stopping = True
+
         logger.info("Stopping server...")
         self.running = False
         self.connection_running = False
         self.transmitting_state = False
-        self.cleanup()
-        if self.gripper_server is not None:
-            self.gripper_server.stop()
-            if self.gripper_thread is not None:
-                self.gripper_thread.join(timeout=2.0)
-        # Stop Genesis simulator
-        self.genesis_sim.stop()
+
+        for stage, action in (
+            ("socket cleanup", self.cleanup),
+            ("gripper server", self._stop_gripper),
+            ("simulator", self.genesis_sim.stop),
+        ):
+            try:
+                action()
+            except Exception:
+                logger.error("Error stopping the %s; continuing shutdown", stage, exc_info=True)
+
+    def _stop_gripper(self):
+        """Stop the gripper server and wait (briefly) for its accept loop."""
+        if self.gripper_server is None:
+            return
+        self.gripper_server.stop()
+        thread, self.gripper_thread = self.gripper_thread, None
+        if thread is not None:
+            # stop() has already closed the listening socket, which drops the
+            # accept() out of its wait immediately -- this join is a formality
+            # that should return in microseconds. It is bounded anyway, and the
+            # thread is a daemon, so a gripper client wedged in a backend call
+            # delays shutdown by at most GRIPPER_JOIN_TIMEOUT_S instead of
+            # holding the process open.
+            thread.join(timeout=GRIPPER_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                logger.warning(
+                    "Gripper server thread did not stop within %.1fs; abandoning it",
+                    GRIPPER_JOIN_TIMEOUT_S,
+                )
 
 
 def main():
@@ -2234,6 +3370,10 @@ def main():
         server.start()
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
+    finally:
+        # stop() is idempotent and does not raise, so running it on every exit
+        # path (not just the interrupt) is safe -- and closing the viewer's window
+        # is an exit path too.
         server.stop()
 
 

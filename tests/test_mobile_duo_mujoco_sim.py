@@ -218,6 +218,55 @@ def test_position_mode_tracks_a_step_target(scene):
     assert scene.get_role_state(ROLE_RIGHT)["q"] == pytest.approx(ARM_INITIAL_Q, abs=1e-3)
 
 
+def test_a_udp_physics_clock_beat_does_not_saturate_either_arm(scene):
+    """The single-arm backend's beat fix, mirrored -- and measured -- here.
+
+    Both arms stream the same 0.5 rad/s ramp on joint 4, delivered on a ``[0,
+    2]`` beat: one physics step sees no new waypoint, the next sees two. The
+    one-step-difference feedforward this replaced turned that into a ``dq_c``
+    alternating 0 / 2v and, at KD=450, a +/-225 Nm square wave clipped on the
+    +/-87 Nm rail; counting the interval the target actually changed over reads
+    a steady v either way. See ``franka_sim.sim_common.PositionFeedforward``.
+    """
+    joint, velocity, ramp_cycles, cycles = 3, 0.5, 100, 300
+    waypoints, q = [], ARM_INITIAL_Q.copy()
+    for cycle in range(cycles):
+        # Accelerated in at 5 rad/s^2 rather than stepped: a step from rest to
+        # 0.5 rad/s pins the rail for its first cycles in *every* delivery
+        # pattern, which says nothing about the beat.
+        q = q.copy()
+        q[joint] += velocity * min(1.0, (cycle + 1) / ramp_cycles) * scene.dt
+        waypoints.append(q)
+
+    for role in ARM_ROLES:
+        scene.set_arm_control_mode(role, ControlMode.POSITION)
+        scene.update_arm_joint_positions(role, ARM_INITIAL_Q.copy())
+
+    torques = {role: [] for role in ARM_ROLES}
+    sent = 0
+    for arrivals in [0, 2] * (cycles // 2):
+        if arrivals:
+            sent += arrivals
+            for role in ARM_ROLES:
+                scene.update_arm_joint_positions(role, waypoints[sent - 1])
+        scene._apply_control()
+        mujoco.mj_step(scene.model, scene.data)
+        for role in ARM_ROLES:
+            torques[role].append(scene.data.qfrc_applied[scene.arm_dofs_idx[role]].copy())
+    scene._read_and_publish_state()
+
+    for role in ARM_ROLES:
+        applied = np.abs(np.array(torques[role]))
+        on_the_rail = np.isclose(applied, FR3_FORCE_LIMITS, rtol=0, atol=1e-9).any(axis=1)
+        assert not on_the_rail.any(), (
+            f"{role}: {on_the_rail.mean():.1%} of the beat run's steps hit the "
+            "actuator rail"
+        )
+        assert scene.get_role_state(role)["q"][joint] == pytest.approx(
+            waypoints[-1][joint], abs=3e-3
+        )
+
+
 def test_velocity_mode_tracks_a_commanded_joint_velocity(scene):
     scene.set_arm_control_mode(ROLE_RIGHT, ControlMode.VELOCITY)
     scene.update_arm_joint_velocities(ROLE_RIGHT, np.full(7, 0.2))

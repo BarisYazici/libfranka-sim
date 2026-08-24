@@ -17,13 +17,19 @@ mujoco = pytest.importorskip("mujoco")
 from franka_sim.control_modes import ControlMode  # noqa: E402
 from franka_sim.mujoco_franka_sim import (  # noqa: E402
     ARM_INITIAL_Q,
+    ARM_POSITION_KD,
+    ARM_POSITION_KP,
     DEFAULT_DT,
     FLANGE_OFFSET_Z,
     MAX_FINGER_TRAVEL,
     MujocoFrankaSim,
     default_fr3_mjcf,
 )
-from franka_sim.sim_common import FR3_FORCE_LIMITS  # noqa: E402
+from franka_sim.sim_common import (  # noqa: E402
+    FR3_FORCE_LIMITS,
+    POSITION_FEEDFORWARD_HOLD_STEPS,
+    PositionFeedforward,
+)
 
 try:
     FR3_MJCF = default_fr3_mjcf()
@@ -42,12 +48,26 @@ SETTLE_STEPS = int(SETTLE_S / DEFAULT_DT)
 
 
 @pytest.fixture
-def sim():
+def sim_factory():
+    """Build independent hand-less arms; all of them torn down after the test."""
+    built = []
+
+    def _build(**kwargs):
+        simulator = MujocoFrankaSim(**kwargs)
+        simulator.initialize_simulation()
+        built.append(simulator)
+        return simulator
+
+    yield _build
+
+    for simulator in built:
+        simulator.stop()
+
+
+@pytest.fixture
+def sim(sim_factory):
     """A built, hand-less 7-DOF arm holding its initial pose."""
-    simulator = MujocoFrankaSim()
-    simulator.initialize_simulation()
-    yield simulator
-    simulator.stop()
+    return sim_factory()
 
 
 @pytest.fixture
@@ -197,6 +217,283 @@ def test_o_t_ee_is_a_valid_column_major_se3_at_the_flange(sim):
     position, orientation = _body_pose(sim, f"{sim.prefix}link7")
     assert transform[:3, 3] == pytest.approx(position)
     assert rotation == pytest.approx(orientation, abs=1e-9)
+
+
+def test_idle_hold_shaped_constant_target_matches_the_old_law(sim):
+    """The idle hold sets q_d = current q, then switches to POSITION mode --
+    the target never differs from where the arm already is, so the new law's
+    velocity feedforward is 0 on every step and its output must match the old
+    ``KP*error - KD*dq`` law bit for bit.
+    """
+    current_q = sim.get_robot_state()["q"].copy()
+    sim.update_joint_positions(current_q)  # target first, mode second (idle-hold order)
+    sim.set_control_mode(ControlMode.POSITION)
+
+    for _ in range(50):
+        q = sim.data.qpos[sim.arm_qpos_adr].copy()
+        dq = sim.data.qvel[sim.arm_dofs_idx].copy()
+        old_law = np.clip(
+            ARM_POSITION_KP * (current_q - q) - ARM_POSITION_KD * dq,
+            -FR3_FORCE_LIMITS,
+            FR3_FORCE_LIMITS,
+        )
+        new_law = sim.arm_control_torque()
+        assert new_law == pytest.approx(old_law)
+        sim.step(1)
+
+
+def test_switching_into_position_mode_resets_the_feedforward_baseline(sim):
+    """A mode switch must not let a stale target produce a first-step spike.
+
+    Runs POSITION mode with a drifting target long enough that the stored
+    feedforward baseline has moved on, switches to TORQUE for a few steps,
+    then switches back into POSITION the way the idle hold does: the target
+    is set to the arm's actual current position *before* the mode switch.
+    The switch must snap the baseline to that target, so the very first
+    torque computed afterwards has zero velocity feedforward -- it must equal
+    the old, undamped-feedforward law exactly.
+    """
+    sim.set_control_mode(ControlMode.POSITION)
+    drifting_target = ARM_INITIAL_Q.copy()
+    for _ in range(50):
+        drifting_target = drifting_target + 0.001
+        sim.update_joint_positions(drifting_target)
+        sim.step(1)
+    assert not np.allclose(sim.prev_position_target, ARM_INITIAL_Q)
+
+    sim.set_control_mode(ControlMode.TORQUE)
+    sim.update_torques(np.zeros(7))
+    sim.step(5)
+
+    current_q = sim.get_robot_state()["q"].copy()
+    sim.update_joint_positions(current_q)
+    sim.set_control_mode(ControlMode.POSITION)
+    assert sim.prev_position_target == pytest.approx(current_q)
+
+    q = sim.data.qpos[sim.arm_qpos_adr].copy()
+    dq = sim.data.qvel[sim.arm_dofs_idx].copy()
+    expected_no_spike = np.clip(
+        ARM_POSITION_KP * (current_q - q) - ARM_POSITION_KD * dq,
+        -FR3_FORCE_LIMITS,
+        FR3_FORCE_LIMITS,
+    )
+    assert sim.arm_control_torque() == pytest.approx(expected_no_spike)
+
+
+def test_constant_velocity_ramp_stays_within_the_tracking_guard(sim):
+    """A smooth streamed trajectory must not fail libfranka's tracking guard.
+
+    libfranka's own smoke-test rejects a motion whose measured joint
+    positions stray from the *previous cycle's* commanded positions by more
+    than 6e-3 rad RMSE at 1 kHz. The undamped-feedforward law fails this on an
+    ordinary ramp because its damping term fights the commanded motion,
+    adding a (KD/KP)*v lag; the fix (damping against the commanded velocity)
+    must keep this comfortably inside the guard.
+    """
+    joint_idx = 3  # joint4 (1-indexed), well inside its travel limits
+    velocity = 0.5  # rad/s
+    dt = DEFAULT_DT
+    steps = 300
+
+    sim.set_control_mode(ControlMode.POSITION)
+    q_c = ARM_INITIAL_Q.copy()
+    sim.update_joint_positions(q_c)
+
+    max_error = 0.0
+    for _ in range(steps):
+        prev_q_c = q_c[joint_idx]
+        q_c = q_c.copy()
+        q_c[joint_idx] += velocity * dt
+        sim.update_joint_positions(q_c)
+        sim.step(1)
+        q_measured = sim.get_robot_state()["q"][joint_idx]
+        max_error = max(max_error, abs(q_measured - prev_q_c))
+
+    assert max_error < 0.003
+
+
+# --- the feedforward under a UDP/physics clock beat --------------------------
+
+#: The ramp the beat tests stream: joint 4 accelerating to 0.5 rad/s and holding
+#: it, 300 cycles in all.
+BEAT_JOINT = 3
+BEAT_VELOCITY = 0.5
+BEAT_STEPS = 300
+#: Cycles the commanded velocity takes to reach BEAT_VELOCITY from rest -- 5
+#: rad/s^2, half of kMaxJointAcceleration. A *step* to 0.5 rad/s would be 500
+#: rad/s^2, which the motion-limit checker refuses outright and which pins the
+#: actuator rail for its first two cycles in every delivery pattern; that spike
+#: is the client's, not the clock beat's, and measuring it here would tell us
+#: nothing about either.
+BEAT_RAMP_CYCLES = 100
+
+
+def _ramp_waypoints(cycles):
+    """The client's 1 kHz waypoint stream for the beat tests."""
+    waypoints, q = [], ARM_INITIAL_Q.copy()
+    for cycle in range(cycles):
+        velocity = BEAT_VELOCITY * min(1.0, (cycle + 1) / BEAT_RAMP_CYCLES)
+        q = q.copy()
+        q[BEAT_JOINT] += velocity * DEFAULT_DT
+        waypoints.append(q)
+    return waypoints
+
+
+def _stream_position_ramp(simulator, arrivals):
+    """Stream :func:`_ramp_waypoints` on a given per-step arrival pattern.
+
+    The client always sends exactly one waypoint per 1 ms cycle. ``arrivals[k]``
+    is how many of those waypoints the *physics* thread finds already published
+    when step ``k`` runs -- a conforming client on a lockstep box gives
+    ``[1, 1, 1, ...]``, two independent ~1 kHz clocks beating against each other
+    give runs of ``[0, 2]``. Either way the same waypoints are applied, in the
+    same order, over the same number of steps: only the arrival bookkeeping
+    differs.
+
+    Returns ``(torques, errors)``: the arm torque applied on each step, and each
+    step's tracking error against the waypoint that was current when it ran.
+    """
+    waypoints = _ramp_waypoints(sum(arrivals))
+    simulator.set_control_mode(ControlMode.POSITION)
+    q_c = ARM_INITIAL_Q.copy()
+    simulator.update_joint_positions(q_c)
+
+    torques, errors = [], []
+    sent = 0
+    for count in arrivals:
+        if count:
+            sent += count
+            q_c = waypoints[sent - 1]
+            simulator.update_joint_positions(q_c)
+        commanded = q_c[BEAT_JOINT]
+        simulator.step(1)
+        torques.append(simulator.data.qfrc_applied[simulator.arm_dofs_idx].copy())
+        errors.append(simulator.get_robot_state()["q"][BEAT_JOINT] - commanded)
+    return np.array(torques), np.array(errors)
+
+
+def _saturated_fraction(torques):
+    """Share of steps where any joint's torque sat on the actuator rail."""
+    on_the_rail = np.isclose(np.abs(torques), FR3_FORCE_LIMITS, rtol=0, atol=1e-9)
+    return float(on_the_rail.any(axis=1).mean())
+
+
+def test_a_udp_physics_clock_beat_does_not_saturate_the_position_servo(sim_factory):
+    """The revert-and-fail pin for the one-step-difference feedforward.
+
+    Nothing synchronises the UDP receive thread with the physics thread, so a
+    step can see no new target or two of them. Differencing over one step
+    regardless makes ``dq_c`` alternate 0 / 2v, which at KD=450 and v=0.5 rad/s
+    is a +/-225 Nm square wave -- clipped on the +/-87 Nm rail on essentially
+    every step. With the interval counted properly, the identical stream
+    delivered on a ``[0, 2]`` beat produces the same steady ``dq_c = v`` the
+    lockstep delivery does, so neither run touches the rail and the tracking is
+    the same to within a hair.
+    """
+    lockstep_tau, lockstep_err = _stream_position_ramp(sim_factory(), [1] * BEAT_STEPS)
+    beat_tau, beat_err = _stream_position_ramp(sim_factory(), [0, 2] * (BEAT_STEPS // 2))
+
+    assert _saturated_fraction(lockstep_tau) == 0.0, "the lockstep baseline itself saturates"
+    assert _saturated_fraction(beat_tau) == 0.0, (
+        f"{_saturated_fraction(beat_tau):.1%} of the beat run's steps hit the "
+        "actuator rail; the feedforward is being differenced over the wrong interval"
+    )
+
+    lockstep_rms = float(np.sqrt(np.mean(lockstep_err**2)))
+    beat_rms = float(np.sqrt(np.mean(beat_err**2)))
+    assert beat_rms < 1.5 * lockstep_rms + 1e-4, (
+        f"beat tracking rms {beat_rms:.2e} rad is far worse than lockstep's "
+        f"{lockstep_rms:.2e} rad"
+    )
+    # Both are inside libfranka's own 6e-3 rad tracking guard, with room.
+    assert max(beat_rms, lockstep_rms) < 3e-3
+
+
+def test_the_feedforward_reads_the_same_velocity_lockstep_or_beat():
+    """The three behaviours the beat fix is defined by, on the class itself.
+
+    Pure arithmetic, no engine: a lockstep stream, the same stream on a
+    ``[0, 2]`` beat, and a target that stops changing.
+    """
+    dt = DEFAULT_DT
+    velocity = np.full(7, 0.5)
+    step_delta = velocity * dt
+
+    lockstep = PositionFeedforward(np.zeros(7))
+    target = np.zeros(7)
+    for _ in range(10):
+        target = target + step_delta
+        assert lockstep.step(target, dt) == pytest.approx(velocity)
+
+    beat = PositionFeedforward(np.zeros(7))
+    target = np.zeros(7)
+    seen = []
+    for _ in range(10):
+        seen.append(beat.step(target, dt).copy())  # nothing arrived this step
+        target = target + 2 * step_delta  # ...so two waypoints land before the next
+        seen.append(beat.step(target, dt).copy())
+    # The very first step of the run has no stream behind it yet, so it holds
+    # the reset's zero; from the first arrival onwards it reads the true v.
+    assert seen[0] == pytest.approx(np.zeros(7))
+    for dq_c in seen[1:]:
+        assert dq_c == pytest.approx(velocity)
+
+    # The stream stops: the held feedforward is gone within three steps and
+    # never comes back, so the servo settles onto the plain KP*e - KD*dq law.
+    for index in range(20):
+        dq_c = beat.step(target, dt)
+        if index >= POSITION_FEEDFORWARD_HOLD_STEPS - 1:
+            assert dq_c == pytest.approx(np.zeros(7)), f"still coasting at step {index}"
+
+
+def test_the_feedforward_spans_a_gap_longer_than_the_hold_window():
+    """A gap longer than ``POSITION_FEEDFORWARD_HOLD_STEPS`` must still be
+    differenced over its true span, not over 1 step.
+
+    Regression pin for the stale-drop branch: it must zero ``dq_c`` without
+    also resetting ``_unchanged_steps``, because ``self.previous`` already
+    equals ``target`` at that point -- resetting the counter would throw away
+    how many physics steps the gap actually spanned. Deriving the change
+    over the wrong (1-step) span would read the resumed target's velocity as
+    ``n`` times too fast for an ``n``-step gap: 3x at a 3-step gap, 6x here.
+    """
+    dt = DEFAULT_DT
+    velocity = np.full(7, 0.5)
+    gap_steps = 6  # longer than POSITION_FEEDFORWARD_HOLD_STEPS (3)
+    assert gap_steps > POSITION_FEEDFORWARD_HOLD_STEPS
+
+    ff = PositionFeedforward(np.zeros(7))
+    target = np.zeros(7)
+
+    # The target holds steady for gap_steps - 1 physics steps: the held
+    # feedforward must decay to zero by POSITION_FEEDFORWARD_HOLD_STEPS in,
+    # same as the shorter beat-recovery case above.
+    for index in range(gap_steps - 1):
+        dq_c = ff.step(target, dt)
+        if index >= POSITION_FEEDFORWARD_HOLD_STEPS - 1:
+            assert dq_c == pytest.approx(np.zeros(7)), f"still coasting at step {index}"
+
+    # A single arrival now carries the whole gap's worth of motion -- the
+    # mean velocity over the gap, not gap_steps times the true velocity.
+    target = target + gap_steps * velocity * dt
+    dq_c = ff.step(target, dt)
+    assert dq_c == pytest.approx(velocity), (
+        f"expected the gap-spanning velocity {velocity}, got {dq_c} -- the "
+        "stale-drop branch is resetting the unchanged-step counter"
+    )
+
+
+def test_the_duo_backend_shares_this_backends_feedforward(sim_factory):
+    """The two MuJoCo backends must not drift apart on the beat fix.
+
+    Structural pin: both drive the *same* PositionFeedforward class, so the
+    behaviour measured above is one implementation, not two. The duo runs its
+    own physics-level beat test (``test_mobile_duo_mujoco_sim.py``).
+    """
+    from franka_sim import mobile_duo_mujoco_sim
+
+    assert mobile_duo_mujoco_sim.PositionFeedforward is PositionFeedforward
+    assert isinstance(sim_factory()._position_feedforward, PositionFeedforward)
 
 
 def test_state_snapshot_is_swapped_not_mutated(sim):

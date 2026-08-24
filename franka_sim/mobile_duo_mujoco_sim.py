@@ -45,7 +45,10 @@ from franka_sim.mujoco_visuals import (
 )
 from franka_sim.sim_common import (
     FR3_FORCE_LIMITS,
+    PositionFeedforward,
     RealtimeFactorMonitor,
+    close_passive_viewer,
+    launch_passive_viewer,
     pose_to_column_major,
     resolve_fr3_joint_damping,
 )
@@ -306,6 +309,8 @@ class MobileDuoMujocoScene:
         self.model = None
         self.data = None
         self.viewer = None
+        #: The viewer's own render thread; see sim_common.close_passive_viewer.
+        self._viewer_thread = None
         self.running = False
         self.swerve: Optional[MujocoSwerveBase] = None
         self.arm_qpos_adr: Dict[str, np.ndarray] = {}
@@ -325,6 +330,18 @@ class MobileDuoMujocoScene:
         self.arm_torques = {role: np.zeros(7) for role in ARM_ROLES}
         self.arm_joint_positions = {role: ARM_INITIAL_Q.copy() for role in ARM_ROLES}
         self.arm_joint_velocities = {role: np.zeros(7) for role in ARM_ROLES}
+        # POSITION mode's velocity feedforward per role: the commanded velocity
+        # the damping term servos against, differenced over the number of
+        # physics steps the target actually took to change (see
+        # PositionFeedforward for why that is not the same as "one step").
+        # Seeded to the initial pose so the settle loop's constant target starts
+        # at dq_c = 0, and re-seeded by set_arm_control_mode() on every switch
+        # into POSITION mode for that role, so a stale baseline never produces a
+        # first-step spike. Identical law to the single-arm backend, from the
+        # same class -- the two must not drift apart.
+        self._arm_position_feedforward = {
+            role: PositionFeedforward(ARM_INITIAL_Q) for role in ARM_ROLES
+        }
 
         self._prev_dq = {role: np.zeros(7) for role in ROLES}
         self._ddq_filtered = {role: np.zeros(7) for role in ROLES}
@@ -567,6 +584,15 @@ class MobileDuoMujocoScene:
             raise ValueError(f"Mode must be a ControlMode enum, got {type(mode)}")
         logger.info("Arm %s control mode -> %s", role, mode.value)
         self.arm_control_modes[role] = mode
+        if mode == ControlMode.POSITION:
+            # Discontinuous-target entry point for this role (fresh Move into
+            # POSITION mode, or the idle hold, which sets the target to the
+            # current q before calling this): snap the feedforward baseline to
+            # whatever target is current right now -- and zero the held dq_c
+            # with it -- so the next physics step sees dq_c = 0 instead of
+            # differencing against, or coasting on, a baseline left over from an
+            # older streaming session or another mode.
+            self._arm_position_feedforward[role].reset(self.arm_joint_positions[role])
 
     def update_arm_torques(self, role: str, torques) -> None:
         """Publish one arm's commanded torques."""
@@ -610,6 +636,20 @@ class MobileDuoMujocoScene:
         Gravity is not part of this: ``body_gravcomp`` already cancels it, so
         TORQUE mode passes the client's command through unchanged -- the same
         contract the real FCI offers.
+
+        POSITION mode's damping term is not plain ``-KD*dq``: undamped, it
+        damps against zero velocity, so it fights any commanded motion and
+        adds a ``(KD/KP)*qdot`` lag behind the target -- enough on its own to
+        fail libfranka's tracking guard (RMSE(q, q_c) < 6e-3 rad) on an
+        ordinary point-to-point motion. Instead it damps against the commanded
+        velocity ``dq_c``, produced once per physics step per role by
+        :class:`~franka_sim.sim_common.PositionFeedforward`: a backward
+        difference of the target taken over the number of steps it took to
+        change, held across the steps where nothing arrived, and dropped to
+        zero once the stream stops. A held target -> dq_c = 0 -> identical to
+        the old law. A target that jumps (teleport) produces one step of large
+        dq_c; the FR3_FORCE_LIMITS clip below is what bounds that, same as it
+        already bounds every other mode.
         """
         mode = self.arm_control_modes[role]
         if mode == ControlMode.TORQUE:
@@ -619,8 +659,10 @@ class MobileDuoMujocoScene:
             dofs = self.arm_dofs_idx[role]
             dq = self.data.qvel[dofs]
             if mode == ControlMode.POSITION:
-                error = self.arm_joint_positions[role] - self.data.qpos[qpos_adr]
-                tau = ARM_POSITION_KP * error - ARM_POSITION_KD * dq
+                target = self.arm_joint_positions[role]
+                dq_c = self._arm_position_feedforward[role].step(target, self.dt)
+                error = target - self.data.qpos[qpos_adr]
+                tau = ARM_POSITION_KP * error + ARM_POSITION_KD * (dq_c - dq)
             else:
                 tau = ARM_VELOCITY_KV * (self.arm_joint_velocities[role] - dq)
         return np.clip(tau, -FR3_FORCE_LIMITS, FR3_FORCE_LIMITS)
@@ -747,23 +789,22 @@ class MobileDuoMujocoScene:
             self.initialize_simulation()
 
         if self.enable_vis and self.viewer is None:
-            import mujoco.viewer
-
             log_gl_renderer()
-            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self.viewer, self._viewer_thread = launch_passive_viewer(self.model, self.data)
 
         self.running = True
         self.run_simulation()
 
     def stop(self) -> None:
-        """Stop the loop, close the viewer and remove the generated URDF copy."""
+        """Stop the loop, close the viewer and remove the generated URDF copy.
+
+        Idempotent: a second call is a no-op.
+        """
         self.running = False
-        if self.viewer is not None:
-            try:
-                self.viewer.close()
-            except Exception:
-                logger.exception("Error closing the MuJoCo viewer")
-            self.viewer = None
+        viewer, self.viewer = self.viewer, None
+        thread, self._viewer_thread = self._viewer_thread, None
+        if viewer is not None:
+            close_passive_viewer(viewer, thread, logger)
         if self._resolved_urdf is not None:
             Path(self._resolved_urdf).unlink(missing_ok=True)
             self._resolved_urdf = None

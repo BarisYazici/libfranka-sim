@@ -17,4 +17,15 @@ class ControlMode(Enum):
     VELOCITY = "velocity"
     TORQUE = "torque"
     STEERING_DRIVE = "steering_drive"  # mobile base: steering=position, drive=velocity
+    #: ``kCartesianPosition`` on an arm role. **Checking-only.** No physics
+    #: backend is ever put into this mode -- the arm stays inert on the pose
+    #: interface -- but the commanded ``O_T_EE_c``/``elbow_c`` stream is
+    #: differentiated and judged exactly as the robot judges it, so a client
+    #: that steps its pose gets the hardware error instead of silence. See
+    #: :meth:`franka_sim.motion_limits.MotionLimitChecker._check_cartesian_pose`.
+    CARTESIAN_POSE = "cartesian_pose"
+    #: ``kCartesianVelocity`` on an *arm* role. Checking-only for the same
+    #: reason; the mobile base's own twist generator is
+    #: :attr:`STEERING_DRIVE`, which is driven for real.
+    CARTESIAN_VELOCITY = "cartesian_velocity"
     NONE = "none"

@@ -2,7 +2,10 @@
 import argparse
 import importlib
 import logging
+import os
 import sys
+import threading
+import time
 from typing import Optional
 
 from franka_sim.franka_protocol import COMMAND_PORT
@@ -10,6 +13,27 @@ from franka_sim.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
 
 # Configure logging to silence Numba debug output
 logging.getLogger("numba").setLevel(logging.WARNING)
+
+#: How long the whole shutdown -- stop() plus the interpreter's own exit, atexit
+#: hooks and all -- may take before the process is forced out. Every stage of
+#: stop() is individually bounded well below this; the margin covers the part of
+#: the process' life that is not ours to bound. See :func:`_arm_exit_watchdog`.
+#:
+#: Sized for the mobile-duo worst case, which is the slowest shutdown this
+#: module drives: ``MobileDuoRunner.stop()`` (``mobile_duo_runner.py``) stops
+#: its three FCI bridges (arms + base) one at a time, then the shared scene.
+#: Each bridge's own ``FrankaSimServer.stop()``/``cleanup()`` sums to roughly
+#: 2.2 s in its own internal, individually-bounded waits -- ``cleanup()``'s
+#: 0.1 s settle sleep, ``_stop_gripper``'s ``GRIPPER_JOIN_TIMEOUT_S`` (1.0 s),
+#: and ``handle_client``'s ``tcp_thread.join(timeout=1.0)`` -- underneath the
+#: 3.0 s outer join ``MobileDuoRunner.stop()`` itself applies per bridge, so
+#: three bridges cost up to ``3 * 3.0 = 9.0`` s in the worst case where every
+#: internal bound is actually hit. The shared scene's viewer teardown adds
+#: ``VIEWER_CLOSE_TIMEOUT_S`` (``sim_common.py``, 2.0 s) on top of that. 5.0 s
+#: was already tight for a *single*-role server and comfortably too short for
+#: three bridges plus a viewer (up to ``9.0 + 2.0 = 11.0`` s); 15.0 s leaves a
+#: margin above even that worst case.
+SHUTDOWN_WATCHDOG_S = 15.0
 
 #: Mobile-duo physics backends, mapped to the module and class implementing the
 #: scene contract MobileDuoRunner consumes. Imported lazily in
@@ -24,6 +48,67 @@ MOBILE_DUO_PHYSICS = {
 #: and the mobile duo alike. MuJoCo holds real time at the 1 ms step the FCI
 #: serves, where Genesis needs 2.5 ms and still falls behind in the duo scene.
 DEFAULT_PHYSICS = "mujoco"
+
+
+def _arm_exit_watchdog(timeout: float = SHUTDOWN_WATCHDOG_S) -> None:
+    """Last resort: force the process out if shutdown wedges past ``timeout``.
+
+    Not the shutdown mechanism -- everything in ``stop()`` is ordered, bounded
+    and joined -- but the tail of the process' life is not ours to bound. The
+    MuJoCo viewer leaves GL/driver ``atexit`` hooks behind, and a deadlock in
+    those runs entirely in C: no Python bytecode executes again, so the pending
+    SIGINT is never delivered to a handler and further Ctrl+C presses do
+    nothing at all. Only an independent thread can get the process out of that,
+    and only ``os._exit`` (no atexit, no finalisation) can do it without
+    re-entering the very code that is stuck.
+
+    A daemon thread, so it never delays a shutdown that does complete: if the
+    process exits first, this thread simply dies with it and nothing is printed.
+    """
+
+    def _bail():
+        time.sleep(timeout)
+        _force_exit(
+            f"Shutdown did not finish within {timeout:.0f}s (stuck in native "
+            "teardown); forcing exit."
+        )
+
+    threading.Thread(target=_bail, name="shutdown-watchdog", daemon=True).start()
+
+
+def _force_exit(message: str, code: int = 130) -> None:
+    """Print ``message`` and leave immediately, skipping interpreter shutdown.
+
+    ``os._exit`` runs no atexit hook and flushes no buffer, so anything still
+    sitting in stdout's buffer (``print`` is block-buffered when stdout is a
+    pipe rather than a terminal) would be lost -- including the "Shutting down
+    server..." line the user is looking at. Flush first, then go.
+    """
+    try:
+        print(message, file=sys.stderr, flush=True)
+        sys.stdout.flush()
+    except Exception:  # pragma: no cover - the streams may already be gone
+        pass
+    os._exit(code)
+
+
+def _shutdown(stoppable) -> None:
+    """Run ``stoppable.stop()`` under the shutdown watchdog, absorbing a re-interrupt.
+
+    A second Ctrl+C almost always lands here, because this is where the
+    shutdown time is spent. Left alone it raises KeyboardInterrupt out of the
+    middle of teardown -- a traceback on top of the shutdown log, and whatever
+    had not been released yet (the listening socket, the viewer's GL context)
+    left dangling. Catching it turns the second press into what the user meant
+    by it: leave now.
+    """
+    _arm_exit_watchdog()
+    try:
+        stoppable.stop()
+    except KeyboardInterrupt:
+        _force_exit("\nInterrupted during shutdown; exiting now.")
+    except Exception:
+        logging.getLogger(__name__).exception("Error during shutdown")
 
 
 def resolve_scene_class(physics: str):
@@ -68,8 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Abort a motion with communication_constraints_violation after 20 "
         "consecutively lost command cycles, as the real FCI does. Off by "
         "default; packet loss is tracked and reported in "
-        "control_command_success_rate either way, and a missed cycle holds the "
-        "last command. Same as "
+        "control_command_success_rate either way, and a missed motion-generator "
+        "cycle is extrapolated (a missed torque cycle is held). Same as "
         "setting FRANKA_SIM_ENFORCE_COMM_CONSTRAINTS=1; pass "
         "--no-enforce-comm-constraints to force it off even when that is set",
     )
@@ -238,8 +323,12 @@ def run_mobile_duo(args) -> None:
     try:
         runner.run_forever()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
-        runner.stop()
+        print("\nShutting down server...", flush=True)
+    finally:
+        # finally, not just the KeyboardInterrupt path: the run loop also ends
+        # when the viewer window is closed, and that exit has exactly the same
+        # resources to release.
+        _shutdown(runner)
 
 
 def run_single_arm(args) -> None:
@@ -263,8 +352,12 @@ def run_single_arm(args) -> None:
     try:
         server.start()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
-        server.stop()
+        print("\nShutting down server...", flush=True)
+    finally:
+        # finally, not just the KeyboardInterrupt path: start() also returns
+        # normally when the viewer window is closed, and that exit leaves the
+        # same sockets bound and the same GL context alive.
+        _shutdown(server)
 
 
 def main():
@@ -285,10 +378,19 @@ def main():
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)
 
-    if args.mobile_duo:
-        run_mobile_duo(args)
-    else:
-        run_single_arm(args)
+    try:
+        if args.mobile_duo:
+            run_mobile_duo(args)
+        else:
+            run_single_arm(args)
+    except KeyboardInterrupt:
+        # A Ctrl+C that landed in the narrow gaps the shutdown path cannot
+        # catch itself -- inside the handler that announces the shutdown, or
+        # just after it finished. The teardown has already run (it is in a
+        # finally block); all that is left is to exit with the conventional
+        # interrupted status instead of dumping a traceback the user can do
+        # nothing about.
+        sys.exit(130)
 
 
 if __name__ == "__main__":
