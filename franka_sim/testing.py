@@ -13,6 +13,8 @@ port (so parallel CI jobs on one machine never collide), waits until the
 server passes the real-handshake readiness probe (`franka_sim.health_check`),
 and tears the process down at the end of the session. It is session-scoped:
 one simulated robot serves the whole suite, exactly as one real robot would.
+The server's log is written to a temp file (``franka_sim_server.log_path``)
+rather than a pipe, so a chatty server can never block on an unread pipe.
 
 The co-located gripper server is disabled by default because its port (1338)
 is fixed by the libfranka gripper protocol and would collide across parallel
@@ -22,6 +24,10 @@ dropping ``--no-gripper`` re-enables it on port 1338::
     @pytest.fixture(scope="session")
     def franka_sim_server_args():
         return []  # gripper on; don't run two such sessions on one machine
+
+Known limit: the subprocess runs in its own session (signals aimed at pytest
+must not hit it), so if pytest itself is SIGKILLed the server outlives it and
+keeps its port until killed by hand.
 """
 
 import os
@@ -29,6 +35,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
@@ -46,6 +54,10 @@ DEFAULT_STARTUP_TIMEOUT_S = 180.0
 #: SIGKILL only ever reaps a process wedged beyond its last-resort exit.
 DEFAULT_STOP_GRACE_S = 20.0
 
+#: Upper bound on one readiness attempt inside the startup loop; short enough
+#: that a child that dies mid-attempt is noticed promptly.
+_PROBE_SLICE_S = 5.0
+
 
 class FrankaSimStartupError(RuntimeError):
     """The franka-sim subprocess never became ready; carries its output tail."""
@@ -58,6 +70,7 @@ class FrankaSimProcess:
     host: str
     port: int
     process: subprocess.Popen = field(repr=False)
+    log_path: Optional[str] = None
 
     @property
     def address(self) -> str:
@@ -68,12 +81,13 @@ class FrankaSimProcess:
 def free_tcp_port() -> int:
     """Pick a TCP port that is free right now.
 
+    Binds the wildcard address because that is what the server itself binds.
     The classic bind-close-reuse race is possible but vanishingly rare in
     practice, and the readiness probe turns a lost race into a clear startup
     failure rather than a hang.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind(("", 0))
         return sock.getsockname()[1]
 
 
@@ -86,8 +100,9 @@ def start_server(
     """Launch a franka-sim server subprocess and wait until it serves the FCI.
 
     Raises FrankaSimStartupError (with the process output tail) if the server
-    exits early or never passes the readiness probe. ``_command`` replaces the
-    whole command line and exists for this module's own tests.
+    exits early or never passes the readiness probe; the subprocess is never
+    left running on failure. ``_command`` replaces the whole command line and
+    exists for this module's own tests.
     """
     if port is None:
         port = free_tcp_port()
@@ -99,24 +114,53 @@ def start_server(
         str(port),
         *extra_args,
     ]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,  # its own process group: signals never leak to pytest
+    # A file, not a pipe: nothing reads the server's output while tests run,
+    # and a filled pipe would block the server's logging — including the 1 kHz
+    # state-broadcast thread — wedging the whole simulation mid-session.
+    log_file = tempfile.NamedTemporaryFile(
+        mode="w", prefix="franka-sim-", suffix=".log", delete=False
     )
-    server = FrankaSimProcess(host="127.0.0.1", port=port, process=process)
-    try:
-        check_server(server.host, server.port, timeout=timeout)
-    except HealthCheckError as exc:
-        stop_server(server, grace=5.0)
-        tail = _drain_output(process)
-        raise FrankaSimStartupError(
-            f"franka-sim server on port {port} did not become ready: {exc}\n"
-            f"--- server output ---\n{tail}"
-        ) from exc
-    return server
+    with log_file:
+        process = subprocess.Popen(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,  # its own process group: signals never leak to pytest
+        )
+    server = FrankaSimProcess(host="127.0.0.1", port=port, process=process, log_path=log_file.name)
+
+    deadline = time.monotonic() + timeout
+    last_probe_error: Optional[Exception] = None
+    while True:
+        if process.poll() is not None:
+            # Fail fast: a dead child will not come up however long we wait.
+            raise FrankaSimStartupError(
+                f"franka-sim server on port {port} exited with code "
+                f"{process.returncode} before becoming ready\n"
+                f"--- server output ({server.log_path}) ---\n{_log_tail(server.log_path)}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stop_server(server, grace=5.0)
+            raise FrankaSimStartupError(
+                f"franka-sim server on port {port} did not become ready within "
+                f"{timeout:.0f}s (last probe error: {last_probe_error})\n"
+                f"--- server output ({server.log_path}) ---\n{_log_tail(server.log_path)}"
+            )
+        try:
+            check_server(server.host, server.port, timeout=min(_PROBE_SLICE_S, remaining))
+            return server
+        except HealthCheckError as exc:
+            last_probe_error = exc
+        except Exception as exc:
+            # A probe bug or a garbled response must still not leak the child.
+            stop_server(server, grace=5.0)
+            raise FrankaSimStartupError(
+                f"readiness probe failed unexpectedly for the franka-sim server on "
+                f"port {port}: {exc!r}\n"
+                f"--- server output ({server.log_path}) ---\n{_log_tail(server.log_path)}"
+            ) from exc
 
 
 def stop_server(server: FrankaSimProcess, grace: float = DEFAULT_STOP_GRACE_S) -> None:
@@ -129,7 +173,12 @@ def stop_server(server: FrankaSimProcess, grace: float = DEFAULT_STOP_GRACE_S) -
         process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         _signal_group(process, signal.SIGKILL)
-        process.wait(timeout=5.0)
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            # SIGKILL was delivered; reaping is now the OS's problem. Do not
+            # let teardown die over it.
+            pass
 
 
 def _signal_group(process: subprocess.Popen, sig: int) -> None:
@@ -143,15 +192,15 @@ def _signal_group(process: subprocess.Popen, sig: int) -> None:
             pass
 
 
-def _drain_output(process: subprocess.Popen, limit: int = 8000) -> str:
-    """Return the tail of the (now dead or dying) process' combined output."""
-    if process.stdout is None:
+def _log_tail(log_path: Optional[str], limit: int = 8000) -> str:
+    """Return the tail of the server's log file."""
+    if not log_path:
         return "<output not captured>"
     try:
-        output = process.stdout.read() or ""
-    except Exception:
-        return "<output unavailable>"
-    return output[-limit:]
+        with open(log_path, "r", errors="replace") as handle:
+            return handle.read()[-limit:]
+    except OSError:
+        return f"<could not read {log_path}>"
 
 
 @pytest.fixture(scope="session")

@@ -21,6 +21,7 @@ inputs:
     description: >-
       Extra run-franka-sim-server arguments, e.g.
       "--enforce-comm-constraints --enforce-motion-limits" or "--no-gripper".
+      Word-split as shell arguments.
     required: false
     default: ''
   port:
@@ -52,31 +53,47 @@ runs:
   steps:
     - name: Start franka-sim container
       shell: bash
+      # Inputs come in through env, not ${{ }} interpolation into the script:
+      # a repo-controlled value must never be able to inject shell into a
+      # user's runner. SERVER_ARGS is word-split on purpose (it is an argv
+      # tail); unquoted expansion splits words but executes nothing.
+      env:
+        FS_IMAGE: ${{ inputs.image }}
+        FS_TAG: ${{ inputs.tag }}
+        FS_NAME: ${{ inputs.container-name }}
+        SERVER_ARGS: ${{ inputs.args }}
       run: |
         # Host networking on purpose: the FCI is a 1 kHz UDP loop; publishing
         # ports would put Docker's NAT in the middle of it.
-        docker run -d --network host --name '${{ inputs.container-name }}' \
-          '${{ inputs.image }}:${{ inputs.tag }}' ${{ inputs.args }}
+        docker rm -f "$FS_NAME" 2>/dev/null || true
+        docker run -d --network host --name "$FS_NAME" "$FS_IMAGE:$FS_TAG" $SERVER_ARGS
 
     - name: Wait until the server serves the FCI
       shell: bash
+      env:
+        FS_NAME: ${{ inputs.container-name }}
+        FS_PORT: ${{ inputs.port }}
+        FS_WAIT: ${{ inputs.wait-timeout }}
       run: |
+        # Validate before use: these land in arithmetic context, where bash
+        # would otherwise evaluate hostile content.
+        [[ "$FS_PORT" =~ ^[0-9]+$ ]] || { echo "::error::port must be an integer, got '$FS_PORT'"; exit 1; }
+        [[ "$FS_WAIT" =~ ^[0-9]+$ ]] || { echo "::error::wait-timeout must be an integer, got '$FS_WAIT'"; exit 1; }
         # franka-sim-check performs a real Connect handshake and waits for a
         # RobotState datagram; it retries internally until the timeout. The
         # outer loop only covers the moments before the container's PID 1 can
         # be exec'd into. One-shot by design: the probe briefly occupies the
         # single FCI client slot, so it must not run periodically.
-        name='${{ inputs.container-name }}'
-        deadline=$(( $(date +%s) + ${{ inputs.wait-timeout }} ))
-        until docker exec "$name" franka-sim-check \
-              --port '${{ inputs.port }}' \
+        deadline=$(( $(date +%s) + FS_WAIT ))
+        until docker exec "$FS_NAME" franka-sim-check \
+              --port "$FS_PORT" \
               --timeout $(( deadline - $(date +%s) > 1 ? deadline - $(date +%s) : 1 )); do
           if [ "$(date +%s)" -ge "$deadline" ] || \
-             [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]; then
+             [ "$(docker inspect -f '{{.State.Running}}' "$FS_NAME" 2>/dev/null)" != "true" ]; then
             echo '::error::franka-sim server did not become ready; container logs follow'
-            docker logs "$name" || true
+            docker logs "$FS_NAME" || true
             exit 1
           fi
           sleep 2
         done
-        echo "franka-sim ready on 127.0.0.1:${{ inputs.port }}"
+        echo "franka-sim ready on 127.0.0.1:$FS_PORT"

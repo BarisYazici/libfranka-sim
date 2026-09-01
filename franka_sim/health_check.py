@@ -5,13 +5,13 @@ over TCP and then waits for one RobotState datagram on UDP, so a passing check
 means the server is actually serving the FCI — accepting clients, agreeing on
 the protocol version and streaming state — not merely holding the port open.
 
-Used as the Docker image's ``HEALTHCHECK``, as the GitHub Action's readiness
+Used as the Docker image's readiness gate, as the GitHub Action's readiness
 wait, and directly in user CI via the ``franka-sim-check`` console script::
 
     franka-sim-check --host 127.0.0.1 --port 1337 --timeout 30
 
 Exit code 0 means healthy; 1 means the server could not be reached, refused
-the handshake or never streamed a state within the timeout.
+or garbled the handshake, or never streamed a state within the timeout.
 
 Note: the probe occupies the server's single FCI client slot while it runs
 (a fraction of a second), exactly like a real ``franka::Robot`` connection.
@@ -34,6 +34,10 @@ PROTOCOL_VERSION = 10
 #: 12-byte MessageHeader + struct.pack("<HH", version, udp_port).
 _CONNECT_REQUEST_SIZE = 12 + 4
 
+#: Header (12) + status uint8 + version uint16: the least a well-formed
+#: Connect response can be.
+_MIN_CONNECT_RESPONSE_SIZE = 12 + 3
+
 
 class HealthCheckError(Exception):
     """The server failed the probe; the message says at which stage."""
@@ -47,11 +51,12 @@ class HealthReport:
     state_bytes: int
 
 
-def _recv_exactly(sock: socket.socket, count: int, what: str) -> bytes:
-    """Read exactly ``count`` bytes or raise HealthCheckError."""
+def _recv_exactly(sock: socket.socket, count: int, deadline: float, what: str) -> bytes:
+    """Read exactly ``count`` bytes before ``deadline`` or raise HealthCheckError."""
     chunks = []
     remaining = count
     while remaining > 0:
+        sock.settimeout(_remaining_or_raise(deadline, f"reading {what}"))
         try:
             chunk = sock.recv(remaining)
         except socket.timeout as exc:
@@ -74,7 +79,9 @@ def check_server(
 
     ``timeout`` bounds the whole probe: TCP connect retries (the server may
     still be starting up), the Connect exchange, and the wait for the first
-    RobotState datagram.
+    RobotState datagram. Every failure mode — unreachable, refused, malformed
+    response, silent UDP — surfaces as HealthCheckError; no other exception
+    escapes short of a bug.
     """
     deadline = time.monotonic() + timeout
 
@@ -85,8 +92,7 @@ def check_server(
             udp.bind(("", 0))
             udp_port = udp.getsockname()[1]
 
-            _remaining_or_raise(deadline, "performing the Connect handshake")
-            tcp.settimeout(max(0.1, deadline - time.monotonic()))
+            tcp.settimeout(_remaining_or_raise(deadline, "sending the Connect request"))
             payload = struct.pack("<HH", PROTOCOL_VERSION, udp_port)
             header = MessageHeader(
                 command=Command.kConnect, command_id=1, size=_CONNECT_REQUEST_SIZE
@@ -96,8 +102,20 @@ def check_server(
             except OSError as exc:
                 raise HealthCheckError(f"failed to send Connect request: {exc}") from exc
 
-            response_header = MessageHeader.from_bytes(_recv_exactly(tcp, 12, "Connect header"))
-            body = _recv_exactly(tcp, response_header.size - 12, "Connect response")
+            raw_header = _recv_exactly(tcp, 12, deadline, "Connect response header")
+            try:
+                response_header = MessageHeader.from_bytes(raw_header)
+            except (ValueError, struct.error) as exc:
+                raise HealthCheckError(
+                    f"malformed Connect response header (is {host}:{port} really a "
+                    f"franka-sim / FCI port?): {exc}"
+                ) from exc
+            if response_header.size < _MIN_CONNECT_RESPONSE_SIZE:
+                raise HealthCheckError(
+                    f"Connect response claims {response_header.size} bytes, less than "
+                    f"the minimum well-formed response ({_MIN_CONNECT_RESPONSE_SIZE})"
+                )
+            body = _recv_exactly(tcp, response_header.size - 12, deadline, "Connect response body")
             status, server_version = struct.unpack("<BH", body[:3])
             if status != ConnectStatus.kSuccess:
                 raise HealthCheckError(
@@ -105,22 +123,38 @@ def check_server(
                     f"(status={status}, server version={server_version})"
                 )
 
-            udp.settimeout(max(0.1, deadline - time.monotonic()))
-            try:
-                datagram, _ = udp.recvfrom(65535)
-            except socket.timeout as exc:
-                raise HealthCheckError(
-                    "handshake succeeded but no RobotState datagram arrived on UDP "
-                    f"port {udp_port} before the timeout"
-                ) from exc
-
-            return HealthReport(server_version=server_version, state_bytes=len(datagram))
+            state_bytes = _await_robot_state(udp, tcp, deadline, udp_port)
+            return HealthReport(server_version=server_version, state_bytes=state_bytes)
         finally:
             udp.close()
     finally:
         # Close abruptly rather than half-shutdown: the server treats a closed
         # command socket as the client leaving, which is what we are.
         tcp.close()
+
+
+def _await_robot_state(
+    udp: socket.socket, tcp: socket.socket, deadline: float, udp_port: int
+) -> int:
+    """Wait for a RobotState datagram from the server we handshook with.
+
+    Datagrams from any other sender (a stray packet on an unprivileged UDP
+    port must not green-light the probe) are discarded and the wait continues.
+    """
+    server_ip = tcp.getpeername()[0]
+    while True:
+        udp.settimeout(
+            _remaining_or_raise(deadline, f"waiting for a RobotState datagram on UDP {udp_port}")
+        )
+        try:
+            datagram, sender = udp.recvfrom(65535)
+        except socket.timeout as exc:
+            raise HealthCheckError(
+                "handshake succeeded but no RobotState datagram arrived on UDP "
+                f"port {udp_port} before the timeout"
+            ) from exc
+        if sender[0] == server_ip and datagram:
+            return len(datagram)
 
 
 def _remaining_or_raise(deadline: float, doing: str) -> float:

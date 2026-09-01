@@ -18,8 +18,10 @@ from franka_sim.franka_protocol import COMMAND_PORT  # noqa: E402
 
 # The shipped pytest plugin normally loads through the pytest11 entry point of
 # an installed franka-sim; when running the suite from a source checkout the
-# checkout shadows the install, so load it explicitly. pytest skips this if the
-# entry point already registered it.
+# checkout shadows the install, so load it explicitly. Must match the entry
+# point's NAME exactly ("franka_sim.testing" in pyproject.toml): pytest dedupes
+# by registration name, so the same name is skipped when already loaded, while
+# a different name for the same module makes pluggy raise before collection.
 pytest_plugins = ["franka_sim.testing"]
 
 # Configure logging

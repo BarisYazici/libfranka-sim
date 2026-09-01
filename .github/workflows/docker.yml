@@ -40,7 +40,7 @@ jobs:
           # v1.0.0-4-g523fc48 -> 1.0.0.post4+g523fc48, bare sha -> 0.0.0+g<sha>
           raw=$(git describe --tags --always)
           case "$raw" in
-            v[0-9]*|[0-9]*)
+            *.*)  # a version tag (bare `--always` shas never contain a dot)
               version=$(echo "$raw" | sed -E 's/^v//; s/-([0-9]+)-g([0-9a-f]+)$/.post\1+g\2/') ;;
             *)
               version="0.0.0+g$raw" ;;
@@ -61,10 +61,16 @@ jobs:
           tag: ci
           args: '--enforce-comm-constraints --enforce-motion-limits'
 
+      # The runner's system python is PEP 668 externally-managed; use
+      # setup-python so pip install works and the console script lands on PATH.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Probe the server from the host, as a user's job would
         run: |
-          python3 -m pip install --quiet .
-          python3 -m franka_sim.health_check --host 127.0.0.1 --port 1337 --timeout 30
+          python -m pip install --quiet .
+          franka-sim-check --host 127.0.0.1 --port 1337 --timeout 30
 
       - name: Server logs
         if: always()

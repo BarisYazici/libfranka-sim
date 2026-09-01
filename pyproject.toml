@@ -46,9 +46,14 @@ run-franka-spine-stub = "franka_sim.mobile.spine_stub:main"
 franka-sim-check = "franka_sim.health_check:main"
 
 # Auto-registers the franka_sim_server fixture in any project whose test env
-# has franka-sim installed (see franka_sim/testing.py).
+# has franka-sim installed (see franka_sim/testing.py). The entry-point name
+# deliberately equals the module path: pytest dedupes plugin registration by
+# name, so this repo's own conftest (pytest_plugins = ["franka_sim.testing"])
+# is a no-op when the entry point already loaded — any other name makes
+# pluggy raise "already registered under a different name" and kills every
+# pytest run of an installed checkout before collection.
 [project.entry-points.pytest11]
-franka_sim = "franka_sim.testing"
+"franka_sim.testing" = "franka_sim.testing"
 
 [project.optional-dependencies]
 dev = [
