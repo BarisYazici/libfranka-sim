@@ -1,0 +1,18 @@
+# Keep the image build context to what `pip install .` needs.
+.git
+.github
+.dockerignore
+Dockerfile
+docs
+site
+tests
+examples
+assets
+scripts
+*.egg-info
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.coverage
+mkdocs.yml
+install_hooks.sh

@@ -143,6 +143,35 @@ python -m franka_sim.run_server -v
 
 In your application, use standard libfranka commands. The simulation will respond exactly like the real robot.
 
+### Testing in CI (no robot required)
+
+Because the sim speaks the real wire protocol, your libfranka / franka_ros2 code can be
+regression-tested on every push. Three ways in — see the
+[Testing in CI guide](https://barisyazici.github.io/libfranka-sim/ci/) for details:
+
+```yaml
+# GitHub Actions: start a simulated FR3, then run your tests against 127.0.0.1
+- uses: BarisYazici/libfranka-sim@main
+  with:
+    args: '--enforce-comm-constraints --enforce-motion-limits'
+```
+
+```bash
+# Docker: self-contained image (models baked in, works offline)
+docker run -d --network host ghcr.io/barisyazici/franka-sim
+docker exec <container> franka-sim-check --timeout 30   # readiness gate
+```
+
+```python
+# pytest: `pip install franka-sim` ships a plugin; one server per session on a free port
+def test_my_controller(franka_sim_server):
+    connect_my_stack(franka_sim_server.host, franka_sim_server.port)
+```
+
+With `--enforce-comm-constraints` and `--enforce-motion-limits` the sim aborts motions the way
+the real FCI does (lost-cycle reflexes, discontinuity limits), so your error-recovery paths get
+exercised in CI instead of on hardware.
+
 ### Gripper (Franka Hand)
 
 The gripper server (libfranka gripper protocol, **TCP port 1338**) runs **by default** alongside

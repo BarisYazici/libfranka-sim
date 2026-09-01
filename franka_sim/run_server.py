@@ -208,7 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--port",
         type=int,
         default=COMMAND_PORT,
-        help=f"TCP command port for every bridge (default: {COMMAND_PORT})",
+        help="TCP command port: the single-arm server's, or every mobile-duo "
+        f"bridge's (default: {COMMAND_PORT})",
     )
     parser.add_argument(
         "--spine",
@@ -341,6 +342,7 @@ def run_single_arm(args) -> None:
     print("Press Ctrl+C to stop the server")
 
     server = FrankaSimServer(
+        port=args.port,
         enable_vis=args.vis,
         urdf_path=args.urdf,
         enable_gripper=not args.no_gripper,

@@ -16,6 +16,12 @@ sys.modules.setdefault("genesis", MagicMock())
 
 from franka_sim.franka_protocol import COMMAND_PORT  # noqa: E402
 
+# The shipped pytest plugin normally loads through the pytest11 entry point of
+# an installed franka-sim; when running the suite from a source checkout the
+# checkout shadows the install, so load it explicitly. pytest skips this if the
+# entry point already registered it.
+pytest_plugins = ["franka_sim.testing"]
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

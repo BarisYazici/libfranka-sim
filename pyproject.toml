@@ -43,6 +43,12 @@ classifiers = [
 [project.scripts]
 run-franka-sim-server = "franka_sim.run_server:main"
 run-franka-spine-stub = "franka_sim.mobile.spine_stub:main"
+franka-sim-check = "franka_sim.health_check:main"
+
+# Auto-registers the franka_sim_server fixture in any project whose test env
+# has franka-sim installed (see franka_sim/testing.py).
+[project.entry-points.pytest11]
+franka_sim = "franka_sim.testing"
 
 [project.optional-dependencies]
 dev = [

@@ -91,3 +91,4 @@ nav:
   - State &amp; command fidelity: robot-state.md
   - Mobile FR3 duo: mobile-duo.md
   - Physics backends: backends.md
+  - Testing in CI: ci.md

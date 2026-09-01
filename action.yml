@@ -1,0 +1,82 @@
+name: 'franka-sim server'
+description: >-
+  Start a headless franka-sim server (libfranka FCI simulator) in Docker and
+  wait until it serves the real wire protocol. Point any libfranka client or
+  franka_ros2 at 127.0.0.1 — no robot required.
+author: 'Baris Yazici'
+branding:
+  icon: 'cpu'
+  color: 'orange'
+
+inputs:
+  image:
+    description: 'Container image to run'
+    required: false
+    default: 'ghcr.io/barisyazici/franka-sim'
+  tag:
+    description: 'Image tag'
+    required: false
+    default: 'latest'
+  args:
+    description: >-
+      Extra run-franka-sim-server arguments, e.g.
+      "--enforce-comm-constraints --enforce-motion-limits" or "--no-gripper".
+    required: false
+    default: ''
+  port:
+    description: 'FCI command port the server is expected on (only change this if you also pass --port in args)'
+    required: false
+    default: '1337'
+  container-name:
+    description: 'Name for the started container (docker logs <name> to inspect it)'
+    required: false
+    default: 'franka-sim'
+  wait-timeout:
+    description: 'Seconds to wait for the server to pass the readiness handshake'
+    required: false
+    default: '90'
+
+outputs:
+  host:
+    description: 'Address the FCI is served on (host networking: 127.0.0.1)'
+    value: '127.0.0.1'
+  port:
+    description: 'FCI command port'
+    value: ${{ inputs.port }}
+  container-name:
+    description: 'Name of the running container'
+    value: ${{ inputs.container-name }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Start franka-sim container
+      shell: bash
+      run: |
+        # Host networking on purpose: the FCI is a 1 kHz UDP loop; publishing
+        # ports would put Docker's NAT in the middle of it.
+        docker run -d --network host --name '${{ inputs.container-name }}' \
+          '${{ inputs.image }}:${{ inputs.tag }}' ${{ inputs.args }}
+
+    - name: Wait until the server serves the FCI
+      shell: bash
+      run: |
+        # franka-sim-check performs a real Connect handshake and waits for a
+        # RobotState datagram; it retries internally until the timeout. The
+        # outer loop only covers the moments before the container's PID 1 can
+        # be exec'd into. One-shot by design: the probe briefly occupies the
+        # single FCI client slot, so it must not run periodically.
+        name='${{ inputs.container-name }}'
+        deadline=$(( $(date +%s) + ${{ inputs.wait-timeout }} ))
+        until docker exec "$name" franka-sim-check \
+              --port '${{ inputs.port }}' \
+              --timeout $(( deadline - $(date +%s) > 1 ? deadline - $(date +%s) : 1 )); do
+          if [ "$(date +%s)" -ge "$deadline" ] || \
+             [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]; then
+            echo '::error::franka-sim server did not become ready; container logs follow'
+            docker logs "$name" || true
+            exit 1
+          fi
+          sleep 2
+        done
+        echo "franka-sim ready on 127.0.0.1:${{ inputs.port }}"
