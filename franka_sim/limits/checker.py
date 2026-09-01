@@ -29,6 +29,7 @@ from franka_sim.limits.tables import (
     CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX,
     CARTESIAN_VELOCITY_VIOLATION_INDEX,
     CONTROLLER_TORQUE_DISCONTINUITY_INDEX,
+    ELBOW_POSITION_LIMITS,
     ERROR_NAMES,
     JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_POSITION_LIMITS_VIOLATION_INDEX,
@@ -1671,7 +1672,7 @@ class MotionLimitChecker:
            1.0 m z step -- 0.3859 m after libfranka's own 100 Hz command
            filter, i.e. 386 m/s and 385 871 m/s^2 in a single cycle -- come back
            as 19 rather than 18.
-        5. **The elbow's derivatives**, all three of which land on 17.
+        5. **The elbow's range and derivatives**, all four of which land on 17.
 
         Steps 4 and 5 never compete in any observed hardware case: a Cartesian
         motion that moves the elbow holds the pose still, and one that moves the
@@ -2017,23 +2018,50 @@ class MotionLimitChecker:
         return None
 
     def _check_elbow_limits(self, command: Dict[str, Any], cycles: int) -> Optional[Violation]:
-        """The elbow's velocity, acceleration and jerk, all three named 17.
+        """The elbow's range, velocity, acceleration and jerk, all four named 17.
 
         ``elbow[0]`` is a commanded *position* on both Cartesian interfaces, so
         its first difference is a velocity on either -- there is no
         interface-relative shift to apply, and the enum has no elbow
-        discontinuity name to shift onto: ``kMaxElbowVelocity``,
-        ``kMaxElbowAcceleration`` and ``kMaxElbowJerk`` all land on
-        ``cartesian_motion_generator_elbow_limit_violation``.
+        discontinuity name to shift onto: the range,
+        ``kMaxElbowVelocity``, ``kMaxElbowAcceleration`` and ``kMaxElbowJerk``
+        all land on ``cartesian_motion_generator_elbow_limit_violation``.
 
-        Franka's suite pins the velocity limit (a 0.3 rad/s^2 ramp that crosses
-        1.499 rad/s after ~5 s while acceleration stays at 0.3); nothing pins an
-        order between the three, so they are checked lowest-derivative first,
-        which is the order in which a ramp reaches them.
+        **The range first -- this sim's decision, not a hardware pin.** The
+        reference provocation cannot settle in-cycle precedence: it holds the
+        pose and integrates a constant ``ddelbow = 0.3`` rad/s^2 from
+        ``kElbowPose`` (``q[2] = -0.1229``), so the angle leaves joint 3's
+        range at ~4.49 s while the velocity is still at ~90% of its 1.499
+        rad/s cap (which it would cross only at ~5.00 s) -- no single cycle
+        ever breaks both. What the ramp *does* pin is when the abort lands:
+        the range fires it half a second earlier, half a second in which the
+        sim would otherwise be dispatching a commanded elbow that sits past a
+        joint stop. The in-cycle ordering itself is pinned by
+        ``test_a_cycle_that_breaks_range_and_velocity_reports_the_range``, so
+        changing it is a decision rather than an accident. Below the range,
+        the derivatives are checked lowest first, which is the order in which
+        a ramp reaches them; nothing pins an order among those three.
+
+        The opening elbow of a motion is not judged here at all (``_elbow_sign``
+        is still None): it has no derivatives yet, and its *value* is
+        :meth:`_check_elbow_validity`'s business -- an opening elbow has to be
+        the one the robot is actually in, which is inside joint 3's range by
+        construction.
         """
         if not command.get("valid_elbow") or self._elbow_sign is None:
             return None
         elbow = command["elbow_c"]
+        angle = float(elbow[0])
+        lower, upper = ELBOW_POSITION_LIMITS
+        if angle > upper or angle < lower:
+            return Violation(
+                CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX,
+                "elbow_c",
+                "angle",
+                angle,
+                upper if angle > upper else lower,
+                "rad",
+            )
         velocity, acceleration, jerk = self._elbow.derivatives([elbow[0]], cycles)
         checks = (
             (velocity, MAX_ELBOW_VELOCITY, "rad/s"),

@@ -56,6 +56,7 @@ from franka_sim.motion_limits import (
     CARTESIAN_VELOCITY_VIOLATION_INDEX,
     CONTROLLER_TORQUE_DISCONTINUITY_INDEX,
     DELTA_T,
+    ELBOW_POSITION_LIMITS,
     ENFORCE_ENV_VAR,
     JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_POSITION_LIMITS_VIOLATION_INDEX,
@@ -1072,6 +1073,210 @@ def test_an_elbow_ramp_past_its_velocity_limit_is_an_elbow_limit_violation():
     assert violation.error_name == "cartesian_motion_generator_elbow_limit_violation"
     assert violation.value == pytest.approx(velocity, rel=1e-9)
     assert violation.unit == "rad/s"
+
+
+#: The configuration Franka's suite moves to before it ramps the elbow
+#: (``kElbowPose`` in ``robot_test_fixture.h``). Its ``q[2]`` -- which *is* the
+#: elbow angle -- is -0.1229 rad, so the ramp below has 3.029 rad of joint 3 to
+#: cross before it reaches the stop. Nothing else about the configuration
+#: matters here; it is carried verbatim so the timings this section asserts are
+#: the timings of the motion hardware is actually provoked with.
+ELBOW_POSE = [
+    -0.34586229358400616,
+    8.678094880070006e-2,
+    -0.12285867662089212,
+    -1.9943087279456002,
+    4.36600598352296e-2,
+    2.150290316104889,
+    0.27794195308429853,
+]
+
+#: The ``ddelbow = 0.0003 / 0.001`` the reference elbow provocation integrates,
+#: in rad/s^2. Constant for the whole motion, and two orders of magnitude inside
+#: ``kMaxElbowAcceleration`` -- the ramp is deliberately gentle, so that what it
+#: eventually breaks is a bound on the elbow itself and not a discontinuity.
+ELBOW_RAMP_ACCELERATION = 0.3
+
+
+def test_an_elbow_at_joint_3s_stop_passes_and_a_hair_past_it_does_not():
+    """``elbow_c[0]`` is joint 3's angle, so joint 3's range is its range -> 17.
+
+    The same boundary
+    ``test_a_position_at_the_joint_limit_passes_and_a_hair_past_it_does_not``
+    pins for ``q_c``, on the one signal that reaches the same joint through a
+    different field -- and compared raw, with no margin of its own, exactly as
+    ``q_c`` is.
+    """
+    lower, upper = ELBOW_POSITION_LIMITS
+    assert (lower, upper) == JOINT_POSITION_LIMITS[2]
+
+    checker = pose_checker()
+    drive_elbow_history(checker, upper, 0.0, 0.0)
+    assert checker.check(elbow_command(5, upper), HOME) is None
+
+    violation = checker.check(elbow_command(5, upper + 1e-6), HOME)
+    assert violation.error_index == CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX
+    assert violation.error_name == "cartesian_motion_generator_elbow_limit_violation"
+    assert violation.limit == upper
+    assert violation.unit == "rad"
+
+    below = pose_checker()
+    drive_elbow_history(below, lower, 0.0, 0.0)
+    assert below.check(elbow_command(5, lower), HOME) is None
+    violation = below.check(elbow_command(5, lower - 1e-6), HOME)
+    assert violation.error_index == CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX
+    assert violation.limit == lower
+
+
+def test_the_reference_elbow_ramp_reaches_joint_3s_stop_before_its_velocity_cap():
+    """The whole hardware provocation, integrated -- and the range is what it hits.
+
+    Franka's suite moves to ``kElbowPose`` (:data:`ELBOW_POSE`), captures
+    ``elbow_d``, and from there integrates a constant
+    ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 into ``elbow[0]`` with the pose
+    held, until the robot aborts with
+    ``cartesian_motion_generator_elbow_limit_violation``.
+
+    Which of the elbow's bounds that ramp reaches first is arithmetic, and it is
+    the *range*: the angle grows as ``q[2] + 0.15 t^2`` and crosses joint 3's
+    +2.9065 rad stop at t ~ 4.49 s, while the velocity grows as ``0.3 t`` and
+    only reaches ``kMaxElbowVelocity`` (1.499 rad/s) at t ~ 5.00 s. Half a
+    second apart, and both are named 17 -- so the error name hardware returns
+    cannot tell them apart, but the *moment* it returns it can, and the range
+    check is what puts the sim's abort at the same place.
+
+    Without it the sim ran the commanded elbow on past joint 3's stop for
+    another half second, which is long enough for a differential-IK backend
+    driving the arm at that reference to raise an error of its own first --
+    ``joint_velocity_violation``, a name the client is not expecting.
+    """
+    checker = pose_checker(q=ELBOW_POSE)
+    angle = ELBOW_POSE[2]
+    opening = elbow_command(1, angle)
+    assert checker.check(opening, ELBOW_POSE) is None
+    checker.record(opening)
+
+    velocity = 0.0
+    violation = None
+    cycle = 0
+    for cycle in range(2, 8000):
+        velocity += ELBOW_RAMP_ACCELERATION * DELTA_T
+        angle += velocity * DELTA_T
+        commanded = elbow_command(cycle, angle)
+        violation = checker.check(commanded, ELBOW_POSE)
+        if violation is not None:
+            break
+        checker.record(commanded)
+
+    assert violation is not None, "the ramp never reached any elbow bound"
+    assert violation.error_index == CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX
+    assert violation.error_name == "cartesian_motion_generator_elbow_limit_violation"
+    # The range, not one of the derivatives: the elbow is past joint 3's stop
+    # while its velocity is still comfortably inside kMaxElbowVelocity.
+    assert violation.unit == "rad"
+    assert violation.limit == ELBOW_POSITION_LIMITS[1]
+    assert velocity < MAX_ELBOW_VELOCITY
+    assert cycle * DELTA_T == pytest.approx(4.49, abs=0.02)
+    # ...and the velocity cap the same ramp would have hit is half a second out.
+    assert MAX_ELBOW_VELOCITY / ELBOW_RAMP_ACCELERATION == pytest.approx(5.0, abs=0.01)
+
+
+def test_an_elbow_swept_up_to_joint_3s_stop_is_never_blamed_for_anything():
+    """The counterpart: a conforming elbow, all the way to the stop, runs clean.
+
+    A raised cosine from ``kElbowPose``'s own elbow to a hundredth of a radian
+    short of joint 3's upper stop, over five seconds -- peak velocity 0.95
+    rad/s (63% of its cap), peak acceleration 0.60 rad/s^2 and peak jerk 0.37
+    rad/s^3, every one of them inside its cap. A range check that fired anywhere on this would abort
+    the redundancy motions the elbow interface exists for.
+    """
+    checker = pose_checker(q=ELBOW_POSE)
+    start = ELBOW_POSE[2]
+    travel = ELBOW_POSITION_LIMITS[1] - 0.01 - start
+    cycles = 5000
+
+    for cycle in range(cycles + 1):
+        phase = math.pi * cycle / cycles
+        commanded = elbow_command(cycle + 1, start + travel * (1.0 - math.cos(phase)) / 2.0)
+        assert checker.check(commanded, ELBOW_POSE) is None, f"cycle {cycle} was blamed"
+        checker.record(commanded)
+
+
+def test_a_cycle_that_breaks_range_and_velocity_reports_the_range():
+    """Two pins in one cycle: the velocity interface runs the range check, and
+    the range wins when a single command breaks both it and a derivative.
+
+    Every other range test drives the pose generator, so this is what keeps
+    the ``_check_cartesian_velocity`` call to ``_check_elbow_limits`` from
+    being deletable -- and the final command jumps half a radian across the
+    stop, a step whose implied velocity is two orders of magnitude past
+    ``kMaxElbowVelocity``, so it also pins range-before-derivatives in-cycle
+    (which no hardware observation settles; see ``_check_elbow_limits``).
+    """
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.CARTESIAN_VELOCITY, robot_state_at(O_T_EE=pose()))
+
+    def vel_elbow(message_id, angle):
+        return command(
+            message_id=message_id,
+            O_dP_EE_c=[0.0] * 6,
+            elbow_c=[angle, HOME_ELBOW[1]],
+            valid_elbow=True,
+        )
+
+    opening = vel_elbow(1, HOME_ELBOW[0])
+    assert checker.check(opening, HOME) is None
+    checker.record(opening)
+
+    # Prime a quiet history just under the stop -- record() only, so the
+    # teleport from the opening elbow is never itself on trial.
+    upper = ELBOW_POSITION_LIMITS[1]
+    step = 2e-4
+    base = upper - 4 * step
+    for offset, waypoint in enumerate((base, base, base + step, base + 2 * step)):
+        checker.record(vel_elbow(offset + 2, waypoint))
+
+    violation = checker.check(vel_elbow(6, upper + 0.5), HOME)
+
+    assert violation is not None
+    assert violation.error_index == CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX
+    # The range verdict specifically -- rad against joint 3's stop -- not the
+    # velocity verdict the same step also earned.
+    assert violation.unit == "rad"
+    assert violation.limit == upper
+    assert violation.value == pytest.approx(upper + 0.5)
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_an_out_of_range_elbow_is_reported_always_and_refused_only_when_enforced(enforce, caplog):
+    """The gate every motion-limit violation goes through, on this one too.
+
+    The check itself is unconditional -- the verdict and the warning naming the
+    limit come back either way -- and only ``--enforce-motion-limits`` turns it
+    into a refusal, which is what keeps the sim the permissive channel a
+    scripted client drives.
+
+    The offending command steps half a millirad across the stop off a history
+    running at a steady 1 rad/s, so its velocity, acceleration and jerk are all
+    inside their caps: the *range* is the only bound it breaks, and the same
+    error name arriving by any other route would not be this feature.
+    """
+    upper = ELBOW_POSITION_LIMITS[1]
+    checker = pose_checker()
+    drive_elbow_history(checker, upper - 0.0005, 1.0, 0.0)
+
+    outcome = checker.absorb_command(
+        elbow_command(5, upper + 0.0005), HOME, fresh=True, enforce=enforce
+    )
+
+    assert outcome.violation.error_name == "cartesian_motion_generator_elbow_limit_violation"
+    assert outcome.accepted is not enforce
+    assert outcome.recorded is not enforce
+
+    with caplog.at_level(logging.WARNING, logger="franka_sim.motion_limits"):
+        checker.report(outcome.violation, enforced=enforce)
+    assert "cartesian_motion_generator_elbow_limit_violation" in caplog.text
+    assert ("(not enforced)" in caplog.text) is not enforce
 
 
 def test_an_elbow_less_motion_is_never_judged_on_its_zero_filled_elbow():
@@ -3611,6 +3816,53 @@ def test_an_extrapolated_command_is_not_dispatched_under_a_newer_motion(mock_phy
     # what covers that path, as it always was.
     server._dispatch_control_command(command(q_c=[0.42] * 7))
     assert server.robot_state.state["q_d"] == [0.42] * 7
+
+
+def test_enforced_an_out_of_range_elbow_latches_its_bit_in_the_robot_state(mock_physics_sim):
+    """17 reaches ``errors``/``reflex_reason`` like every other motion-limit abort.
+
+    In process rather than over the wire -- the abort path is
+    ``_absorb_within_motion_limits`` -> ``_latch_and_abort`` ->
+    ``_abort_with_error``, which is the identical sequence
+    ``test_enforced_a_violating_command_aborts_with_its_own_error_bit`` reads off
+    the socket, and the alternative here would be streaming four and a half
+    seconds of elbow ramp through a real one.
+
+    ``q`` is set on the published state because that is what
+    ``_absorb_within_motion_limits`` hands the checker as the measured
+    configuration, and the elbow is ``(q[2], sign(q[3]))``: the shared mock
+    reports an all-zeros ``q``, whose joint 4 sign is +1 and whose elbow no
+    conforming command could open a motion against. It is parked a microradian
+    short of joint 3's stop so that *one* conforming cycle of elbow motion
+    crosses it -- 2 mrad/s, 2 rad/s^2, every derivative far inside its cap, so
+    the range is the only bound broken and the abort cannot be the velocity
+    check wearing the same name.
+    """
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    upper = ELBOW_POSITION_LIMITS[1]
+    parked = list(HOME)
+    parked[2] = upper - 1e-6
+
+    server = FrankaSimServer(
+        physics_sim=mock_physics_sim, enable_gripper=False, enforce_motion_limits=True
+    )
+    server.robot_state.state["q"] = parked
+    server._motion_generation = 4
+    server.motion_limits.start_motion(
+        ControlMode.CARTESIAN_POSE, robot_state_at(q=parked, O_T_EE=pose()), motion_id=4
+    )
+
+    assert server._absorb_within_motion_limits(elbow_command(1, parked[2]), fresh=True)
+    accepted = server._absorb_within_motion_limits(elbow_command(2, upper + 1e-6), fresh=True)
+
+    assert accepted is False
+    latched = server.robot_state.state
+    assert latched["errors"][CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX] is True
+    assert latched["reflex_reason"][CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX] is True
+    assert sum(latched["errors"]) == 1, "exactly this bit, nothing else"
+    assert latched["robot_mode"] == RobotMode.kReflex
+    assert server.motion_limits.violated is True
 
 
 # --- layer 2: the server over the wire, with a mocked simulator --------------

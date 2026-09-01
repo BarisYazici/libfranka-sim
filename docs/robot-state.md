@@ -483,6 +483,7 @@ when a single cycle breaks both. See
 | Cartesian pose | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_velocity_discontinuity` (19) |
 | Cartesian pose | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
 | Cartesian pose | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
+| Cartesian pose / velocity | commanded `elbow_c[0]` in range | joint 3's own FR3 URDF range, ±2.9065 rad — `elbow[0]` *is* joint 3's angle, and this is the bound Franka's 0.3 rad/s² elbow ramp reaches first (at ~4.49 s, half a second before the velocity cap below) | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | Cartesian pose / velocity | elbow velocity, acceleration, jerk | `kMaxElbowVelocity` 1.5 − 1e−3 rad/s, `kMaxElbowAcceleration` 10 − 1e−3 rad/s², `kMaxElbowJerk` 5000 − 1e−3 rad/s³ | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | torque | \|τ\| | FR3 URDF `<limit effort=>`: 87/87/87/87/12/12/12 Nm | `tau_J_range_violation` (34) |
 | torque | \|dτ/dt\| | `kMaxTorqueRate` = 1000 − 1e−3 Nm/s | `controller_torque_discontinuity` (32) |

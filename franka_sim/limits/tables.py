@@ -89,7 +89,9 @@ MAX_ROTATIONAL_VELOCITY = (
 #: interfaces, so its first difference is a velocity on either -- there is no
 #: interface-relative shift for the elbow, and no elbow *discontinuity* name in
 #: the enum: every one of the three lands on
-#: :data:`CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX`.
+#: :data:`CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX`, and so does
+#: the range the position itself has to stay in
+#: (:data:`ELBOW_POSITION_LIMITS`).
 MAX_ELBOW_ACCELERATION = 10.0 - LIMIT_EPS
 MAX_ELBOW_JERK = 5000.0 - LIMIT_EPS
 MAX_ELBOW_VELOCITY = (
@@ -158,6 +160,32 @@ POSITION_BASED_VELOCITY_LIMITS = (
 #: Per-joint torque range, from ``<limit effort=>`` in
 #: ``franka_sim/models/fr3.urdf``: 87 Nm for joints 1-4, 12 Nm for 5-7.
 MAX_TORQUE = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
+
+#: ``(lower, upper)`` the commanded ``elbow_c[0]`` itself has to stay inside.
+#:
+#: Not a fourth number of its own: ``elbow[0]`` **is** joint 3's angle on a
+#: 7-DOF FR3 (see :meth:`MotionLimitChecker._robot_elbow`), so the redundancy
+#: angle's stop is joint 3's stop, and this is :data:`JOINT_POSITION_LIMITS`
+#: ``[2]`` under a name that says which signal reads it. Compared raw, with no
+#: margin, in the same exclusive form ``_check_joint_position_limits`` uses for
+#: ``q_c``: both are commanded joint angles judged against the ranges the URDF
+#: this server serves publishes. (Same form, not the same cycle coverage:
+#: ``q_c`` is judged from the opening command, while the elbow range starts on
+#: cycle 2 -- the opening elbow is ``_check_elbow_validity``'s business, and is
+#: only guaranteed in-range when a measured pose seeded that check.)
+#:
+#: **It is the bound the reference elbow provocation actually reaches.** That
+#: motion moves to ``kElbowPose`` (``q[2] = -0.1229``), holds ``O_T_EE_d`` and
+#: integrates a constant ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 into
+#: ``elbow[0]``, so the angle grows as ``q[2] + 0.15 t^2`` and the velocity as
+#: ``0.3 t``. The angle crosses +2.9065 rad at t ~ 4.49 s; the velocity reaches
+#: :data:`MAX_ELBOW_VELOCITY` (1.499 rad/s) only at t ~ 5.00 s. Both are named
+#: :data:`CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX`, so the name
+#: hardware returns does not separate them -- but half a second separates *when*
+#: they fire, and running the commanded elbow half a second past a joint stop is
+#: half a second in which a backend driving the arm at that reference raises an
+#: error of its own instead. Hence the range is checked before the derivatives.
+ELBOW_POSITION_LIMITS = JOINT_POSITION_LIMITS[2]
 
 # -- error indices ------------------------------------------------------------
 #
@@ -237,12 +265,16 @@ JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX = 15
 #: is a start-pose error, not a velocity discontinuity.
 CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX = 16
 
-#: ``kCartesianMotionGeneratorElbowLimitViolation`` (``error.h:26``) -- the
-#: elbow's velocity, acceleration and jerk limits, all three. The velocity one
-#: is observable on hardware: hold the pose and ramp the elbow at a constant
-#: ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2, so elbow velocity grows linearly
-#: and crosses :data:`MAX_ELBOW_VELOCITY` (1.499 rad/s) after ~5 s while
-#: acceleration stays at 0.3, far inside :data:`MAX_ELBOW_ACCELERATION`.
+#: ``kCartesianMotionGeneratorElbowLimitViolation`` (``error.h:26``) -- every
+#: bound the commanded elbow has: its range (:data:`ELBOW_POSITION_LIMITS`) and
+#: its velocity, acceleration and jerk limits alike. The observable provocation
+#: is one motion for all four: hold the pose and ramp the elbow at a constant
+#: ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 from ``kElbowPose``. Acceleration
+#: stays at 0.3, far inside :data:`MAX_ELBOW_ACCELERATION`; the angle leaves
+#: joint 3's range after ~4.49 s and the velocity crosses
+#: :data:`MAX_ELBOW_VELOCITY` (1.499 rad/s) after ~5.00 s. The range is
+#: therefore what the robot reaches first, and what this index is checked for
+#: first -- see :data:`ELBOW_POSITION_LIMITS`.
 CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX = 17
 
 #: ``kCartesianMotionGeneratorVelocityLimitsViolation`` (``error.h:27``).
