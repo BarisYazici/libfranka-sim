@@ -5,6 +5,26 @@ All notable changes to **franka-sim** are documented here. The format is based o
 [Semantic Versioning](https://semver.org/): from 1.0.0 on, breaking changes only
 come with a major version bump.
 
+## [Unreleased]
+
+### Added
+
+- **`self_collision_avoidance_violation` (error 2): the arm folding onto itself
+  now raises the reflex.** The third measured-side check, beside
+  `joint_velocity_violation` and `cartesian_velocity_violation`: it judges the
+  robot rather than the command, so it is armed in every control mode including
+  pure external torque control. Detection is MuJoCo's own contact test with
+  `margin == gap` set to 50 mm on the arm's collision geoms — which widens the
+  set of contacts MuJoCo *reports* without touching the set it *simulates*, so
+  no existing motion's physics changes by a bit — restricted to link pairs at
+  least three apart in the chain (neighbours touch by construction, and link5/
+  link7 sit 10–22 mm apart in every configuration). The margin is the safety
+  offset the real controller has from testing inflated collision volumes rather
+  than the visual meshes: the reflex fires *before* the links meet. Like the
+  other motion-limit checks it warns always and aborts only under
+  `--enforce-motion-limits` / `FRANKA_SIM_ENFORCE_MOTION_LIMITS`. MuJoCo backend
+  only; see [Motion limits](docs/robot-state.md#self_collision_avoidance_violation-2-the-geometric-half).
+
 ## [1.0.0] - 2026-08-24
 
 ### Changed

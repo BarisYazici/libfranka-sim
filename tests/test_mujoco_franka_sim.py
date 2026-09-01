@@ -22,6 +22,7 @@ from franka_sim.mujoco_franka_sim import (  # noqa: E402
     DEFAULT_DT,
     FLANGE_OFFSET_Z,
     MAX_FINGER_TRAVEL,
+    SELF_COLLISION_MARGIN,
     MujocoFrankaSim,
     default_fr3_mjcf,
 )
@@ -851,3 +852,244 @@ def test_the_published_pose_is_unchanged_by_an_identity_ee_transform(sim):
     sim.step(1)
 
     assert np.array(sim.get_robot_state()["O_T_EE"]) == pytest.approx(before, abs=1e-12)
+
+
+# --- self-collision detection ------------------------------------------------
+#
+# The geometric reading behind ``self_collision_avoidance_violation``. The
+# backend only *measures*; the abort lives in
+# MotionLimitChecker.check_self_collision and is covered in test_motion_limits.py.
+
+
+#: The pose the acceptance test parks at before folding joint 4
+#: (``kInitPoseSelfCollision``, ``robot_test_fixture.h``).
+SMOKE_SELF_COLLISION_POSE = np.array(
+    [0.0693453, 0.175089, -0.0697772, -1.88166, 0.0163913, 1.1729, 0.641234]
+)
+
+
+def _link_geom(simulator, index):
+    return mujoco.mj_name2id(
+        simulator.model, mujoco.mjtObj.mjOBJ_GEOM, f"{simulator.prefix}link{index}_collision"
+    )
+
+
+def _hold_at(simulator, q):
+    """Park the arm at ``q`` with the position servo holding it there."""
+    simulator.data.qpos[simulator.arm_qpos_adr] = q
+    simulator.data.qvel[simulator.arm_dofs_idx] = 0.0
+    simulator.update_joint_positions(np.asarray(q, dtype=float))
+    simulator.set_control_mode(ControlMode.POSITION)
+    mujoco.mj_forward(simulator.model, simulator.data)
+    simulator.step(1)
+
+
+def test_the_arm_collision_geoms_carry_the_detection_margin(sim):
+    """Equal margin and gap on every arm link, which makes the contact inactive.
+
+    MuJoCo puts a contact in ``mjData.contact`` once its distance drops below
+    ``margin`` but hands it to the solver only below ``margin - gap``; equal
+    values make that second threshold exactly 0, i.e. the margin-free one.
+    """
+    for index in range(8):
+        geom = _link_geom(sim, index)
+        assert geom >= 0, index
+        assert sim.model.geom_margin[geom] == SELF_COLLISION_MARGIN
+        assert sim.model.geom_gap[geom] == SELF_COLLISION_MARGIN
+
+
+def test_the_home_pose_reports_no_self_collision(sim):
+    """The arm as it is built is not folded onto itself."""
+    sim.step(1)
+    assert sim.self_collision() is None
+    assert sim.get_robot_state()["self_collision"] is None
+
+
+def test_adjacent_links_touching_in_the_home_pose_do_not_trigger(sim):
+    """link0 and link1 sit ~1 mm apart in every configuration, by construction.
+
+    They *are* a contact at this margin -- MuJoCo reports them -- so a detector
+    that only looked at ``ncon`` would fire on a freshly built arm. Only pairs
+    at least three links apart in the chain are monitored.
+    """
+    sim.step(1)
+    pairs = {
+        (int(sim.data.contact[i].geom1), int(sim.data.contact[i].geom2))
+        for i in range(sim.data.ncon)
+    }
+    near = (_link_geom(sim, 0), _link_geom(sim, 1))
+    assert near in pairs or near[::-1] in pairs, "the model changed; pick another near pair"
+    assert sim.self_collision() is None
+
+
+def test_folding_joint_four_onto_the_shoulder_is_detected(sim):
+    """The acceptance test's provocation: fold joint 4, twist joint 5 aside.
+
+    Driven kinematically here (the closed-loop version costs eleven seconds of
+    simulated time); the pair that closes is link1 against link5 -- the forearm
+    coming down onto the shoulder.
+    """
+    folded = SMOKE_SELF_COLLISION_POSE.copy()
+    folded[3] = -3.0
+    folded[4] = -2.2
+    _hold_at(sim, folded)
+
+    contact = sim.self_collision()
+    assert contact is not None
+    assert {contact.first, contact.second} == {"link1", "link5"}
+    assert 0.0 < contact.distance < SELF_COLLISION_MARGIN
+    assert contact.label == f"{contact.first}/{contact.second}"
+    assert sim.get_robot_state()["self_collision"] == contact
+
+
+def test_the_fold_is_detected_before_the_links_actually_touch(sim):
+    """The reflex is *avoidance*: it fires with the safety offset still standing.
+
+    Franka's own self-collision model inflates each link's volume, so the real
+    robot stops short of contact. Here the margin does the inflating, and the
+    distance reported at the moment of detection is what proves the geometry is
+    still clear.
+    """
+    approaching = SMOKE_SELF_COLLISION_POSE.copy()
+    approaching[3] = -2.945
+    approaching[4] = -2.09
+    _hold_at(sim, approaching)
+
+    contact = sim.self_collision()
+    assert contact is not None
+    assert contact.distance > 0.0, "detection must precede penetration"
+
+
+def test_ordinary_poses_keep_a_healthy_clearance(sim):
+    """No monitored pair comes near the margin in the poses clients actually use."""
+    for pose in (
+        ARM_INITIAL_Q,
+        SMOKE_SELF_COLLISION_POSE,
+        np.array([0.0, 1.28, 0.0, -0.5415, 0.0, 2.74, 0.0]),  # kSingularPose
+        np.array([1.78972, -0.705398, -1.84658, -2.43753, -1.05781, 2.33839, 0.785578]),
+    ):
+        _hold_at(sim, pose)
+        assert sim.self_collision() is None, pose
+
+
+def _plain_model(sim_factory):
+    """An arm with the detection margin undone -- the pre-reflex model."""
+    plain = sim_factory()
+    for index in range(8):
+        geom = _link_geom(plain, index)
+        plain.model.geom_margin[geom] = 0.0
+        plain.model.geom_gap[geom] = 0.0
+    return plain
+
+
+def _contact_pairs(simulator, *, solver_only):
+    """Geom pairs in ``mjData.contact``; the ones the solver is given, or all of them."""
+    contacts = simulator.data.contact
+    return {
+        (int(contacts[i].geom[0]), int(contacts[i].geom[1]))
+        for i in range(simulator.data.ncon)
+        if not solver_only or contacts[i].dist < contacts[i].includemargin
+    }
+
+
+def test_the_detection_margin_admits_no_contact_the_plain_model_did_not(sim_factory):
+    """While nothing interpenetrates, the solver's input and output are identical.
+
+    ``margin == gap`` puts the solver threshold at 0, the value it has on the
+    untouched model, so a contact only reaches the solver once the two hulls
+    are actually through each other -- which under the reflex never happens,
+    because it fires with the separation still positive and the arm is stopped
+    tens of millimetres short. This is the property the reflex is added under,
+    and what it is checked as: the *set* of contacts handed to the solver and
+    the constraint force it produces, step by step, against an arm whose
+    margins have been zeroed back to the pre-reflex model.
+
+    The two preconditions are checked rather than assumed, because without them
+    the comparison is vacuous: the trajectory has to stay clear of
+    self-penetration (where it does *not*, the two models genuinely diverge --
+    see ``test_an_interpenetration_is_where_the_margins_equivalence_stops``),
+    and the margin has to be *doing* something, i.e. the detecting model must
+    report pairs the plain one never sees. It reports two of them here and
+    hands neither to the solver, while the constraint forces the solver does
+    produce -- 0.2 Nm of them on this run -- match exactly.
+    """
+    detecting = sim_factory()
+    plain = _plain_model(sim_factory)
+
+    for simulator in (detecting, plain):
+        simulator.set_control_mode(ControlMode.VELOCITY)
+        simulator.update_joint_velocities(np.array([0.3, -0.2, 0.1, -0.4, 0.2, -0.3, 0.1]))
+
+    reported = [set(), set()]
+    for step in range(500):
+        detecting.step(1)
+        plain.step(1)
+        contact = detecting.self_collision()
+        assert contact is None or contact.distance > 0.0, f"penetrating at step {step}"
+        assert _contact_pairs(detecting, solver_only=True) == _contact_pairs(
+            plain, solver_only=True
+        ), step
+        assert detecting.data.qfrc_constraint == pytest.approx(
+            plain.data.qfrc_constraint, abs=0.0
+        ), step
+        for index, simulator in enumerate((detecting, plain)):
+            reported[index] |= _contact_pairs(simulator, solver_only=False)
+
+    assert reported[0] > reported[1], "the margin must widen the reported set to prove anything"
+    assert detecting.get_robot_state()["q"] == pytest.approx(plain.get_robot_state()["q"], abs=0.0)
+    assert detecting.get_robot_state()["dq"] == pytest.approx(
+        plain.get_robot_state()["dq"], abs=0.0
+    )
+
+
+def test_an_interpenetration_is_where_the_margins_equivalence_stops(sim_factory):
+    """Honest bound: once hulls overlap, the two models report different depths.
+
+    ``margin`` is an input to MuJoCo's mesh narrowphase, not only a threshold
+    on its output, so for hulls that *already* intersect libccd converges on a
+    different penetration depth with the margin set. Asserted rather than
+    disclaimed, so the docstring on
+    :meth:`MujocoFrankaSim._bind_self_collision` stays a checked fact.
+
+    Only a teleport gets here -- ``update_joint_positions`` straight into an
+    overlap, which is what this test does. The FCI layer cannot: the reflex
+    fires while the separation is still positive.
+    """
+    # Inside every FR3 joint limit, and link1/link5 are through each other.
+    folded = np.array([-2.584, -0.710, 2.662, -2.998, -1.901, 1.392, -2.495])
+    detecting = sim_factory()
+    plain = _plain_model(sim_factory)
+    depths = []
+    for simulator in (detecting, plain):
+        _hold_at(simulator, folded)
+        pair = (_link_geom(simulator, 1), _link_geom(simulator, 5))
+        contacts = simulator.data.contact
+        found = [
+            float(contacts[i].dist)
+            for i in range(simulator.data.ncon)
+            if tuple(sorted(int(g) for g in contacts[i].geom)) == tuple(sorted(pair))
+        ]
+        assert found and found[0] < 0.0, "the pose must interpenetrate link1 and link5"
+        depths.append(found[0])
+
+    assert depths[0] != depths[1], "penetration depth is expected to differ, not to match"
+
+
+def test_the_grafted_hand_is_not_monitored(hand_sim):
+    """The hand sits 26-68 mm off link5 in ordinary poses, closer than the margin.
+
+    It is an end effector, not an arm link: the acceptance test twists the wrist
+    precisely to get the gripper "out of the way" so the *links* can touch. Were
+    the hand monitored, ``--gripper-physics`` would report a self-collision on a
+    freshly built arm and the reflex would differ between the two builds.
+    """
+    hand_sim.step(1)
+    assert hand_sim.self_collision() is None
+
+    folded = SMOKE_SELF_COLLISION_POSE.copy()
+    folded[3] = -3.0
+    folded[4] = -2.2
+    _hold_at(hand_sim, folded)
+    contact = hand_sim.self_collision()
+    assert contact is not None
+    assert {contact.first, contact.second} == {"link1", "link5"}

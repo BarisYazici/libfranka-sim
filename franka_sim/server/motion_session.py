@@ -37,6 +37,7 @@ from franka_sim.franka_protocol import (
     convert_to_libfranka_motion_mode,
 )
 from franka_sim.motion_limits import (
+    DELTA_T,
     SINGULAR_POSE_MIN_SINGULAR_VALUE,
     smallest_singular_value,
     transform_matrix,
@@ -217,6 +218,7 @@ class MotionSessionMixin:
                 # Update dq_d with commanded velocities
                 self.robot_state.state["dq_d"] = list(command["dq_c"])
                 self._publish_commanded_derivatives("ddq_d")
+                self._integrate_commanded_position(command["dq_c"])
                 self.physics_sim.update_joint_velocities(command["dq_c"])
                 self.physics_sim.update_torques([0.0] * 7)
             elif (
@@ -259,6 +261,91 @@ class MotionSessionMixin:
                 # Update tau_J_d with commanded torques
                 self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
                 self.physics_sim.update_torques(command["tau_J_d"])
+                self._echo_external_controller_generator(command)
+
+    def _integrate_commanded_position(self, dq_c) -> None:
+        """Advance ``q_d`` by one control cycle of the commanded velocity.
+
+        A joint-*velocity* generator commands no position, but the robot still
+        reports one: ``q_d`` is the reference the internal generator integrates,
+        and libfranka documents it as always present in the robot state so a
+        client can predict what the robot will do "even in case of packet
+        losses" (``docs/overview.rst``). The sim used to leave it frozen for the
+        whole motion, which is wrong on the wire and breaks two real clients:
+        a torque controller servoing against ``q_d`` (see
+        :meth:`_echo_external_controller_generator`) sees a zero error for ever,
+        and libfranka's own ``MotionGenerator`` -- which seeds ``q_start`` from
+        ``q_d`` -- plans a zero-length trajectory when the next motion asks it
+        to move away from where a velocity motion actually left the arm.
+
+        One cycle per applied command, which is exact rather than approximate:
+        every cycle the client misses gets its own extrapolated substitute
+        dispatched through :meth:`_dispatch_control_command` (see
+        :meth:`_extrapolate_missed_command`), so one dispatch really is one
+        millisecond of reference.
+
+        The reference is integrated, not slaved to the measured ``q``: it is
+        what the client *commanded*, and a torque controller's whole job is to
+        close the gap between the two. Copying the measurement here would make
+        that gap identically zero and the controller a no-op -- which is exactly
+        the failure this method exists to fix.
+        """
+        state = self.robot_state.state
+        q_d = state["q_d"]
+        state["q_d"] = [float(q_d[i]) + float(dq_c[i]) * DELTA_T for i in range(7)]
+
+    def _echo_external_controller_generator(self, command) -> None:
+        """Report the motion generator's reference during an external-controller session.
+
+        ``kExternalController`` replaces the **controller**, not the generator.
+        The robot still runs the joint motion generator the ``Move`` asked for
+        and still reports its output -- that is what makes libfranka's
+        two-callback ``robot.control(torque_callback, motion_callback)`` pattern
+        work at all, since the torque callback has nothing else to servo
+        against. The sim
+        published only ``tau_J_d`` here and left the generator fields frozen, so
+        every such client read ``q_d == q`` and ``dq_d == 0``, computed a zero
+        torque, and watched an arm that never moved. Measured on the reference
+        provocation: eight seconds of ``dq_c`` ramped to -0.1 rad/s with
+        ``q_d[3]`` pinned at -1.5700, ``dq_d[3]`` at 0.0 and the client's
+        ``200 * (q_d - q)`` at exactly 0.0000 Nm.
+        (The Cartesian generators' own echo is
+        :meth:`_echo_commanded_cartesian`, which already runs for every command
+        whatever the controller.)
+
+        **Which fields, per generator.** A ``kJointPosition`` session writes
+        ``q_d`` alone -- the position the client commanded, which is the field
+        its torque law servos against and the one that was frozen. A
+        ``kJointVelocity`` session writes all three: ``dq_d`` is the command,
+        ``ddq_d`` its backward difference, and ``q_d`` the integral the
+        generator would have produced
+        (:meth:`_integrate_commanded_position`).
+
+        The physics is untouched, and deliberately: in this mode the client's
+        torques drive the arm and the generator's output is a reference only,
+        which is why the branch above puts the backend in ``TORQUE`` mode. This
+        method is reporting, nothing else.
+
+        ``ddq_d`` is differenced here rather than taken from the limit checker.
+        The checker is armed in ``TORQUE`` mode for this session -- it is
+        judging ``tau_J_d``, the only signal this server checks in an
+        external-controller session -- so
+        :meth:`_publish_commanded_derivatives` would hand back the torque rate
+        and write it into ``ddq_d``. One backward difference over the same
+        single cycle :meth:`_integrate_commanded_position` uses is the honest
+        substitute.
+        """
+        generator = self.robot_state.state["motion_generator_mode"]
+        if generator == LibfrankaMotionGeneratorMode.kJointPosition:
+            self.robot_state.state["q_d"] = list(command["q_c"])
+        elif generator == LibfrankaMotionGeneratorMode.kJointVelocity:
+            previous = [float(value) for value in self.robot_state.state["dq_d"]]
+            commanded = [float(value) for value in command["dq_c"]]
+            self.robot_state.state["dq_d"] = commanded
+            self.robot_state.state["ddq_d"] = [
+                (commanded[i] - previous[i]) / DELTA_T for i in range(7)
+            ]
+            self._integrate_commanded_position(commanded)
 
     def _drive_cartesian_generator(self, command) -> None:
         """Hand one accepted Cartesian command to the backend's differential IK.
@@ -503,6 +590,9 @@ class MotionSessionMixin:
                 generation = self._motion_generation
                 self._motion_epoch_id = self.robot_state.state["message_id"]
                 self._motion_has_commands = False
+                # No run of losses is open on a motion that has not started;
+                # the checker drops its own snapshot in start_motion below.
+                self._extrapolated_reference = None
 
                 # The snapshot this motion is judged and reported from, read
                 # once and used twice: to stamp the commanded Cartesian fields
@@ -1361,6 +1451,19 @@ class MotionSessionMixin:
             if violation.fatal:
                 return
 
+        # The wire-side half of the checker's ``_gap_snapshot``, taken on the
+        # first guess of a run and put back by
+        # :meth:`_absorb_within_motion_limits` when a late datagram makes the
+        # checker throw that run's guesses away. Without it the rewind is only
+        # half done: the history goes back but the published ``q_d`` keeps the
+        # extrapolated ``dq_ext * dt``, and then integrates the real command on
+        # top of it -- one extra millisecond of reference per rewound packet,
+        # measured as -2.35630 where two cycles of -0.1 rad/s put it at
+        # -2.35620. Only the *first* guess snapshots: the ones after it are
+        # part of the same run and rewind to the same place.
+        if self._extrapolated_reference is None:
+            self._extrapolated_reference = list(self.robot_state.state["q_d"])
+
         self._dispatch_control_command(command, motion_generation=generation)
 
     def _absorb_within_motion_limits(self, command, *, fresh: bool) -> bool:
@@ -1384,6 +1487,15 @@ class MotionSessionMixin:
         refused either way: applying NaN is not permissiveness, it poisons the
         physics state, the backward differences and the wire. It does not abort,
         though -- aborting is what the switch is for.
+
+        **A rewind takes the published reference back with it.** The checker
+        undoes the guesses this datagram turns out to be the real answer for
+        (:meth:`franka_sim.motion_limits.MotionLimitChecker.rewind_extrapolation`),
+        and the reference those guesses were dispatched into has to follow, or
+        the caller's dispatch integrates the same millisecond twice: once as
+        ``dq_ext * dt`` when the cycle was guessed and again as ``dq_c * dt``
+        now. See :attr:`
+        franka_sim.franka_sim_server.FrankaSimServer._extrapolated_reference`.
         """
         motion_id = self.motion_limits.motion_id
         outcome = self.motion_limits.absorb_command(
@@ -1392,6 +1504,16 @@ class MotionSessionMixin:
             fresh=fresh,
             enforce=self.enforce_motion_limits,
         )
+        if outcome.rewound:
+            reference = self._extrapolated_reference
+            self._extrapolated_reference = None
+            if reference is not None:
+                self.robot_state.state["q_d"] = list(reference)
+        elif outcome.recorded:
+            # A fresh command closes the run of losses (the checker drops its
+            # snapshot in the same step), so the guesses it was judged against
+            # stand and there is nothing left to put back.
+            self._extrapolated_reference = None
         if outcome.violation is None:
             return True
 
@@ -1649,6 +1771,56 @@ class MotionSessionMixin:
         if not self.enforce_motion_limits:
             # Nothing to refuse: no command caused this, so "reject the
             # command" is not a remedy. Reported and carried on with.
+            return
+        self._latch_and_abort(violation, motion_id)
+
+    def _run_self_collision_check(self, sim_state) -> None:
+        """Run the safety controller's geometric third against this cycle's contacts.
+
+        The third measured-side check, and the same shape as
+        :meth:`_run_safety_velocity_check`: it judges where the arm *is*, not
+        what the client asked for, so it is armed in every control mode -- which
+        is what the reference provocation's torque-control variant needs, since
+        there the client drives joint 4 from its own controller and there is no
+        commanded signal for any other check to object to.
+
+        The backend does the geometry (``MujocoFrankaSim.self_collision``) and
+        publishes either a link pair inside the margin or None. **A snapshot
+        with no ``self_collision`` key at all switches the check off**, which is
+        deliberately not the same as a key holding None: the Genesis backend,
+        the mobile base's swerve backend and every mocked simulator in the tests
+        publish no such key, and reading their silence as "the arm is clear"
+        would be inventing a measurement none of them took.
+        Also skipped on a ``mobile_base`` server, for the reason
+        :meth:`_run_safety_velocity_check` is: the monitored pairs are the FR3's
+        own links.
+        (The duo's *arms* run on ordinary arm servers and do get the check.)
+        Run *before* the velocity checks in the publish loop, because on the
+        reference provocation the fold ends with joint 4 parked against its
+        position limit, where the position-based envelope collapses; the sim's
+        own margin buys 833 cycles of lead over that, and the ordering makes the
+        geometric error win even if it did not.
+
+        Reporting is always on; the abort is gated on
+        ``--enforce-motion-limits`` and goes through the same latch-then-abort
+        plumbing as every other violation, so the client sees the identical
+        thing: the error bit in ``errors``/``reflex_reason``, ``kReflex``, and
+        the pending ``Move`` answered ``kReflexAborted``.
+        """
+        if self.mobile_base or not isinstance(sim_state, dict):
+            return
+        if "self_collision" not in sim_state:
+            return
+        motion_id = self.motion_limits.motion_id
+        violation = self.motion_limits.check_self_collision(sim_state["self_collision"])
+        if violation is None:
+            return
+        self.motion_limits.report(violation, enforced=self.enforce_motion_limits)
+        if not self.enforce_motion_limits:
+            # Nothing to refuse: no command caused this -- the arm is simply
+            # where it is -- so "reject the command" is not a remedy. Reported
+            # once per approach (see MotionLimitChecker.check_self_collision)
+            # and carried on with.
             return
         self._latch_and_abort(violation, motion_id)
 

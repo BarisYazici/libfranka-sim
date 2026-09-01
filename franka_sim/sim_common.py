@@ -12,11 +12,44 @@ define, so every existing import path keeps working.
 
 import os
 import threading
+from typing import NamedTuple
 
 import numpy as np
 
 #: FR3 actuator limits (Nm): joints 1-4 +/-87, joints 5-7 +/-12.
 FR3_FORCE_LIMITS = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
+
+
+class SelfCollisionContact(NamedTuple):
+    """Two arm links that have come within the self-collision margin of each other.
+
+    The contract between a physics backend and the FCI layer for the reading
+    behind ``self_collision_avoidance_violation``: a backend publishes one of
+    these (or ``None``) under ``self_collision`` in its state snapshot, and
+    :meth:`franka_sim.motion_limits.MotionLimitChecker.check_self_collision`
+    turns it into the reflex. It lives here rather than in either half because
+    it belongs to neither: the backend measures it and the FCI layer judges it.
+
+    ``distance`` is the surface separation in metres, so it is *positive* while
+    the safety offset still stands and negative only once the volumes actually
+    overlap -- the real robot's reflex fires in the positive range, which is
+    what makes it collision *avoidance*. ``first``/``second`` name the two links
+    for the log line, shortest form ("link1", "link5"), because "which two"
+    is the only thing that makes an unenforced warning actionable. ``margin`` is
+    the threshold the backend applied, carried along so the warning can print
+    the bound it was judged against rather than a bare number.
+    """
+
+    first: str
+    second: str
+    distance: float
+    margin: float
+
+    @property
+    def label(self) -> str:
+        """``"link1/link5"`` -- the pair as one grep-able token."""
+        return f"{self.first}/{self.second}"
+
 
 #: Default joint viscous damping (Nm*s/rad), applied to all 7 joints unless
 #: overridden via $FR3_JOINT_DAMPING. Calibrated against a logged real-robot

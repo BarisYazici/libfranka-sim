@@ -56,6 +56,8 @@ from franka_sim.limits.tables import (
     MEASURED_JOINT_VELOCITY_MARGIN,
     NORM_EPS,
     ORTHONORMAL_THRESHOLD,
+    SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX,
+    SELF_COLLISION_CLOSING_DISTANCE,
     START_CARTESIAN_POSE_ROTATION_TOLERANCE,
     START_CARTESIAN_POSE_TRANSLATION_TOLERANCE,
     START_ELBOW_TOLERANCE,
@@ -187,6 +189,7 @@ class MotionLimitChecker:
         ),
         start_cartesian_rotation_tolerance: float = START_CARTESIAN_POSE_ROTATION_TOLERANCE,
         start_elbow_tolerance: float = START_ELBOW_TOLERANCE,
+        self_collision_closing_distance: float = SELF_COLLISION_CLOSING_DISTANCE,
     ):
         """Build a checker; see the module constants for the defaults."""
         self._lock = threading.Lock()
@@ -200,6 +203,7 @@ class MotionLimitChecker:
         self.start_cartesian_translation_tolerance = start_cartesian_translation_tolerance
         self.start_cartesian_rotation_tolerance = start_cartesian_rotation_tolerance
         self.start_elbow_tolerance = start_elbow_tolerance
+        self.self_collision_closing_distance = self_collision_closing_distance
 
         self._mode: ControlMode = ControlMode.NONE
         self._joint = _Differentiator(7)
@@ -229,6 +233,19 @@ class MotionLimitChecker:
         #: Cartesian half of the safety controller's input; see
         #: :meth:`check_measured_cartesian_velocity`.
         self._measured_ee_velocity: Optional[List[float]] = None
+        #: The link pair the backend last reported inside the self-collision
+        #: margin, or None when the arm is clear. The geometric third of the
+        #: safety controller's input; see :meth:`check_self_collision`.
+        self._self_collision: Optional[Any] = None
+        #: Widest separation seen since each link pair entered the margin --
+        #: the high-water mark the reflex judges *closing* against, so that an
+        #: arm standing in the margin can still be driven out of it. Keyed by
+        #: the pair's label, because the backend reports only the *closest*
+        #: pair: one shared mark would judge a pair by an approach some other
+        #: pair made, and fire the moment the reading switched to a pair that
+        #: happens to sit deeper. Empty while the arm is clear. See
+        #: :meth:`check_self_collision`.
+        self._self_collision_clearance: Dict[str, float] = {}
         self._active = False
         #: Whether *a motion* is running, as opposed to whether a motion
         #: generator this module differences is running (:attr:`_active`). The
@@ -320,6 +337,8 @@ class MotionLimitChecker:
             self._safety_active = True
             self._measured_velocity = None
             self._measured_ee_velocity = None
+            self._self_collision = None
+            self._self_collision_clearance = {}
             self._motion_id = motion_id
             self._first_command = True
             self._applied_id = None
@@ -382,6 +401,8 @@ class MotionLimitChecker:
             self._safety_active = False
             self._measured_velocity = None
             self._measured_ee_velocity = None
+            self._self_collision = None
+            self._self_collision_clearance = {}
             self._motion_id = 0
             self._first_command = True
 
@@ -393,6 +414,8 @@ class MotionLimitChecker:
             self._safety_active = False
             self._measured_velocity = None
             self._measured_ee_velocity = None
+            self._self_collision = None
+            self._self_collision_clearance = {}
             self._motion_id = 0
             self._first_command = True
             self._logged = set()
@@ -913,6 +936,104 @@ class MotionLimitChecker:
             self.measured_cartesian_velocity_limit,
             "m/s",
         )
+
+    def check_self_collision(self, self_collision: Optional[Any] = None) -> Optional[Violation]:
+        """Run the safety controller against the arm folding onto itself.
+
+        The geometric third of the safety controller, alongside
+        :meth:`check_measured_velocity` and
+        :meth:`check_measured_cartesian_velocity`: called once per control cycle
+        from the state-publish loop with the physics snapshot that loop already
+        read, judging the *robot* rather than the client, and therefore armed in
+        every control mode. Both halves of the reference provocation need that
+        -- one folds joint 4 through a joint-velocity generator, the other
+        through a client-side torque controller with no commanded velocity for
+        any other check to look at.
+
+        ``self_collision`` is what the backend measured: a
+        :class:`~franka_sim.sim_common.SelfCollisionContact` naming the two
+        links and their separation, or None when the arm is clear. Its
+        *threshold* lives in the backend, not here, because the safety offset
+        the real robot fires with is a property of the collision model rather
+        than of the FCI (see
+        :data:`franka_sim.mujoco_franka_sim.SELF_COLLISION_MARGIN`): a reading
+        that exists at all is already a violation, and this method's job is to
+        name it, arm it and rate-limit it. A backend that publishes no reading
+        (Genesis, the mobile base, a mock) never gets here -- the server skips
+        the call, rather than reading None as "clear".
+
+        **Being inside the margin is not the violation; moving further in is.**
+        A reading is judged against :attr:`_self_collision_clearance`, the widest
+        separation seen since *this pair* entered the margin, and fires only once
+        the arm has closed :attr:`self_collision_closing_distance` in on it. That
+        is the direction the real reflex has -- hardware resists motion *into*
+        the zone and still lets the arm be driven out -- and without it the
+        reflex is a trap rather than a guard: the abort leaves the arm parked
+        inside the margin, so a plain "inside = violation" test aborts every
+        later ``Move`` on its first cycle and no homing or recovery motion is
+        possible. The acceptance suite fails on precisely that, one test after
+        the one the reflex correctly stops. See
+        :data:`SELF_COLLISION_CLOSING_DISTANCE` for the size and its evidence.
+
+        The high-water mark ratchets *up* only: retreating re-arms the check
+        from wherever the arm got back to, so "out a little, then deeper than
+        before" still fires. There is **one mark per link pair**, because the
+        backend publishes only the *closest* pair: a single shared mark is set
+        by whichever pair the reading happened to be about, so the next pair to
+        become closest is judged on an approach it never made -- one that has
+        been standing 20 mm off while another pair sat at 30 mm fires on the
+        cycle the reading switches to it, without the arm having moved towards
+        anything. A pair's own mark is dropped when the arm leaves the margin
+        (that pair's episode is over) and the whole table is cleared by
+        :meth:`start_motion`, :meth:`end_motion` and :meth:`recover`, so each
+        motion judges its own approach.
+
+        Actual interpenetration -- a separation at or below zero -- fires
+        whatever the direction: no argument about which way the arm is going
+        excuses links that are already through each other. Only a one-cycle
+        teleport can reach it, which needs enforcement off.
+
+        Returns the violation on every cycle the arm is closing, not only on the
+        leading edge: an abort that :meth:`
+        franka_sim.franka_sim_server.FrankaSimServer._latch_and_abort` refuses
+        because the motion it belonged to had already ended must be retriable on
+        the next cycle. The *logging* is per episode, which is what clearing the
+        rate-limit latch below buys.
+        """
+        with self._lock:
+            previous = self._self_collision
+            self._self_collision = self_collision
+            if self_collision is None:
+                if previous is not None:
+                    # *That* pair's mark, not the whole table: a pair the
+                    # reading passed over on its way here keeps its own
+                    # approach, which is the one it will be judged on when it
+                    # becomes the closest again.
+                    self._self_collision_clearance.pop(getattr(previous, "label", "links"), None)
+                    # The links separated: this episode is over, so the next one
+                    # is allowed its own warning. Without this the
+                    # once-per-error-class rule in :meth:`should_log` would
+                    # report the first approach of a motion and stay silent
+                    # through every later one.
+                    self._logged.discard(SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX)
+                return None
+            label = getattr(self_collision, "label", "links")
+            distance = float(self_collision.distance)
+            clearance = self._self_collision_clearance.get(label)
+            clearance = distance if clearance is None else max(clearance, distance)
+            self._self_collision_clearance[label] = clearance
+            if not self._safety_active:
+                return None
+            if distance > 0.0 and clearance - distance < self.self_collision_closing_distance:
+                return None
+            return Violation(
+                SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX,
+                "link separation",
+                label,
+                distance,
+                float(self_collision.margin),
+                "m",
+            )
 
     def record(self, command: Dict[str, Any], *, clean: Optional[bool] = None) -> None:
         """Accept one *received* command as applied.

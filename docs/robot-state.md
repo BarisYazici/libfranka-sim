@@ -452,11 +452,12 @@ nothing else, and a `kCartesianPosition` motion is judged on `O_T_EE_c` and
 `elbow_c` and nothing else.
 
 The safety controller is **not in this table**, because it is not in this
-precedence chain. Its two errors — `joint_velocity_violation` (3) on measured
-`dq` and `cartesian_velocity_violation` (4) on measured end-effector speed — are
+precedence chain. Its three errors — `joint_velocity_violation` (3) on measured
+`dq`, `cartesian_velocity_violation` (4) on measured end-effector speed and
+`self_collision_avoidance_violation` (2) on the arm's own geometry — are
 judged on the state-publish thread, once per cycle, in every control mode
 including pure torque; they never preempt any row below and no row below
-preempts them. The two places the halves meet each other: a commanded
+preempts them. The two places the velocity halves meet each other: a commanded
 velocity-envelope violation (13) latches 3 alongside itself, and 4 outranks 3
 when a single cycle breaks both. See
 [below](#joint_velocity_violation-3-the-safety-controller).
@@ -651,6 +652,65 @@ an `acceleration_discontinuity` is a **jerk** limit — libfranka's own naming,
 kept as is so a message can be grepped against the real robot's vocabulary. On a
 *velocity* interface everything shifts by one; see the table above.
 
+### `self_collision_avoidance_violation` (2): the geometric half
+
+The third measured-side check, and the only one that is about *shape* rather
+than speed: the safety controller also watches the arm folding onto itself, and
+latches `self_collision_avoidance_violation` when two links that are not
+neighbours come within **50 mm** of each other. Measured, not commanded, so like
+the two velocity halves it is armed in every control mode — including pure
+external torque control, which is one of the two ways the reference provocation
+runs it.
+
+**It fires before the links touch, and that is the point.** The real controller
+does not test the visual meshes; it tests simplified volumes inflated around
+each link — the same simplification `franka_description` ships as its collision
+meshes — so the reflex has a built-in safety offset and stops the arm short of
+contact. The sim gets that offset from MuJoCo's contact `margin` rather than by
+fattening geometry: setting `margin == gap` on the arm's collision geoms widens
+the set of contacts MuJoCo *reports* to everything within 50 mm while leaving
+the set it *simulates*, and every contact force in it, bit for bit unchanged.
+Nobody's physics moves; only the sim's field of view widens.
+
+Two calibration facts about the 50 mm, both measured on the sim's own FR3
+(`robot_descriptions` `fr3_v2`) over the monitored pairs:
+
+* **The provocation reaches 24.7 mm and never touches.** Folding joint 4 at
+  0.1 rad/s while twisting joint 5 at 0.2 rad/s brings link5 down onto link1,
+  and the convex hulls stay apart for the whole motion — so a detector waiting
+  for an actual contact would wait for ever. Closed loop through the backend's
+  velocity servo, 50 mm is crossed at t = 10.80 s.
+* **It has to beat the other error that scenario can raise.** The same fold ends
+  with joint 4 against its position limit, where the
+  [position-based envelope](#the-position-based-joint-velocity-limits) collapses
+  towards zero and the commanded −0.1 rad/s becomes
+  `joint_motion_generator_velocity_limits_violation`. On the same run that
+  happens at t = 11.63 s — 833 control cycles later.
+
+Ordinary operation is nowhere near it: across the home pose and three reference
+start poses no monitored pair comes closer than 136 mm, and three of the four
+have no monitored pair within 200 mm at all.
+
+**Neighbours are excluded, on measurement rather than principle.** Only links at
+least three apart in the chain are monitored. Adjacent links touch by
+construction (link0 and link1 sit ~1 mm apart in every configuration). The
+once-removed pairs are excluded because they behave the same way: link5 and
+link7 are **10–22 mm** apart in *every* configuration — their relative pose
+depends only on joints 6 and 7 — which is inside the margin and closer than the
+provocation ever gets; link2/link4 and link3/link5 sit at ~70 mm. The wrist's
+joint limits, not a reflex, are what hold those apart.
+
+**The grafted hand is not monitored.** With `--gripper-physics` the Franka Hand
+sits 26–68 mm off link5 in ordinary poses, inside the margin, so including it
+would report a self-collision on a freshly built arm and make the reflex differ
+between the two builds. It is an end effector rather than an arm link — and the
+reference provocation twists joint 5 precisely to get the gripper "out of the
+way … so self-collision between links can be detected".
+
+**MuJoCo backend only**, exactly like `cartesian_velocity_violation` (4): the
+Genesis backend and the mobile-duo scene publish no such reading, and a backend
+that publishes none is left alone rather than read as "the arm is clear".
+
 ### The position-based joint velocity limits
 
 The FR3 has no fixed joint velocity limit. What the robot enforces — and what
@@ -832,10 +892,11 @@ sim will now find it for you first if you ask it to.
 ## Roadmap: what is still an ideal channel
 
 * **The reflex system.** Collision thresholds and the remaining bits of `errors` /
-  `reflex_reason` — `joint_reflex`, `cartesian_reflex`,
-  `self_collision_avoidance_violation`, `power_limit_violation` and the Cartesian
-  *position* limits, none of which the sim can detect because it models neither
-  contact forces nor an inverse-kinematics stage.
+  `reflex_reason` — `joint_reflex`, `cartesian_reflex`, `power_limit_violation`
+  and the Cartesian *position* limits, none of which the sim can detect because
+  it models neither contact forces nor an external-force estimator.
+  (`self_collision_avoidance_violation` is no longer on this list — see
+  [above](#self_collision_avoidance_violation-2-the-geometric-half).)
 * **Cartesian *impedance* control.** `kCartesianImpedance` as a controller mode
   is accepted but the sim always servos in joint space; and
   `setJointImpedance` / `setCartesianImpedance` are acknowledged without

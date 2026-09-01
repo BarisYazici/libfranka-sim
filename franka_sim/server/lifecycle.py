@@ -42,6 +42,7 @@ class LifecycleMixin:
         self.states_sent = 0
         self._motion_epoch_id = 0
         self._motion_has_commands = False
+        self._extrapolated_reference = None
         self.client_socket = None
         self.tcp_thread = None
         self.udp_socket = None

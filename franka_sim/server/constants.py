@@ -88,7 +88,14 @@ COMMANDED_STATE_FIELDS = (
 #: ``ndarray``, which the state dict's consumers (``pack_state``, the
 #: state-shaped copies :meth:`FrankaSimServer._publish_hold_setpoint` hands out)
 #: have no idea what to do with.
-INTERNAL_SIM_STATE_FIELDS = ("O_dP_EE", "O_J_EE")
+#:
+#: ``self_collision`` is the link pair the backend found inside the
+#: self-collision margin, or None (see
+#: :meth:`FrankaSimServer._run_self_collision_check`). What reaches the wire is
+#: the *error bit* the reflex latches, not the geometry behind it -- libfranka's
+#: ``RobotState`` has no field for a link pair -- and like ``O_J_EE`` it is not
+#: a number the state dict's consumers could pack anyway.
+INTERNAL_SIM_STATE_FIELDS = ("O_dP_EE", "O_J_EE", "self_collision")
 
 #: How long :meth:`FrankaSimServer.stop` waits for the gripper server's accept
 #: loop to notice its socket was closed. The wait is normally microseconds --

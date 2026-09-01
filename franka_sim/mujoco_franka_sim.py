@@ -37,6 +37,7 @@ from franka_sim.sim_common import (
     FR3_FORCE_LIMITS,
     PositionFeedforward,
     RealtimeFactorMonitor,
+    SelfCollisionContact,
     close_passive_viewer,
     launch_passive_viewer,
     resolve_fr3_joint_damping,
@@ -91,6 +92,74 @@ FLANGE_OFFSET_Z = 0.107
 
 #: Settling steps run at build time, matching the Genesis sim's warm-up.
 SETTLE_STEPS = 100
+
+#: How close two monitored arm links may come (m) before the sim calls it a
+#: self-collision and the FCI layer raises ``self_collision_avoidance_violation``.
+#:
+#: **Not a libfranka constant**, like every other tolerance in
+#: :mod:`franka_sim.limits.tables`: Control's self-collision model is not
+#: published. What *is* known about it is its shape -- the robot does not test
+#: the visual meshes but a set of simplified volumes inflated around each link,
+#: the same simplification ``franka_description`` ships as its collision meshes
+#: -- so the reflex fires with an offset still standing, before the links
+#: physically touch. This margin is that inflation, applied here as MuJoCo's own
+#: contact ``margin`` rather than by fattening geometry (see
+#: :meth:`MujocoFrankaSim._bind_self_collision`).
+#:
+#: 50 mm, placed between the two things it has to separate on the sim's own FR3
+#: model (``robot_descriptions`` ``fr3_v2``), both measured over the *monitored*
+#: pairs only (:data:`SELF_COLLISION_MIN_LINK_SEPARATION`):
+#:
+#: * **The provocation.** Folding joint 4 at 0.1 rad/s from
+#:   ``kInitPoseSelfCollision`` while twisting joint 5 at 0.2 rad/s brings link5
+#:   (the forearm) down onto link1 (the shoulder). Its closest approach is
+#:   24 mm -- the convex hulls never touch at all -- so a contact-based detector
+#:   would wait for ever and any margin below ~25 mm never fires. Run closed
+#:   loop through this backend's velocity servo, 50 mm is reached at t = 10.80 s.
+#: * **The other error that scenario can raise.** The fold ends with joint 4
+#:   parked against its position limit, where the position-based velocity
+#:   envelope collapses towards zero and the commanded -0.1 rad/s becomes
+#:   ``joint_motion_generator_velocity_limits_violation``. Measured on the same
+#:   closed-loop run, that happens at t = 11.63 s -- 833 control cycles after
+#:   this margin fires, which is the lead the geometric error needs to be the
+#:   one the client sees.
+#:
+#: The other bound is ordinary operation, and it is not tight: across the home
+#: pose, ``kInitPoseSelfCollision``, ``kSingularPose`` and ``kIkBugPose`` no
+#: monitored pair comes closer than 136 mm, and three of those four have no
+#: monitored pair within 200 mm at all. So this sits ~2.7x inside the tightest
+#: ordinary clearance and ~2x outside the provocation's closest approach.
+SELF_COLLISION_MARGIN = 0.05
+
+#: How far apart in the kinematic chain two links must be for the pair to be
+#: monitored. Three, i.e. link ``i`` is checked against ``i+3`` and beyond.
+#:
+#: Adjacent links (``i``, ``i+1``) are the obvious exclusion -- they touch by
+#: construction, and on this model MuJoCo does not even filter link0/link1 for
+#: us (link0 carries no joint, so it welds to the world and the parent-child
+#: filter, which skips pairs involving the world weld, lets it through). The
+#: once-removed pairs are excluded on measurement rather than principle:
+#: link5/link7 sit **10-22 mm** apart in every configuration -- their relative
+#: pose depends only on joints 6 and 7 -- which is *inside* this margin and
+#: closer than the provocation ever gets. They are held apart by the wrist's
+#: joint limits, not by a reflex, and monitoring them would report a
+#: self-collision on a freshly built arm. link2/link4 and link3/link5 behave the
+#: same way at ~70 mm. Two links apart is still mechanically a neighbour; three
+#: is the arm reaching back on itself.
+SELF_COLLISION_MIN_LINK_SEPARATION = 3
+
+#: Which links carry a monitored collision volume: the arm's own, ``link0``
+#: through ``link7``, and nothing else.
+#:
+#: **The grafted hand is deliberately out.** It is an end effector, not an arm
+#: link, and on this model it sits 26-68 mm off link5 in ordinary poses (37 mm
+#: at ``kSingularPose``) -- inside :data:`SELF_COLLISION_MARGIN`, so including
+#: it would report a self-collision on a freshly built ``--gripper-physics``
+#: arm and make the reflex differ between the two builds. It is also what the
+#: reference provocation legislates for: it twists joint 5 specifically to get
+#: the gripper "out of the way ... so self-collision between links can be
+#: detected".
+SELF_COLLISION_LINKS = tuple(range(8))
 
 #: Wall-clock lag (s) the paced loop catches up on before it gives up and
 #: resynchronises its deadline. ``viewer.sync()`` blocks on the render thread's
@@ -288,6 +357,13 @@ class MujocoFrankaSim:
         self.finger_dofs_idx: Optional[np.ndarray] = None
         self.ee_body_id: Optional[int] = None
 
+        # Self-collision monitoring, resolved once at build time (see
+        # _bind_self_collision): ``{(lo_geom_id, hi_geom_id): ("link1", "link5")}``
+        # for every pair worth watching. Empty when the model carries no
+        # ``*_collision`` geoms at all, which switches the whole check off
+        # rather than guessing.
+        self._self_collision_pairs = {}
+
         # Flange -> EE transform (row-major 4x4), i.e. the FCI's ``F_T_EE``.
         # Identity until a client sends a SetEE-family command; see
         # update_ee_transform(). Only the translation is read today (the EE's
@@ -360,6 +436,7 @@ class MujocoFrankaSim:
             "O_T_EE": np.eye(4).T.flatten(),
             "O_dP_EE": np.zeros(3),
             "O_J_EE": np.zeros((6, 7)),
+            "self_collision": None,
         }
 
     # -- construction ------------------------------------------------------
@@ -409,6 +486,128 @@ class MujocoFrankaSim:
             finger_names = [f"{self.prefix}finger_joint{i}" for i in (1, 2)]
             self.finger_qpos_adr = _qpos_addresses(self.model, finger_names)
             self.finger_dofs_idx = _dof_addresses(self.model, finger_names)
+
+        self._bind_self_collision()
+
+    def _bind_self_collision(self) -> None:
+        """Arm the self-collision reading: widen the margin, list the pairs.
+
+        Two halves, both done once here so the 1 kHz path is a lookup.
+
+        **The margin.** MuJoCo puts a contact into ``mjData.contact`` as soon as
+        the two geoms are closer than the pair's ``margin`` (the larger of the
+        two geoms'), and hands it to the constraint solver only once it is
+        closer than ``margin - gap`` -- the field MuJoCo calls
+        ``includemargin``. Setting ``margin == gap ==``
+        :data:`SELF_COLLISION_MARGIN` therefore makes that solver threshold
+        exactly 0, which is the value it has on the untouched model: the
+        *reported* set grows to everything within 50 mm while the *simulated*
+        set does not grow at all. **No pair that was not already penetrating
+        enters the solver**, which is the property the reflex is added under,
+        and it is why this is not done by inflating the geoms.
+
+        What that does *not* claim is that the two models are bit-identical
+        once links do interpenetrate. ``margin`` is an input to the narrowphase
+        as well as a threshold on its output -- libccd is run with it -- so for
+        mesh hulls that already overlap, the *depth* it converges on differs
+        between the two models. Measured on a fold with link1/link5 through
+        each other: -2.799 mm reported plain against -5.771 mm with the margin
+        set, and a closed position loop settling at 48.9 Nm of
+        ``qfrc_constraint`` on joint 4 against 26.6 Nm (12 of 300 random
+        in-joint-range configurations differ at all). That state is one the FCI
+        layer never reaches under control: the reflex fires while the
+        separation is still positive (see
+        :meth:`franka_sim.motion_limits.MotionLimitChecker.check_self_collision`)
+        and the arm is stopped at the margin, tens of millimetres before any
+        hull intersects. Reaching it needs a one-cycle teleport straight into
+        an overlap, i.e. ``update_joint_positions``, not a motion.
+
+        It also has to be MuJoCo's own detection rather than a Python distance
+        sweep: the engine's broadphase culls the far pairs in C and hands back
+        the few that are close, at a measured 14-23 us per 1 ms step (61 ->
+        75-84 us for the whole step, control law and state publish included,
+        the wide end being the folded pose with an extra contact live), of which
+        :meth:`self_collision`'s own scan is 3-4 us. A per-step
+        ``mj_geomDistance`` loop over the 15 monitored pairs is both an order of
+        magnitude dearer and, on this model, *wrong*: it reports 42 mm of
+        penetration between link1 and link5 in configurations where the two
+        hulls are provably 12 mm apart.
+
+        **The pairs.** Everything at least
+        :data:`SELF_COLLISION_MIN_LINK_SEPARATION` links apart among
+        :data:`SELF_COLLISION_LINKS`, which on the FR3 is 15 pairs. The margin
+        goes on all eight link geoms even so -- a geom's margin is a property of
+        the geom, not of a pair, so an unmonitored pair (link0/link1, or an arm
+        link against the ground) simply shows up in ``mjData.contact`` and is
+        skipped by name in :meth:`self_collision`.
+
+        A model without ``<prefix>linkN_collision`` geoms leaves both halves
+        empty and the check silently off: no margin is touched, and
+        :meth:`self_collision` answers None for ever. That is the honest answer
+        for a backend that cannot see its own links, and it keeps a caller
+        pointing ``$FR3_MJCF`` at a stripped-down model working.
+        """
+        geoms = {}
+        for index in SELF_COLLISION_LINKS:
+            geom_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, f"{self.prefix}link{index}_collision"
+            )
+            if geom_id >= 0:
+                geoms[index] = geom_id
+
+        self._self_collision_pairs = {
+            (min(first_id, second_id), max(first_id, second_id)): (
+                f"link{first}",
+                f"link{second}",
+            )
+            for first, first_id in geoms.items()
+            for second, second_id in geoms.items()
+            if second - first >= SELF_COLLISION_MIN_LINK_SEPARATION
+        }
+        if not self._self_collision_pairs:
+            logger.warning(
+                "No %slinkN_collision geoms in the model: self-collision detection is off",
+                self.prefix,
+            )
+            return
+
+        margins = np.array(sorted(geoms.values()), dtype=np.intp)
+        self.model.geom_margin[margins] = SELF_COLLISION_MARGIN
+        self.model.geom_gap[margins] = SELF_COLLISION_MARGIN
+
+    def self_collision(self) -> Optional[SelfCollisionContact]:
+        """The closest monitored link pair inside the margin, or None.
+
+        Reads ``mjData.contact`` as the last forward pass left it -- the
+        collisions are already computed, so this adds no geometry work to the
+        step, only the scan. ``ncon`` is 2-4 on this model in practice (the
+        unmonitored link0/link1 near-touch, the ground, and whatever is genuinely
+        close), so the scan is a handful of dictionary lookups.
+
+        *Closest*, not first: which pair is reported ends up in the log line and
+        in the error's ``describe()``, and "the two links that are 24 mm apart"
+        is a more useful answer than "the first pair the solver happened to
+        list". The distance is MuJoCo's own ``contact.dist``, i.e. surface
+        separation -- positive while the safety offset stands.
+        """
+        contacts = self.data.ncon
+        if not contacts or not self._self_collision_pairs:
+            return None
+        contact_list = self.data.contact
+        geoms = contact_list.geom[:contacts]
+        distances = contact_list.dist[:contacts]
+        closest = None
+        for index in range(contacts):
+            first_id, second_id = int(geoms[index, 0]), int(geoms[index, 1])
+            pair = self._self_collision_pairs.get(
+                (min(first_id, second_id), max(first_id, second_id))
+            )
+            if pair is None:
+                continue
+            distance = float(distances[index])
+            if closest is None or distance < closest.distance:
+                closest = SelfCollisionContact(pair[0], pair[1], distance, SELF_COLLISION_MARGIN)
+        return closest
 
     def _configure_model(self) -> None:
         """Apply the optional joint-damping override to the compiled model.
@@ -798,6 +997,10 @@ class MujocoFrankaSim:
             "O_T_EE": ee_pose.T.flatten(),
             "O_dP_EE": jacobian[:3] @ dq,
             "O_J_EE": jacobian,
+            # The geometric third of the safety controller. Published with the
+            # rest of the snapshot rather than read from the FCI thread, for the
+            # same reason the Jacobian is: mjData belongs to the physics thread.
+            "self_collision": self.self_collision(),
         }
 
     def step(self, steps: int = 1) -> None:

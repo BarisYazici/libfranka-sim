@@ -58,6 +58,7 @@ from franka_sim.motion_limits import (
     DELTA_T,
     ELBOW_POSITION_LIMITS,
     ENFORCE_ENV_VAR,
+    ERROR_NAMES,
     JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_POSITION_LIMITS_VIOLATION_INDEX,
     JOINT_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX,
@@ -78,11 +79,13 @@ from franka_sim.motion_limits import (
     MAX_TRANSLATIONAL_VELOCITY,
     MEASURED_CARTESIAN_VELOCITY_LIMIT,
     MEASURED_JOINT_VELOCITY_MARGIN,
+    SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX,
+    SELF_COLLISION_CLOSING_DISTANCE,
     SINGULAR_POSE_MIN_SINGULAR_VALUE,
-    TAU_J_RANGE_VIOLATION_INDEX,
     START_CARTESIAN_POSE_ROTATION_TOLERANCE,
     START_CARTESIAN_POSE_TRANSLATION_TOLERANCE,
     START_ELBOW_TOLERANCE,
+    TAU_J_RANGE_VIOLATION_INDEX,
     MotionLimitChecker,
     Violation,
     _Differentiator,
@@ -95,6 +98,7 @@ from franka_sim.motion_limits import (
     upper_joint_velocity_limits,
 )
 from franka_sim.robot_state import _ROBOT_STATE_PACKER, RobotState
+from franka_sim.sim_common import SelfCollisionContact
 
 #: A configuration comfortably inside every joint's range, so the
 #: position-dependent velocity limits sit at their flat caps. Joints 4 and 6 do
@@ -3781,6 +3785,130 @@ def test_a_late_datagram_enforcement_refuses_leaves_the_extrapolation_standing()
     assert checker.rewind_extrapolation(command(message_id=last_id + 2)) is True
 
 
+def _velocity_session(mock_physics_sim):
+    """A server mid joint-velocity motion, its published reference seeded at HOME."""
+    from franka_sim.franka_protocol import (
+        LibfrankaControllerMode,
+        LibfrankaMotionGeneratorMode,
+    )
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
+    server.robot_state.set_controller_mode(LibfrankaControllerMode.kJointImpedance)
+    server.robot_state.set_motion_generator_mode(LibfrankaMotionGeneratorMode.kJointVelocity)
+    server.robot_state.state["q"] = list(HOME)
+    server.robot_state.state["q_d"] = list(HOME)
+    server.robot_state.state["dq_d"] = [0.0] * 7
+    server._motion_generation = 1
+    server.motion_limits.start_motion(ControlMode.VELOCITY, robot_state_at(), motion_id=1)
+    return server
+
+
+def _answer_cycle(server, message_id, dq_c, *, fresh):
+    """Absorb and dispatch one datagram exactly as the UDP receive path does."""
+    datagram = command(message_id=message_id, dq_c=list(dq_c))
+    if server._absorb_within_motion_limits(datagram, fresh=fresh):
+        server._dispatch_control_command(datagram)
+
+
+def test_a_rewound_cycle_advances_the_reference_once_not_twice(mock_physics_sim):
+    """DEFECT REGRESSION: ``q_d`` gained 2 ms of reference for 1 ms of wall clock.
+
+    The checker throws the extrapolated cycle away when the real datagram for it
+    turns up (``rewind_extrapolation``), but the published ``q_d`` kept the
+    guess's ``dq_ext * dt`` and then integrated the datagram's ``dq_c * dt`` on
+    top of it. One extra millisecond of reference per rewound packet -- and a
+    late datagram is the *normal* case for a non-realtime client, so the drift
+    is unbounded: it is exactly the reference a torque controller servos against
+    (``_echo_external_controller_generator``) and the seed libfranka's own
+    ``MotionGenerator`` plans the next motion from.
+
+    Two control cycles at -0.1 rad/s from HOME put joint 4 at -2.35620; it read
+    -2.35630, one whole cycle further on.
+    """
+    server = _velocity_session(mock_physics_sim)
+    dq_c = [0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0]
+
+    # Cycle 1: the client answers on time.
+    server.motion_limits.note_published(1)
+    server.robot_state.state["message_id"] = 1
+    _answer_cycle(server, 1, dq_c, fresh=True)
+
+    # Cycle 2: its datagram is late, so the publish loop guesses the cycle...
+    server.motion_limits.note_published(2)
+    server.robot_state.state["message_id"] = 2
+    server._extrapolate_missed_cycle(2)
+    guessed = server.robot_state.state["q_d"][3]
+    assert guessed == pytest.approx(HOME[3] + 2 * dq_c[3] * DELTA_T, abs=1e-12)
+
+    # ...and then the real answer to it turns up and is applied as well.
+    _answer_cycle(server, 2, dq_c, fresh=False)
+
+    assert server.robot_state.state["q_d"][3] == pytest.approx(
+        HOME[3] + 2 * dq_c[3] * DELTA_T, abs=1e-12
+    ), "one dispatch must be one millisecond of reference"
+
+
+def test_an_unanswered_guess_still_advances_the_reference_once(mock_physics_sim):
+    """The restore is a rewind, not a rollback: a guess nobody answers stands.
+
+    The FCI's extrapolation *is* the reference while the client is quiet, so the
+    snapshot taken for a possible rewind must never be put back on its own --
+    only when a datagram arrives to replace the cycle it stood in for.
+    """
+    server = _velocity_session(mock_physics_sim)
+    dq_c = [0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0]
+
+    server.motion_limits.note_published(1)
+    server.robot_state.state["message_id"] = 1
+    _answer_cycle(server, 1, dq_c, fresh=True)
+
+    for message_id in (2, 3, 4):
+        server.motion_limits.note_published(message_id)
+        server.robot_state.state["message_id"] = message_id
+        server._extrapolate_missed_cycle(message_id)
+
+    assert server.robot_state.state["q_d"][3] == pytest.approx(
+        HOME[3] + 4 * dq_c[3] * DELTA_T, abs=1e-12
+    ), "four dispatched cycles, four milliseconds of reference"
+
+    # The client resumes with a *fresh* command answering a cycle beyond the
+    # run: the guesses stand, as they do on hardware, and it adds its own.
+    server.motion_limits.note_published(5)
+    server.robot_state.state["message_id"] = 5
+    _answer_cycle(server, 5, dq_c, fresh=True)
+    assert server.robot_state.state["q_d"][3] == pytest.approx(
+        HOME[3] + 5 * dq_c[3] * DELTA_T, abs=1e-12
+    )
+
+
+def test_a_backlog_of_late_datagrams_advances_the_reference_once_each(mock_physics_sim):
+    """A stalled receive thread hands over a whole run; each answers one cycle.
+
+    The rewind stays available for the whole run of losses, so the snapshot has
+    to survive it too: rewinding to the pre-gap reference for *every* datagram
+    in the backlog would put the arm back at HOME three times over.
+    """
+    server = _velocity_session(mock_physics_sim)
+    dq_c = [0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0]
+
+    server.motion_limits.note_published(1)
+    server.robot_state.state["message_id"] = 1
+    _answer_cycle(server, 1, dq_c, fresh=True)
+
+    for message_id in (2, 3, 4):
+        server.motion_limits.note_published(message_id)
+        server.robot_state.state["message_id"] = message_id
+        server._extrapolate_missed_cycle(message_id)
+
+    for message_id in (2, 3, 4):
+        _answer_cycle(server, message_id, dq_c, fresh=False)
+
+    assert server.robot_state.state["q_d"][3] == pytest.approx(
+        HOME[3] + 4 * dq_c[3] * DELTA_T, abs=1e-12
+    ), "four cycles of wall clock, four cycles of reference"
+
+
 def test_an_extrapolated_command_is_not_dispatched_under_a_newer_motion(mock_physics_sim):
     """A ``Move`` accepted mid-gap must not have the old motion's fields applied.
 
@@ -4591,6 +4719,473 @@ def test_a_joint_only_excursion_still_reports_the_joint_error(serve, client, moc
     assert state[ERRORS_SLICE][CARTESIAN_VELOCITY_VIOLATION_INDEX] == 0
 
 
+# -- the self-collision reflex ------------------------------------------------
+#
+# ``self_collision_avoidance_violation``: the arm folding onto itself, watched
+# in every control mode like the rest of the safety controller. The geometric
+# reading comes from the physics backend (see MujocoFrankaSim.self_collision and
+# its tests); everything below is what the FCI layer does with it.
+
+
+#: A margin wide enough that every distance below is unambiguously inside it.
+SELF_COLLISION_TEST_MARGIN = 0.05
+
+
+def touching(distance=0.01, first="link1", second="link5", margin=SELF_COLLISION_TEST_MARGIN):
+    """A self-collision reading shaped as the backend publishes one."""
+    return SelfCollisionContact(first, second, distance, margin)
+
+
+def approach(checker, *distances):
+    """Feed a run of readings; return the verdict on the last one."""
+    violation = None
+    for distance in distances:
+        violation = checker.check_self_collision(
+            None if distance is None else touching(distance=distance)
+        )
+    return violation
+
+
+def armed(control_mode=ControlMode.VELOCITY, **kwargs):
+    """A checker with a motion running, ready to be handed readings."""
+    checker = MotionLimitChecker(**kwargs)
+    checker.start_motion(control_mode, {"q": list(HOME), "dq": [0.0] * 7})
+    return checker
+
+
+def test_the_self_collision_error_index_is_the_enums_own():
+    """``Error::kSelfcollisionAvoidanceViolation`` is enumerator 2 (error.h:11)."""
+    assert SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX == 2
+    assert ERROR_NAMES[SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX] == (
+        "self_collision_avoidance_violation"
+    )
+
+
+def test_the_self_collision_check_fires_on_a_closing_approach():
+    checker = armed()
+    assert checker.check_self_collision(None) is None
+
+    violation = approach(checker, 0.02, 0.02 - SELF_COLLISION_CLOSING_DISTANCE)
+    assert violation is not None
+    assert violation.error_index == SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX
+    assert violation.error_name == "self_collision_avoidance_violation"
+    assert violation.axis == "link1/link5"
+    assert violation.value == pytest.approx(0.02 - SELF_COLLISION_CLOSING_DISTANCE)
+    assert violation.limit == pytest.approx(SELF_COLLISION_TEST_MARGIN)
+    assert violation.unit == "m"
+
+
+def test_entering_the_margin_is_not_itself_the_violation():
+    """The first reading of an approach seeds the high-water mark, it does not fire."""
+    checker = armed()
+    assert checker.check_self_collision(touching(distance=0.02)) is None
+    # ...and neither does standing still inside it, however long.
+    assert approach(checker, *([0.02] * 50)) is None
+
+
+def test_a_motion_that_retreats_out_of_the_margin_is_never_stopped():
+    """DEFECT REGRESSION: the arm the reflex parked inside the margin must get out.
+
+    The abort leaves the arm where it stopped, i.e. inside the margin, so the
+    next ``Move`` starts there. Judging "inside" as the violation aborted that
+    motion on its first cycle and made homing impossible -- the acceptance
+    suite's ``moveP2P`` back to the start pose threw
+    ``self_collision_avoidance_violation`` 1 ms after ``kMotionStarted``, one
+    test after the reflex had correctly fired. A retreat must be legal.
+    """
+    checker = armed()
+    parked = SELF_COLLISION_TEST_MARGIN - 1e-4  # where the abort left it
+    retreat = [parked + step * 1e-4 for step in range(120)]
+    assert approach(checker, parked, *retreat) is None
+    # ...including the cycle it finally leaves the margin on, and after it.
+    assert approach(checker, None, None) is None
+
+
+def test_a_retreat_that_turns_back_deeper_fires_from_where_it_got_to():
+    """The high-water mark ratchets up, so backing off is not a free pass."""
+    checker = armed()
+    # In to 0.02, out to 0.03 (no fire either way), then back past 0.029.
+    assert approach(checker, 0.02, 0.025, 0.03) is None
+    assert approach(checker, 0.03 - 0.5 * SELF_COLLISION_CLOSING_DISTANCE) is None
+    violation = approach(checker, 0.03 - SELF_COLLISION_CLOSING_DISTANCE)
+    assert violation is not None
+
+
+def test_leaving_the_margin_re_arms_the_approach_from_scratch():
+    """A fresh episode is judged on its own closing, not the previous one's."""
+    checker = armed()
+    assert approach(checker, 0.02, 0.019) is not None  # closed 1 mm: fires
+    assert approach(checker, None) is None  # links separate
+    assert approach(checker, 0.019) is None, "a new episode starts clear"
+
+
+def test_interpenetration_fires_whatever_direction_the_arm_is_going():
+    """No direction argument excuses links that are already through each other."""
+    checker = armed()
+    assert checker.check_self_collision(touching(distance=-0.001)) is not None
+
+
+def test_a_new_motion_judges_its_own_approach():
+    """``start_motion`` clears the high-water mark; that is what frees a homing Move."""
+    checker = armed()
+    assert approach(checker, 0.02, 0.019) is not None
+
+    checker.start_motion(ControlMode.POSITION, {"q": list(HOME), "dq": [0.0] * 7})
+    assert approach(checker, 0.019, 0.0195, 0.020) is None
+
+
+def test_the_self_collision_check_is_armed_in_torque_mode_too():
+    """It judges the arm, not the command -- the torque-control acceptance test.
+
+    ``moveSelfCollisionAvoidanceViolationWithTorqueControl`` folds joint 4 from
+    an external controller, so a check that needed a motion generator to
+    difference would never fire there.
+    """
+    checker = armed(ControlMode.TORQUE)
+    assert approach(checker, 0.02, 0.019) is not None
+
+    # ...and disarmed once the motion is over, exactly as the velocity halves are.
+    checker.end_motion()
+    assert approach(checker, 0.02, 0.019) is None
+
+
+def test_the_self_collision_check_keeps_firing_while_the_arm_closes():
+    """No edge latch on the *verdict*: an abort refused once must be retriable."""
+    checker = armed()
+    approach(checker, 0.02)
+    for step in range(1, 6):
+        assert (
+            checker.check_self_collision(
+                touching(distance=0.02 - step * SELF_COLLISION_CLOSING_DISTANCE)
+            )
+            is not None
+        )
+
+
+def test_each_new_contact_episode_logs_again(caplog):
+    """Unenforced, the warning is per episode -- not once per motion, not per cycle."""
+    checker = armed()
+
+    with caplog.at_level(logging.WARNING, logger="franka_sim.motion_limits"):
+        approach(checker, 0.02)
+        for step in range(1, 4):
+            checker.report(
+                checker.check_self_collision(
+                    touching(distance=0.02 - step * SELF_COLLISION_CLOSING_DISTANCE)
+                ),
+                enforced=False,
+            )
+        assert len(caplog.records) == 1, "one episode must not log once per cycle"
+
+        checker.check_self_collision(None)  # the links separate: the episode ends
+        approach(checker, 0.02)
+        checker.report(checker.check_self_collision(touching(distance=0.019)), enforced=False)
+        assert len(caplog.records) == 2, "a second episode must be reported"
+
+
+def test_recovery_re_arms_the_self_collision_check():
+    """A latched reflex is cleared by AutomaticErrorRecovery, this one included."""
+    checker = armed()
+    assert approach(checker, 0.02, 0.019) is not None
+
+    checker.recover()
+    assert approach(checker, 0.02, 0.019) is None
+
+    checker.start_motion(ControlMode.VELOCITY, {"q": list(HOME), "dq": [0.0] * 7})
+    assert approach(checker, 0.02, 0.019) is not None
+
+
+#: A closing distance wide enough that every step in the tests below is
+#: unambiguously inside or outside it, unlike the 1 mm default where a 1 mm step
+#: written as ``0.020 - 0.019`` lands 1e-18 on the wrong side of the comparison.
+WIDE_CLOSING_DISTANCE = 0.010
+
+
+def test_each_link_pair_is_judged_on_its_own_approach():
+    """DEFECT REGRESSION: one shared high-water mark judged a pair by another's approach.
+
+    The backend publishes only the *closest* pair, so a single mark is set by
+    whichever pair the reading happened to be about. With link1/link5 sitting
+    25 mm off and its mark at 30 mm, the cycle the reading first switches to
+    link2/link6 at 20 mm fires -- 10 mm of "closing" that no link travelled and
+    an abort in the middle of a motion that was moving away from everything.
+    """
+    checker = armed(self_collision_closing_distance=WIDE_CLOSING_DISTANCE)
+    first = {"first": "link1", "second": "link5"}
+    second = {"first": "link2", "second": "link6"}
+
+    # link1/link5 enters at 30 mm and closes 5 mm: its own mark is 30 mm.
+    assert checker.check_self_collision(touching(distance=0.030, **first)) is None
+    assert checker.check_self_collision(touching(distance=0.025, **first)) is None
+
+    # link2/link6 becomes the closest pair, 20 mm out. It has closed nothing.
+    assert checker.check_self_collision(touching(distance=0.020, **second)) is None
+    assert checker.check_self_collision(touching(distance=0.015, **second)) is None
+    violation = checker.check_self_collision(touching(distance=0.010, **second))
+    assert violation is not None, "its own 10 mm of closing must still fire"
+    assert violation.axis == "link2/link6"
+
+    # ...and link1/link5 is still judged on its own 30 mm mark when it comes back.
+    assert checker.check_self_collision(touching(distance=0.024, **first)) is None
+    assert checker.check_self_collision(touching(distance=-0.001, **first)) is not None
+
+
+def test_a_new_motion_clears_every_pairs_clearance_mark():
+    """The reset contract, 1 of 3: ``start_motion``.
+
+    Discriminating on purpose. The arm is left 20 mm inside the margin -- where
+    a reflex abort parks it -- and the next motion's first reading is at 9 mm.
+    Cleared, that reading only seeds the new motion's mark and nothing fires,
+    which is what makes a homing ``Move`` out of the margin possible at all.
+    Kept, the stale 20 mm mark reads it as 11 mm of closing and aborts the
+    homing motion on its first cycle.
+    """
+    checker = armed(self_collision_closing_distance=WIDE_CLOSING_DISTANCE)
+    assert approach(checker, 0.020) is None
+    assert checker._self_collision_clearance == {"link1/link5": 0.020}
+
+    checker.start_motion(ControlMode.POSITION, {"q": list(HOME), "dq": [0.0] * 7})
+
+    assert checker._self_collision_clearance == {}
+    assert approach(checker, 0.009) is None, "the new motion judges its own approach"
+
+
+def test_ending_a_motion_clears_every_pairs_clearance_mark():
+    """The reset contract, 2 of 3: ``end_motion``.
+
+    Asserted on the table rather than on a verdict, and it has to be:
+    ``end_motion`` disarms the safety controller, so every reading after it
+    answers None whatever the mark holds, and the only call that re-arms it --
+    ``start_motion`` -- clears the table itself. The state is the observable,
+    and without it nothing in the suite tells this reset from its absence.
+    """
+    checker = armed(self_collision_closing_distance=WIDE_CLOSING_DISTANCE)
+    assert approach(checker, 0.020) is None
+    assert checker._self_collision_clearance == {"link1/link5": 0.020}
+
+    checker.end_motion()
+
+    assert checker._self_collision_clearance == {}
+
+
+def test_error_recovery_clears_every_pairs_clearance_mark():
+    """The reset contract, 3 of 3: ``recover``.
+
+    ``AutomaticErrorRecovery`` puts the robot back to where a fresh ``Move`` can
+    be accepted, and a mark left over from the fold that latched the reflex
+    would make the *next* motion's first reading inside the margin an abort. On
+    the table for the same reason as ``end_motion`` above: ``recover`` disarms
+    the safety controller too.
+    """
+    checker = armed(self_collision_closing_distance=WIDE_CLOSING_DISTANCE)
+    assert approach(checker, 0.020) is None
+    assert checker._self_collision_clearance == {"link1/link5": 0.020}
+
+    checker.recover()
+
+    assert checker._self_collision_clearance == {}
+
+
+def _self_collision_server(mock_physics_sim, *, enforce):
+    """A server object wired to a mocked backend; nothing is bound or served."""
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(
+        physics_sim=mock_physics_sim, enable_gripper=False, enforce_motion_limits=enforce
+    )
+    server._motion_generation = 5
+    server.motion_limits.start_motion(
+        ControlMode.VELOCITY, {"q": list(HOME), "dq": [0.0] * 7}, motion_id=5
+    )
+    return server
+
+
+def _snapshot(contact):
+    return {
+        "q": np.array(HOME),
+        "dq": np.zeros(7),
+        "tau_J": np.zeros(7),
+        "self_collision": contact,
+    }
+
+
+def _close_in(server, *distances):
+    """Publish a run of snapshots through the server's per-cycle check."""
+    for distance in distances:
+        server._run_self_collision_check(
+            _snapshot(None if distance is None else touching(distance=distance))
+        )
+
+
+def test_enforced_a_self_collision_aborts_the_motion(mock_physics_sim):
+    """The reflex the acceptance test waits for: kReflex with bit 2 latched."""
+    server = _self_collision_server(mock_physics_sim, enforce=True)
+
+    _close_in(server, 0.02, 0.019)
+
+    state = server.robot_state.state
+    assert state["errors"][SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX] is True
+    assert state["reflex_reason"][SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX] is True
+    assert sum(bool(bit) for bit in state["errors"]) == 1, "no second error rode along"
+    assert state["robot_mode"] == RobotMode.kReflex
+    assert server.motion_limits.violated is True
+
+
+def test_unenforced_a_self_collision_only_warns(mock_physics_sim, caplog):
+    """The gating decision: detection always runs, the abort is opt-in."""
+    server = _self_collision_server(mock_physics_sim, enforce=False)
+
+    with caplog.at_level(logging.WARNING, logger="franka_sim.motion_limits"):
+        _close_in(server, 0.02, 0.019)
+
+    assert "self_collision_avoidance_violation" in caplog.text
+    assert "(not enforced)" in caplog.text
+    assert not any(server.robot_state.state["errors"])
+    assert server.motion_limits.violated is False
+
+
+def test_enforced_a_motion_that_only_retreats_is_not_aborted(mock_physics_sim):
+    """DEFECT REGRESSION, at the server: a homing Move from inside the margin runs.
+
+    The server-level twin of
+    test_a_motion_that_retreats_out_of_the_margin_is_never_stopped -- the abort
+    plumbing must never be reached, so nothing is latched and the ``Move`` is
+    never answered ``kReflexAborted``.
+    """
+    server = _self_collision_server(mock_physics_sim, enforce=True)
+
+    parked = SELF_COLLISION_TEST_MARGIN - 1e-4
+    _close_in(server, parked, *[parked + step * 1e-4 for step in range(120)], None)
+
+    assert not any(server.robot_state.state["errors"])
+    assert server.motion_limits.violated is False
+    assert server._pending_move_response is None
+
+
+def test_a_backend_that_publishes_no_reading_is_left_alone(mock_physics_sim):
+    """The Genesis backend and the mocked ones carry no ``self_collision`` key."""
+    server = _self_collision_server(mock_physics_sim, enforce=True)
+
+    server._run_self_collision_check({"q": np.array(HOME), "dq": np.zeros(7)})
+    server._run_self_collision_check({"q": np.array(HOME), "dq": np.zeros(7)})
+    _close_in(server, None, None)
+    server._run_self_collision_check(None)
+
+    assert not any(server.robot_state.state["errors"])
+
+
+def test_the_mobile_base_role_skips_the_self_collision_check(mock_physics_sim):
+    """The monitored pairs are the FR3's links; a swerve base has none of them."""
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(
+        physics_sim=mock_physics_sim,
+        enable_gripper=False,
+        mobile_base=True,
+        enforce_motion_limits=True,
+    )
+    server._motion_generation = 5
+    server.motion_limits.start_motion(
+        ControlMode.VELOCITY, {"q": list(HOME), "dq": [0.0] * 7}, motion_id=5
+    )
+
+    _close_in(server, 0.02, 0.019)
+
+    assert not any(server.robot_state.state["errors"])
+
+
+# -- the motion generator's reference in an external-controller session -------
+#
+# ``kExternalController`` replaces the controller, not the generator: the robot
+# still runs the joint motion generator the Move asked for and still reports its
+# output in q_d/dq_d/ddq_d, which is the only thing a client's torque callback
+# has to servo against. See
+# FrankaSimServer._echo_external_controller_generator.
+
+
+def _generator_server(mock_physics_sim, controller_mode, generator_mode):
+    """A server object with the modes a Move would have set; nothing is served."""
+    from franka_sim.franka_protocol import (
+        LibfrankaControllerMode,
+        LibfrankaMotionGeneratorMode,
+    )
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
+    server.robot_state.set_controller_mode(getattr(LibfrankaControllerMode, controller_mode))
+    server.robot_state.set_motion_generator_mode(
+        getattr(LibfrankaMotionGeneratorMode, generator_mode)
+    )
+    server.robot_state.state["q_d"] = list(HOME)
+    server.robot_state.state["dq_d"] = [0.0] * 7
+    return server
+
+
+@pytest.mark.parametrize(
+    "controller_mode", ["kExternalController", "kJointImpedance"], ids=["external", "internal"]
+)
+def test_a_velocity_generator_integrates_its_reference_into_q_d(
+    mock_physics_sim, controller_mode
+):
+    """DEFECT REGRESSION: ``q_d`` is the integrated reference, not a frozen value.
+
+    A joint-velocity generator commands no position, but the robot reports one --
+    and the sim used to leave it frozen for the whole motion. Two real clients
+    break on that: a torque controller servoing ``200 * (q_d - q)`` reads a zero
+    error for ever (the acceptance suite's torque variant ran 300 s with the arm
+    stock still), and libfranka's ``MotionGenerator`` seeds ``q_start`` from
+    ``q_d``, so the next motion plans a zero-length trajectory from a pose the
+    arm left long ago.
+    """
+    server = _generator_server(mock_physics_sim, controller_mode, "kJointVelocity")
+    dq_c = [0.0, 0.0, 0.0, -0.1, -0.2, 0.0, 0.0]
+
+    for _ in range(1000):
+        server._dispatch_control_command(command(dq_c=dq_c))
+
+    state = server.robot_state.state
+    assert state["dq_d"] == pytest.approx(dq_c), "the commanded velocity must be echoed"
+    expected = [HOME[i] + dq_c[i] * 1000 * DELTA_T for i in range(7)]
+    assert state["q_d"] == pytest.approx(expected, abs=1e-9)
+
+
+def test_an_external_controller_reports_the_generators_acceleration(mock_physics_sim):
+    """``ddq_d`` is the backward difference of the commanded velocity, not the torque rate.
+
+    The limit checker is armed in TORQUE mode for an external-controller session
+    -- it judges ``tau_J_d`` -- so its differences are torque rates, and reusing
+    them here would put Nm/s into a rad/s^2 field.
+    """
+    server = _generator_server(mock_physics_sim, "kExternalController", "kJointVelocity")
+
+    server._dispatch_control_command(command(dq_c=[0.0] * 7))
+    server._dispatch_control_command(command(dq_c=[0.0, 0.0, 0.0, -0.002, 0.0, 0.0, 0.0]))
+
+    assert server.robot_state.state["ddq_d"][3] == pytest.approx(-2.0)
+
+
+def test_an_external_controller_position_generator_reports_its_waypoint(mock_physics_sim):
+    """The other joint generator: ``q_d`` is the commanded waypoint itself."""
+    server = _generator_server(mock_physics_sim, "kExternalController", "kJointPosition")
+    waypoint = [0.1, 0.2, 0.3, -1.4, 0.5, 1.6, 0.7]
+
+    server._dispatch_control_command(command(q_c=waypoint))
+
+    assert server.robot_state.state["q_d"] == pytest.approx(waypoint)
+
+
+def test_a_pure_torque_session_reports_no_generator_reference(mock_physics_sim):
+    """``startTorqueControl`` runs no generator, so ``q_d`` must not drift."""
+    server = _generator_server(mock_physics_sim, "kExternalController", "kIdle")
+
+    for _ in range(50):
+        server._dispatch_control_command(command(dq_c=[1.0] * 7, tau_J_d=[0.5] * 7))
+
+    assert server.robot_state.state["q_d"] == pytest.approx(HOME)
+    assert server.robot_state.state["dq_d"] == pytest.approx([0.0] * 7)
+    assert server.robot_state.state["tau_J_d"] == pytest.approx([0.5] * 7)
+
+
 # -- singular start poses -----------------------------------------------------
 
 
@@ -5190,3 +5785,166 @@ def test_a_half_radian_step_aborts_over_the_real_wire(live_server, client):
     assert state[ERRORS_SLICE][JOINT_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX] == 1
     assert state[ERRORS_SLICE][JOINT_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION_INDEX] == 0
     assert state[ROBOT_MODE_INDEX] == RobotMode.kReflex
+
+
+def test_an_external_controller_can_actually_drive_the_arm(live_server, client):
+    """DEFECT REGRESSION, over the real wire: the two-callback pattern must work.
+
+    ``robot.control(torque_callback, motion_callback)`` -- the shape every
+    libfranka torque client uses, and the one the acceptance suite's
+    ``moveSelfCollisionAvoidanceViolationWithTorqueControl`` runs -- has the
+    motion callback stream ``dq_c`` while the torque callback servos against the
+    ``q_d`` the robot reports back. With ``q_d`` frozen and ``dq_d`` pinned at
+    zero, that PD computes exactly 0 Nm and the arm never moves: the acceptance
+    test ran 300 s with the arm stock still and no reflex could ever fire.
+    """
+    server = live_server(enforce=True)
+    wire = client()
+    wire.connect()
+    assert wire.move(
+        ControllerMode.kExternalController, MotionGeneratorMode.kJointVelocity
+    ) == MoveStatus.kMotionStarted
+
+    started = np.array(wire.read_state()[Q_SLICE])
+    commanded = np.zeros(7)
+    torque = np.zeros(7)
+    for _ in range(1500):
+        state = wire.read_state()
+        measured = np.array(state[Q_SLICE])
+        reference = np.array(state[Q_D_SLICE])
+        commanded[3] = max(-0.1, commanded[3] - 0.5 * DELTA_T)
+        # The acceptance test's controller, in shape: a PD on the reference the
+        # robot reports, with no knowledge of what was commanded.
+        torque[3] = 200.0 * (reference[3] - measured[3])
+        wire.answer(dq_c=list(commanded), tau_j_d=list(torque))
+
+    state = wire.read_state()
+    reference = np.array(state[Q_D_SLICE])
+    measured = np.array(state[Q_SLICE])
+
+    assert reference[3] < started[3] - 0.1, "q_d never integrated the commanded velocity"
+    assert state[DQ_D_SLICE][3] == pytest.approx(commanded[3], abs=1e-6)
+    assert measured[3] < started[3] - 0.05, "the client's torque never moved the arm"
+    assert not any(state[ERRORS_SLICE])
+    assert server.motion_limits.violated is False
+
+
+#: ``kInitPoseSelfCollision`` (``robot_test_fixture.h``), the pose the
+#: acceptance test moves to before folding joint 4.
+INIT_POSE_SELF_COLLISION = np.array(
+    [0.0693453, 0.175089, -0.0697772, -1.88166, 0.0163913, 1.1729, 0.641234]
+)
+
+
+def test_the_folding_scenario_aborts_with_the_self_collision_reflex():
+    """The acceptance provocation, closed loop over real physics.
+
+    ``moveSelfCollisionAvoidanceViolation*`` folds joint 4 towards -0.1 rad/s
+    (at -0.5 rad/s^2) while twisting joint 5 towards -0.2 rad/s, from
+    ``kInitPoseSelfCollision``, until the links come together. Driven here
+    through the backend's own velocity servo, with the reflex enforced.
+
+    The second assertion is the one that matters for *which* error the client
+    reads. The same fold ends with joint 4 against its position limit, where the
+    position-based velocity envelope collapses towards zero and the commanded
+    -0.1 rad/s becomes ``joint_motion_generator_velocity_limits_violation``; the
+    self-collision margin has to win, and by enough that ordinary timing jitter
+    cannot reorder them. Measured lead here: ~0.8 s, i.e. ~800 control cycles.
+
+    No sockets: the reflex is raised from the publish loop's own per-cycle call,
+    which is exactly what this drives.
+    """
+    if FR3_MJCF is None or not FR3_MJCF.exists():
+        pytest.skip("the MuJoCo Menagerie FR3 model is neither cached nor downloadable")
+
+    sim = MujocoFrankaSim()
+    sim.initialize_simulation()
+    try:
+        # Park on the acceptance test's start pose before the fold begins.
+        sim.data.qpos[sim.arm_qpos_adr] = INIT_POSE_SELF_COLLISION
+        sim.data.qvel[sim.arm_dofs_idx] = 0.0
+        sim.update_joint_positions(INIT_POSE_SELF_COLLISION.copy())
+        sim.set_control_mode(ControlMode.POSITION)
+        sim.step(200)
+
+        server = FrankaSimServer(physics_sim=sim, enable_gripper=False, enforce_motion_limits=True)
+        server._motion_generation = 3
+        server.motion_limits.start_motion(
+            ControlMode.VELOCITY,
+            {"q": list(sim.get_robot_state()["q"]), "dq": [0.0] * 7},
+            motion_id=3,
+        )
+        sim.set_control_mode(ControlMode.VELOCITY)
+
+        commanded = np.zeros(7)
+        aborted_at = None
+        envelope_lost_at = None
+        for cycle in range(14000):
+            commanded[3] = max(-0.1, commanded[3] - 0.5 * DELTA_T)
+            commanded[4] = max(-0.2, commanded[4] - 0.5 * DELTA_T)
+            sim.update_joint_velocities(commanded.copy())
+            sim.step(1)
+            state = sim.get_robot_state()
+            if (
+                envelope_lost_at is None
+                and commanded[3] < lower_joint_velocity_limits(state["q"])[3]
+            ):
+                envelope_lost_at = cycle
+            server._run_self_collision_check(state)
+            if aborted_at is None and server.motion_limits.violated:
+                aborted_at = cycle
+                break
+
+        assert aborted_at is not None, "the fold never raised the reflex"
+        assert envelope_lost_at is None, (
+            "joint 4's velocity envelope collapsed first: the client would read "
+            "joint_motion_generator_velocity_limits_violation, not the reflex"
+        )
+
+        errors = server.robot_state.state["errors"]
+        assert errors[SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX] is True
+        assert sum(bool(bit) for bit in errors) == 1
+        assert server.robot_state.state["robot_mode"] == RobotMode.kReflex
+
+        # --- and now back out again ------------------------------------------
+        #
+        # DEFECT REGRESSION, end to end. The abort leaves the arm parked inside
+        # the margin, so the acceptance suite's next test opens with a
+        # ``moveP2P`` *from* there -- and with the reflex judging "inside the
+        # margin" rather than "closing", that homing Move was aborted 1 ms after
+        # kMotionStarted and threw outside its own EXPECT_THROW. Recover, start
+        # a fresh motion from exactly where the reflex stopped the arm, and ramp
+        # back to the start pose: it must run to completion untouched.
+        assert sim.self_collision() is not None, "the abort should park it in the margin"
+        server.motion_limits.recover()
+        server._motion_generation = 4
+        parked = np.array(sim.get_robot_state()["q"])
+        server.motion_limits.start_motion(
+            ControlMode.POSITION, {"q": list(parked), "dq": [0.0] * 7}, motion_id=4
+        )
+        sim.update_joint_positions(parked)
+        sim.set_control_mode(ControlMode.POSITION)
+
+        left_margin_at = None
+        for cycle in range(6000):
+            alpha = min(1.0, 0.5 * (1.0 - math.cos(math.pi * min(cycle, 4000) / 4000)))
+            sim.update_joint_positions(parked + alpha * (INIT_POSE_SELF_COLLISION - parked))
+            sim.step(1)
+            server._run_self_collision_check(sim.get_robot_state())
+            assert not server.motion_limits.violated, (
+                f"the retreat was aborted at cycle {cycle}: an arm the reflex "
+                "stopped can never be driven out of the margin"
+            )
+            if left_margin_at is None and sim.self_collision() is None:
+                left_margin_at = cycle
+
+        assert left_margin_at is not None, "the retreat never left the margin"
+        # Back where the acceptance suite's homing puts it, ready for the next
+        # test. (``errors`` still carries the first abort's bit: only the
+        # server's AutomaticErrorRecovery handler clears the wire state, and
+        # this test drives the checker directly.)
+        assert sim.get_robot_state()["q"] == pytest.approx(
+            INIT_POSE_SELF_COLLISION, abs=5e-3
+        )
+    finally:
+        sim.stop()

@@ -195,6 +195,27 @@ ELBOW_POSITION_LIMITS = JOINT_POSITION_LIMITS[2]
 # binds each named member to ``errors_[static_cast<size_t>(Error::k...)]``
 # (``src/errors.cpp``). Line numbers below are that enum's declarations.
 
+#: ``kSelfcollisionAvoidanceViolation`` (``error.h:11``) ->
+#: ``self_collision_avoidance_violation`` (``error.h:116-117``).
+#:
+#: **A geometry error, and the safety controller's third signal.** Like
+#: :data:`JOINT_VELOCITY_VIOLATION_INDEX` and
+#: :data:`CARTESIAN_VELOCITY_VIOLATION_INDEX` it judges the *arm*, not the
+#: command, so it is armed in every control mode -- including pure external
+#: torque control, which is one of the two ways the reference provocation runs
+#: it (``moveSelfCollisionAvoidanceViolationWithTorqueControl`` folds joint 4
+#: from a client-side torque controller, with a joint-velocity generator only
+#: for the reference; the other variant commands the velocities directly).
+#: Both fold joint 4 at 0.1 rad/s while twisting joint 5 at 0.2 rad/s to get the
+#: gripper out of the way, until the links come together.
+#:
+#: The robot's own model is a set of *inflated* volumes around each link -- the
+#: same simplification ``franka_description`` ships as its collision meshes --
+#: so the reflex fires with a safety offset still standing, before the real
+#: geometry touches. What the sim measures against is documented on
+#: :data:`franka_sim.mujoco_franka_sim.SELF_COLLISION_MARGIN`.
+SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX = 2
+
 #: ``kJointVelocityViolation`` (``error.h:12``) ->
 #: ``joint_velocity_violation`` (``error.h:108-109``; ``franka::Errors`` binds
 #: it at ``src/errors.cpp:32``).
@@ -352,6 +373,7 @@ TAU_J_RANGE_VIOLATION_INDEX = 34
 #: (``error.h:52-138``). Used in the log lines so a message can be grepped
 #: straight against libfranka's own vocabulary.
 ERROR_NAMES = {
+    SELF_COLLISION_AVOIDANCE_VIOLATION_INDEX: "self_collision_avoidance_violation",
     JOINT_VELOCITY_VIOLATION_INDEX: "joint_velocity_violation",
     CARTESIAN_VELOCITY_VIOLATION_INDEX: "cartesian_velocity_violation",
     JOINT_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX: (
@@ -578,6 +600,46 @@ MEASURED_JOINT_VELOCITY_MARGIN = 0.1
 #: (the fastest point-to-point moves observed peak near 1 m/s), so there is no
 #: jitter at the boundary to absorb.
 MEASURED_CARTESIAN_VELOCITY_LIMIT = MAX_TRANSLATIONAL_VELOCITY
+
+#: How much further *into* the self-collision margin the arm must travel, in
+#: metres, before ``self_collision_avoidance_violation`` fires -- measured from
+#: the widest clearance seen since *that link pair* entered the margin. Per
+#: pair, because the backend reports only the closest one: a mark shared across
+#: pairs would judge a pair by an approach another pair made.
+#:
+#: **Not a libfranka constant**, and not a second threshold on top of
+#: :data:`franka_sim.mujoco_franka_sim.SELF_COLLISION_MARGIN` either. It is what
+#: makes the reflex *directional*, which the real one is: hardware's
+#: self-collision avoidance resists motion **into** the zone and still lets you
+#: drive out of it. Without that, an arm the reflex has just stopped is stuck --
+#: it is parked inside the margin, so every subsequent ``Move`` aborts on its
+#: first cycle and no homing or recovery motion is possible. That is exactly
+#: what the acceptance suite catches: with the reflex firing correctly on the
+#: first fold, the *next* test's ``moveP2P`` back to the start pose was aborted
+#: 1 ms after ``kMotionStarted``, throwing outside its own ``EXPECT_THROW``.
+#:
+#: So a reading inside the margin is judged against that pair's episode
+#: high-water clearance rather than against the margin alone: closing by this
+#: much fires, holding still does not, and retreating re-arms from wherever the
+#: arm got back to. (Actual interpenetration -- a non-positive separation --
+#: fires regardless, since no direction argument excuses links that are already
+#: through each other. Reachable only by a one-cycle teleport, which needs
+#: enforcement off.)
+#:
+#: 1 mm, placed against the two things it separates on the sim's own FR3, both
+#: measured over 400-1500 cycle runs of the link1/link5 pair:
+#:
+#: * **Noise and wobble, ~50 um.** Holding a pose inside the margin, MuJoCo's
+#:   reported separation moves 48.9 um peak to peak; a full homing retreat out
+#:   of the margin dips at most 40.3 um below its own running maximum. Even a
+#:   monotone approach shows single cycles moving *outward* by up to 56.8 um,
+#:   which is why this is a cumulative test against a high-water mark and not a
+#:   per-cycle derivative -- the latter is unusable in both directions.
+#: * **The delay it costs, ~31 cycles.** The reference provocation closes at
+#:   31.8 um per cycle, so 1 mm is 31 ms of extra detection lag against the
+#:   833 cycles of lead the margin holds over the next error the same fold can
+#:   raise. 20x the noise floor, and 4% of the lead.
+SELF_COLLISION_CLOSING_DISTANCE = 0.001
 
 #: Smallest singular value of the end-effector Jacobian at or below which a
 #: configuration counts as *singular*, so that a ``Move`` asking for a Cartesian

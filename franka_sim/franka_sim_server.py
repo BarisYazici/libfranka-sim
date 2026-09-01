@@ -29,7 +29,7 @@ import argparse
 import select
 import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from franka_sim.comm_constraints import (
     CommConstraintTracker,
@@ -186,6 +186,15 @@ class FrankaSimServer(
         #: recognised as belonging to a motion that is already over. Never
         #: reused, unlike current_motion_id (a client's Move command_id).
         self._motion_generation = 0
+        #: The published ``q_d`` as it stood before the current run of
+        #: extrapolated cycles, or None when no run is open. The wire-side
+        #: counterpart of the limit checker's ``_gap_snapshot``: when a late
+        #: datagram makes the checker throw the guesses away, this puts the
+        #: reference back too, so the cycle the datagram answers is integrated
+        #: once and not twice. See
+        #: :meth:`_extrapolate_missed_cycle` and
+        #: :meth:`_absorb_within_motion_limits`.
+        self._extrapolated_reference: Optional[List[float]] = None
         #: ``(motion_id, status)`` owed to the client, flushed by the state loop
         #: *after* the state carrying the error is on the wire; see
         #: :meth:`_abort_with_error`.

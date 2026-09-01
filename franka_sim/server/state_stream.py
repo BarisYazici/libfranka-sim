@@ -306,10 +306,13 @@ class StateStreamMixin:
                     self._publish_commanded_pose(sim_state)
                     self._publish_elbow(sim_state)
 
-                    # The safety controller: measured velocity against the
-                    # position-based envelope, every cycle, in every control
-                    # mode. Judges the arm, not the command, so it lives here
-                    # rather than on the UDP receive path.
+                    # The safety controller: the arm folding onto itself, and
+                    # measured velocity against the position-based envelope,
+                    # every cycle, in every control mode. All three judge the
+                    # arm, not the command, so they live here rather than on the
+                    # UDP receive path. Geometry first; see
+                    # _run_self_collision_check for why the order is that way.
+                    self._run_self_collision_check(sim_state)
                     self._run_safety_velocity_check(sim_state)
 
                     # Everything above is this cycle's work; the pacing sleep
