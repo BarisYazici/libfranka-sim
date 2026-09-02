@@ -5,7 +5,6 @@ import logging
 import os
 import sys
 import threading
-import time
 from typing import Optional
 
 from franka_sim.franka_protocol import COMMAND_PORT
@@ -50,7 +49,7 @@ MOBILE_DUO_PHYSICS = {
 DEFAULT_PHYSICS = "mujoco"
 
 
-def _arm_exit_watchdog(timeout: float = SHUTDOWN_WATCHDOG_S) -> None:
+def _arm_exit_watchdog(timeout: float = SHUTDOWN_WATCHDOG_S) -> threading.Timer:
     """Last resort: force the process out if shutdown wedges past ``timeout``.
 
     Not the shutdown mechanism -- everything in ``stop()`` is ordered, bounded
@@ -62,18 +61,30 @@ def _arm_exit_watchdog(timeout: float = SHUTDOWN_WATCHDOG_S) -> None:
     and only ``os._exit`` (no atexit, no finalisation) can do it without
     re-entering the very code that is stuck.
 
-    A daemon thread, so it never delays a shutdown that does complete: if the
-    process exits first, this thread simply dies with it and nothing is printed.
+    Returns the armed ``Timer`` so :func:`_shutdown` can ``cancel()`` it once
+    ``stop()`` returns -- cleanly or via a caught exception -- so a shutdown
+    that finishes well inside ``timeout`` never fires this at all. A cancelled
+    ``Timer`` never runs its function, so an in-process caller that starts and
+    stops many servers over its lifetime (a test suite embedding
+    ``run_single_arm``/``run_mobile_duo`` directly, as opposed to a CLI process
+    that exits right after) is not left with a ticking, un-cancellable
+    ``os._exit`` armed against it. Still a daemon thread as a backstop: if
+    cancellation itself never runs (the interpreter dies between arming and
+    ``_shutdown``'s ``finally``), the process exits instead of hanging forever,
+    and it never delays a process exit that beats it there.
     """
-
-    def _bail():
-        time.sleep(timeout)
-        _force_exit(
+    watchdog = threading.Timer(
+        timeout,
+        _force_exit,
+        args=(
             f"Shutdown did not finish within {timeout:.0f}s (stuck in native "
-            "teardown); forcing exit."
-        )
-
-    threading.Thread(target=_bail, name="shutdown-watchdog", daemon=True).start()
+            "teardown); forcing exit.",
+        ),
+    )
+    watchdog.name = "shutdown-watchdog"
+    watchdog.daemon = True
+    watchdog.start()
+    return watchdog
 
 
 def _force_exit(message: str, code: int = 130) -> None:
@@ -101,14 +112,25 @@ def _shutdown(stoppable) -> None:
     had not been released yet (the listening socket, the viewer's GL context)
     left dangling. Catching it turns the second press into what the user meant
     by it: leave now.
+
+    The watchdog is cancelled in ``finally`` -- once ``stop()`` has returned,
+    by whichever path -- rather than left to expire on its own. It is only a
+    backstop for teardown wedged in native code; a ``stop()`` that returns (or
+    raises something ordinary, caught above) is not that, and every caller
+    outside a CLI process that exits right afterwards (tests included) would
+    otherwise inherit an ``os._exit(130)`` timed for up to ``SHUTDOWN_WATCHDOG_S``
+    later, armed against whatever the process happens to be doing by then.
     """
-    _arm_exit_watchdog()
+    watchdog = _arm_exit_watchdog()
     try:
         stoppable.stop()
     except KeyboardInterrupt:
         _force_exit("\nInterrupted during shutdown; exiting now.")
     except Exception:
         logging.getLogger(__name__).exception("Error during shutdown")
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
 
 def resolve_scene_class(physics: str):
