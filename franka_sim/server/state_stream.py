@@ -354,6 +354,7 @@ class StateStreamMixin:
                     # after this point missed this packet, which is what
                     # _flush_pending_move_response keys off.
                     self._states_packed += 1
+                    sent_message_id = self.robot_state.state["message_id"]
                     state = self.robot_state.pack_state()
                     if self.udp_socket and not self.udp_socket._closed:
                         self.udp_socket.sendto(state, (client_address, client_udp_port))
@@ -362,6 +363,15 @@ class StateStreamMixin:
                         # a datagram really went out (and, with it, that the
                         # socket has been implicitly bound to a real port).
                         self.states_sent += 1
+                        # Also after the send, for the same reason: this is
+                        # the id a client could actually have in hand right
+                        # now, as opposed to robot_state.state["message_id"]
+                        # (bumped by update() below, before the datagram for
+                        # the *next* id has gone out). See reset_state() in
+                        # lifecycle.py for why handle_move_command reads this
+                        # field, not the state dict, to seed a new motion's
+                        # epoch.
+                        self._last_published_message_id = sent_message_id
                         # Inside the guard: a state that was never sent cannot
                         # be the one a deferred kReflexAborted is waiting to
                         # follow.

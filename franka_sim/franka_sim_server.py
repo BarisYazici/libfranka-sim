@@ -215,6 +215,14 @@ class FrankaSimServer(
         #: port stays 0 until the first ``sendto`` implicitly binds it, and that
         #: is what waiters used to key off.
         self.states_sent = 0
+        #: The highest ``message_id`` a datagram has actually gone out on,
+        #: written by the publish loop right after its ``sendto()`` succeeds
+        #: (:meth:`start_robot_state_transmission`). Deliberately *not*
+        #: ``robot_state.state["message_id"]``: that counter is bumped before
+        #: the datagram for the new id is on the wire, which is one id too
+        #: optimistic for :attr:`_motion_epoch_id` to seed itself from --
+        #: see :meth:`handle_move_command`.
+        self._last_published_message_id = 0
         #: ``message_id`` that was current when the running motion's ``Move``
         #: was accepted, and whether any control command of it has arrived yet.
         #: Together they identify a ``*_finished`` datagram left over from the

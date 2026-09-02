@@ -80,7 +80,15 @@ class MotionSessionMixin:
           motion fits inside one publish cycle echoes the epoch id itself, and
           treating that as stale would leave it waiting for a ``kSuccess`` that
           never comes. Equality costs a rare missed stale datagram; the other
-          way round costs a hang.
+          way round costs a hang. This is also why the epoch is seeded from
+          ``self._last_published_message_id`` rather than
+          ``self.robot_state.state["message_id"]``: the latter is bumped by
+          the publish loop's own ``update()`` *before* the datagram for that
+          new id has gone out (see ``start_robot_state_transmission`` in
+          ``state_stream.py``), so reading it here could seed an epoch one
+          id ahead of anything the client could possibly hold yet -- turning
+          the client's own first, legitimate answer into exactly the "other
+          way round" this bullet is about.
         * **no control command of the running motion has been seen yet.** A
           client streams before it finishes, so a finish arriving before any
           command is not this motion's. A belt to the first condition's braces:
@@ -588,7 +596,17 @@ class MotionSessionMixin:
                 # A fresh session token for this motion; see _motion_generation.
                 self._motion_generation += 1
                 generation = self._motion_generation
-                self._motion_epoch_id = self.robot_state.state["message_id"]
+                # NOT self.robot_state.state["message_id"]: that counter is
+                # bumped by the publish loop's own update() *before* the
+                # datagram carrying the next id has actually gone out (send,
+                # then drain-gate/accounting, then update() -- see
+                # start_robot_state_transmission), so reading it here can
+                # observe an id one ahead of anything the client could
+                # possibly have received yet. self._last_published_message_id
+                # is written *after* the sendto() that id belongs to, so it
+                # never promises a datagram that is not already on the wire.
+                # See its docstring for the failure this produced.
+                self._motion_epoch_id = self._last_published_message_id
                 self._motion_has_commands = False
                 # No run of losses is open on a motion that has not started;
                 # the checker drops its own snapshot in start_motion below.

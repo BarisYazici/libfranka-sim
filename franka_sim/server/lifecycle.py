@@ -40,6 +40,10 @@ class LifecycleMixin:
         self._pending_move_response = None
         self._states_packed = 0
         self.states_sent = 0
+        # See FrankaSimServer.__init__ for what this is and why
+        # handle_move_command seeds _motion_epoch_id from it rather than from
+        # robot_state.state["message_id"].
+        self._last_published_message_id = 0
         self._motion_epoch_id = 0
         self._motion_has_commands = False
         self._extrapolated_reference = None
