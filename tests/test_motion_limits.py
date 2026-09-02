@@ -3104,9 +3104,32 @@ class WireClient:
                 pass
 
 
-def wait_for_server(port, timeout=5.0):
-    """Block until the FCI accept loop answers on ``port``."""
+def wait_for_server(server, port, timeout=5.0):
+    """Block until *this* server's own FCI accept loop answers on ``port``.
+
+    Whose accept loop it is matters, and the difference is a whole
+    nondeterministic failure mode. ``_bind_listener`` deliberately refuses to
+    co-bind -- no ``SO_REUSEPORT``, so a second bind dies with ``EADDRINUSE`` --
+    which means that when anything else already holds the port (a second pytest
+    session, a stray ``run-franka-sim-server``) this server's ``run_server``
+    thread is dead before the fixture returns, while the *stranger* goes on
+    answering a plain "does the port accept?" probe. The fixture would then hand
+    back a server that never listened: the test's ``WireClient`` talks to the
+    stranger, and the assertions read a ``motion_limits`` checker that nothing
+    drove. What that produces is a different unreproducible handful of failed
+    wire tests on every run, each of which passes in isolation -- and no hint
+    anywhere in the failure that the port was the problem.
+
+    So ownership is checked first, off ``running``, which ``run_server`` sets
+    only once its own ``bind``/``listen`` has succeeded. The port probe stays
+    behind it: it is what proves the loop is actually reachable, and it is
+    cheap.
+    """
     deadline = time.time() + timeout
+    while time.time() < deadline and not server.running:
+        time.sleep(0.01)
+    if not server.running:
+        return False
     while time.time() < deadline:
         try:
             probe = socket.create_connection(("127.0.0.1", port), timeout=1.0)
@@ -4041,7 +4064,10 @@ def serve(mock_arm_sim):
         )
         thread = threading.Thread(target=server.run_server, daemon=True)
         thread.start()
-        assert wait_for_server(COMMAND_PORT), "the FCI server never came up"
+        assert wait_for_server(server, COMMAND_PORT), (
+            f"this test's FCI server never took port {COMMAND_PORT} -- something "
+            "else is listening there"
+        )
         started.append((server, thread))
         return server
 
@@ -5727,7 +5753,10 @@ def live_server():
         sim.running = True
         physics_thread = threading.Thread(target=sim.run_simulation, daemon=True)
         physics_thread.start()
-        assert wait_for_server(COMMAND_PORT), "the FCI server never came up on port 1337"
+        assert wait_for_server(server, COMMAND_PORT), (
+            f"this test's FCI server never took port {COMMAND_PORT} -- something "
+            "else is listening there"
+        )
         made.append((server, sim, accept_thread, physics_thread))
         return server
 
