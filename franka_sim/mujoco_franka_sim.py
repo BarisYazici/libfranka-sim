@@ -161,15 +161,6 @@ SELF_COLLISION_MIN_LINK_SEPARATION = 3
 #: detected".
 SELF_COLLISION_LINKS = tuple(range(8))
 
-#: Wall-clock lag (s) the paced loop catches up on before it gives up and
-#: resynchronises its deadline. ``viewer.sync()`` blocks on the render thread's
-#: mutex for ~12 ms, so every rendered frame leaves the loop a dozen steps
-#: behind; resynchronising at less than a frame's worth of lag would *discard*
-#: that simulated time rather than make it up. The bound still exists so a
-#: genuinely overloaded loop cannot spiral -- past this much lag the backlog is
-#: dropped and the RTF monitor reports the truth.
-MAX_CATCHUP_LAG_S = 0.25
-
 
 def default_fr3_mjcf() -> Path:
     """Resolve the FR3 MJCF physics model (MuJoCo Menagerie ``franka_fr3_v2``).
@@ -1049,11 +1040,24 @@ class MujocoFrankaSim:
                 if next_render < now:
                     next_render = now + render_period
 
+            # Pace to realtime: advance one dt of sim-time per dt of wall-time.
+            # If a step takes longer than dt, run flat out (no catch-up burst).
             next_step += self.dt
             now = time.perf_counter()
             if next_step > now:
                 time.sleep(next_step - now)
-            elif now - next_step > MAX_CATCHUP_LAG_S:
+            elif now - next_step > self.dt:
+                # Fell a full step behind (e.g. a ~12 ms viewer.sync() under
+                # load): resync both schedules instead of bursting mj_step to
+                # make up the lost wall time. A 1 kHz client reads one
+                # RobotState per 1 ms of simulated time; measured under
+                # viewer + CPU load, bursting let 58 physics steps land
+                # between two published states 16.9 ms apart wall-clock, so
+                # the client's PD servo saw a joint delta it read as
+                # instantaneous and answered with a torque spike that tripped
+                # controller_torque_discontinuity. Dropping the backlog here
+                # (RTF < 1, surfaced by the monitor below) keeps that
+                # one-state-per-ms invariant instead of hiding the stall.
                 next_step = now
                 next_render = max(next_render, next_step)
 

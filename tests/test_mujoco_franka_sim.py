@@ -14,6 +14,7 @@ import pytest
 
 mujoco = pytest.importorskip("mujoco")
 
+import franka_sim.mujoco_franka_sim as mujoco_franka_sim_module  # noqa: E402
 from franka_sim.control_modes import ControlMode  # noqa: E402
 from franka_sim.mujoco_franka_sim import (  # noqa: E402
     ARM_INITIAL_Q,
@@ -1093,3 +1094,63 @@ def test_the_grafted_hand_is_not_monitored(hand_sim):
     contact = hand_sim.self_collision()
     assert contact is not None
     assert {contact.first, contact.second} == {"link1", "link5"}
+
+
+# -- pacing ---------------------------------------------------------------
+
+
+def test_a_stalled_iteration_resyncs_instead_of_bursting_catchup_steps(sim, monkeypatch):
+    """A stall must drop the lost wall time, never sprint mj_step to make it up.
+
+    Regression for the torque-discontinuity bug: with the old 0.25 s
+    catch-up window, a ~12 ms viewer-sync stall left the loop's deadline far
+    enough behind that it looped without sleeping until it caught up --
+    measured (under viewer + CPU load) at 58-84 physics steps between two
+    published RobotStates 16.9 ms apart wall-clock. A 1 kHz client reads one
+    RobotState per 1 ms of simulated time, so that many steps in one
+    "instant" reads as a joint teleport; the PD servo answers with a torque
+    spike that trips ``controller_torque_discontinuity``. The fix
+    resynchronises the schedule as soon as it falls behind by more than one
+    physics step (matching the Genesis backend's "run flat out, no
+    catch-up burst"), so a stall costs simulated time (RTF < 1, reported by
+    the RTF monitor) instead of a burst of unpaced steps.
+
+    Uses a fake wall clock (perf_counter/sleep both redirected onto one
+    counter) so the "wall time lost to a stall" can be injected as a single
+    jump, deterministically, without an actual 20 ms sleep in the test.
+    """
+    fake_now = [0.0]
+
+    def fake_sleep(seconds):
+        fake_now[0] += seconds
+
+    monkeypatch.setattr(mujoco_franka_sim_module.time, "perf_counter", lambda: fake_now[0])
+    monkeypatch.setattr(mujoco_franka_sim_module.time, "sleep", fake_sleep)
+
+    real_mj_step = mujoco_franka_sim_module.mujoco.mj_step
+    step_times = []
+
+    def spy_mj_step(model, data):
+        step_times.append(fake_now[0])
+        real_mj_step(model, data)
+        if len(step_times) == 10:
+            # A stall that consumes wall time without going through the
+            # loop's own pacing sleep -- e.g. a slow viewer.sync() blocking
+            # inline between two iterations, or scheduler contention.
+            fake_now[0] += 0.02
+        elif len(step_times) == 40:
+            sim.running = False
+
+    monkeypatch.setattr(mujoco_franka_sim_module.mujoco, "mj_step", spy_mj_step)
+
+    sim.running = True
+    sim.run_simulation()
+
+    assert len(step_times) == 40
+    gaps = [b - a for a, b in zip(step_times, step_times[1:])]
+    # Every gap is either one paced dt, or the single injected 20 ms stall --
+    # never a run of ~0 s gaps (the burst signature of the old catch-up
+    # window, which would let a dozen-plus steps land back to back).
+    assert all(gap > 0 for gap in gaps), gaps
+    stall_gaps = [g for g in gaps if g > 5 * sim.dt]
+    assert len(stall_gaps) == 1, gaps

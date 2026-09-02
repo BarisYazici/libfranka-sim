@@ -109,21 +109,6 @@ SETTLE_STEPS = 100
 #: Group 3 is MuJoCo's convention for "collision only, hidden by default".
 COLLISION_GEOM_GROUP = 3
 
-#: Wall-clock lag (s) the paced loop catches up on before it gives up and
-#: resynchronises its deadline.
-#:
-#: ``viewer.sync()`` blocks on the mutex the viewer's render thread holds while
-#: it draws, which measures ~12 ms per call on this host, so every rendered
-#: frame leaves the loop ~12 steps behind. Resynchronising at anything less
-#: than a frame's worth of lag *discards* that simulated time instead of making
-#: it up -- ~0.36 s per wall-clock second at 30 FPS, which is exactly the 0.70x
-#: real-time factor the viewer used to cost. Catching up takes ~17 un-slept
-#: steps and finishes long before the next frame is due.
-#:
-#: The bound still exists so a genuinely overloaded loop cannot spiral: past
-#: this much lag the backlog is dropped and the RTF monitor reports the truth.
-MAX_CATCHUP_LAG_S = 0.25
-
 #: MuJoCo compiler settings injected into the URDF as a ``<mujoco>`` extension
 #: element. ``strippath=false`` keeps the absolute mesh paths that
 #: ``resolve_urdf_meshes`` wrote (MuJoCo defaults to basename-only for URDF);
@@ -770,11 +755,24 @@ class MobileDuoMujocoScene:
                 if next_render < now:
                     next_render = now + render_period
 
+            # Pace to realtime: advance one dt of sim-time per dt of wall-time.
+            # If a step takes longer than dt, run flat out (no catch-up burst).
             next_step += self.dt
             now = time.perf_counter()
             if next_step > now:
                 time.sleep(next_step - now)
-            elif now - next_step > MAX_CATCHUP_LAG_S:
+            elif now - next_step > self.dt:
+                # Fell a full step behind (e.g. a ~12 ms viewer.sync() under
+                # load): resync both schedules instead of bursting mj_step to
+                # make up the lost wall time. A 1 kHz client reads one
+                # RobotState per 1 ms of simulated time; measured under
+                # viewer + CPU load, bursting let 58 physics steps land
+                # between two published states 16.9 ms apart wall-clock, so
+                # the client's PD servo saw a joint delta it read as
+                # instantaneous and answered with a torque spike that tripped
+                # controller_torque_discontinuity. Dropping the backlog here
+                # (RTF < 1, surfaced by the monitor below) keeps that
+                # one-state-per-ms invariant instead of hiding the stall.
                 next_step = now
                 next_render = max(next_render, next_step)
 
