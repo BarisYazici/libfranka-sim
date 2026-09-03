@@ -693,7 +693,12 @@ have no monitored pair within 200 mm at all.
 
 **Neighbours are excluded, on measurement rather than principle.** Only links at
 least three apart in the chain are monitored. Adjacent links touch by
-construction (link0 and link1 sit ~1 mm apart in every configuration). The
+construction (link0 and link1 sit 0.1–1.2 mm apart, and their Menagerie
+collision hulls actually overlap by ~0.1 mm around `q1 ≈ 0.22 rad`; that pair is
+the one neighbour MuJoCo's parent-child filter does not drop, because link0 is
+welded to the world, so the sim excludes it explicitly — otherwise the overlap
+acts as a friction brake on joint 1 that a torque controller cannot push
+through). The
 once-removed pairs are excluded because they behave the same way: link5 and
 link7 are **10–22 mm** apart in *every* configuration — their relative pose
 depends only on joints 6 and 7 — which is inside the margin and closer than the

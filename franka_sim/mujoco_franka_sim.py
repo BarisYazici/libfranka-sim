@@ -137,7 +137,9 @@ SELF_COLLISION_MARGIN = 0.05
 #: Adjacent links (``i``, ``i+1``) are the obvious exclusion -- they touch by
 #: construction, and on this model MuJoCo does not even filter link0/link1 for
 #: us (link0 carries no joint, so it welds to the world and the parent-child
-#: filter, which skips pairs involving the world weld, lets it through). The
+#: filter, which skips pairs involving the world weld, lets it through); that
+#: pair is taken out of the contact model altogether in
+#: :func:`_exclude_base_shoulder_contact`, because its hulls overlap. The
 #: once-removed pairs are excluded on measurement rather than principle:
 #: link5/link7 sit **10-22 mm** apart in every configuration -- their relative
 #: pose depends only on joints 6 and 7 -- which is *inside* this margin and
@@ -250,6 +252,8 @@ def build_model(enable_hand: bool = False, dt: float = DEFAULT_DT, model_path=No
     spec.option.timestep = dt
     spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION
 
+    _exclude_base_shoulder_contact(spec, prefix)
+
     # The real FR3 reports tau_J with gravity already removed, and the Genesis
     # sim loads the arm with gravity_compensation=1.0. MuJoCo's per-body
     # gravcomp is the exact analogue: it cancels weight only, leaving Coriolis,
@@ -272,6 +276,47 @@ def build_model(enable_hand: bool = False, dt: float = DEFAULT_DT, model_path=No
     model = spec.compile()
     del hand_spec
     return model, prefix
+
+
+def _exclude_base_shoulder_contact(spec, prefix: str) -> None:
+    """Turn off collision between ``link0`` (the base) and ``link1`` (the shoulder).
+
+    They are adjacent links joined by joint 1, and adjacent links never collide
+    on the real robot: Control's self-collision model does not test them, and
+    neither does MuJoCo for any *other* neighbouring pair -- its parent-child
+    filter drops those automatically. link0/link1 is the one pair that filter
+    lets through: link0 carries no joint, so it is welded to the world, and the
+    filter deliberately keeps world-vs-child contacts (a body must be able to
+    rest on the floor it is attached to). So on the unmodified Menagerie
+    ``fr3v2`` model the two convex collision hulls *are* collided, and they sit
+    0.1-1.2 mm apart, interpenetrating by ~0.1 mm over a band of joint-1 angles
+    (measured: ``dist = -0.096 mm`` at ``q1 = 0.226 rad`` with libccd, and
+    negative from about 0.20 to 0.23 rad).
+
+    That overlap is a physical brake the real arm does not have. Passing
+    through it at speed costs one step of ~75 Nm of ``qfrc_constraint`` on
+    joint 1; arriving in it slowly, under a torque controller, is worse -- the
+    contact's dry friction (mesh ``friction`` 1.0) holds joint 1 against
+    everything a compliant controller can bring: measured, 5 Nm of commanded
+    torque on joint 1 answered by -4.99 Nm of constraint torque and the joint
+    parked at ``q1 = 0.223``. franky's Cartesian-impedance null-space posture
+    task (20 Nm/rad) stalled there with its target 0.27 rad away, which is what
+    this was found from. The position servo (4.5 kNm/rad) never noticed.
+
+    A pair exclusion is the exact MuJoCo counterpart of what the parent-child
+    filter does for every other neighbour, and it changes nothing else: the
+    self-collision reflex only monitors links three or more apart
+    (:data:`SELF_COLLISION_MIN_LINK_SEPARATION`), and the pair was already
+    skipped there by name. Skipped silently if either body is missing, so a
+    caller pointing ``$FR3_MJCF`` at a model without them still compiles.
+    """
+    first, second = f"{prefix}link0", f"{prefix}link1"
+    if spec.find_body(first) is None or spec.find_body(second) is None:
+        return
+    exclude = spec.add_exclude()
+    exclude.name = f"{first}_{second}"
+    exclude.bodyname1 = first
+    exclude.bodyname2 = second
 
 
 def _attach_hand(spec, hand_spec, prefix: str) -> None:
@@ -528,9 +573,11 @@ class MujocoFrankaSim:
         :data:`SELF_COLLISION_MIN_LINK_SEPARATION` links apart among
         :data:`SELF_COLLISION_LINKS`, which on the FR3 is 15 pairs. The margin
         goes on all eight link geoms even so -- a geom's margin is a property of
-        the geom, not of a pair, so an unmonitored pair (link0/link1, or an arm
+        the geom, not of a pair, so an unmonitored pair (link5/link7, or an arm
         link against the ground) simply shows up in ``mjData.contact`` and is
-        skipped by name in :meth:`self_collision`.
+        skipped by name in :meth:`self_collision`. (link0/link1 does not show
+        up at all: :func:`_exclude_base_shoulder_contact` removes that pair
+        from the contact model before compile.)
 
         A model without ``<prefix>linkN_collision`` geoms leaves both halves
         empty and the check silently off: no margin is touched, and
@@ -571,8 +618,8 @@ class MujocoFrankaSim:
 
         Reads ``mjData.contact`` as the last forward pass left it -- the
         collisions are already computed, so this adds no geometry work to the
-        step, only the scan. ``ncon`` is 2-4 on this model in practice (the
-        unmonitored link0/link1 near-touch, the ground, and whatever is genuinely
+        step, only the scan. ``ncon`` is 1-3 on this model in practice (the
+        unmonitored link5/link7 near-touch, the ground, and whatever is genuinely
         close), so the scan is a handful of dictionary lookups.
 
         *Closest*, not first: which pair is reported ends up in the log line and

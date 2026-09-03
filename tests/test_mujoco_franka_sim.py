@@ -906,8 +906,8 @@ def test_the_home_pose_reports_no_self_collision(sim):
     assert sim.get_robot_state()["self_collision"] is None
 
 
-def test_adjacent_links_touching_in_the_home_pose_do_not_trigger(sim):
-    """link0 and link1 sit ~1 mm apart in every configuration, by construction.
+def test_near_unmonitored_links_in_the_home_pose_do_not_trigger(sim):
+    """link5 and link7 sit 10-22 mm apart in every configuration, by construction.
 
     They *are* a contact at this margin -- MuJoCo reports them -- so a detector
     that only looked at ``ncon`` would fire on a freshly built arm. Only pairs
@@ -918,9 +918,61 @@ def test_adjacent_links_touching_in_the_home_pose_do_not_trigger(sim):
         (int(sim.data.contact[i].geom1), int(sim.data.contact[i].geom2))
         for i in range(sim.data.ncon)
     }
-    near = (_link_geom(sim, 0), _link_geom(sim, 1))
+    near = (_link_geom(sim, 5), _link_geom(sim, 7))
     assert near in pairs or near[::-1] in pairs, "the model changed; pick another near pair"
     assert sim.self_collision() is None
+
+
+def test_the_base_and_the_shoulder_are_excluded_from_contact(sim):
+    """link0/link1 is the one adjacent pair MuJoCo's parent filter lets through.
+
+    link0 is welded to the world, and world-vs-child contacts are kept on
+    purpose, so the unmodified Menagerie model collides the base hull with the
+    shoulder hull -- and the two overlap by ~0.1 mm around ``q1 = 0.22 rad``.
+    The pair is excluded before compile (see
+    :func:`franka_sim.mujoco_franka_sim._exclude_base_shoulder_contact`), so
+    it never reaches ``mjData.contact`` in any configuration, margin or not.
+    """
+    base, shoulder = _link_geom(sim, 0), _link_geom(sim, 1)
+    body_of = sim.model.geom_bodyid
+    assert sim.model.nexclude >= 1
+    signatures = {int(s) for s in sim.model.exclude_signature}
+    pair = (int(body_of[base]), int(body_of[shoulder]))
+    assert (pair[0] << 16 | pair[1]) in signatures or (pair[1] << 16 | pair[0]) in signatures
+
+    for q1 in (0.0, 0.20, 0.226, 0.23, -2.5, 2.5):
+        pose = ARM_INITIAL_Q.copy()
+        pose[0] = q1
+        _hold_at(sim, pose)
+        reported = {
+            tuple(sorted((int(sim.data.contact[i].geom1), int(sim.data.contact[i].geom2))))
+            for i in range(sim.data.ncon)
+        }
+        assert tuple(sorted((base, shoulder))) not in reported, q1
+
+
+def test_a_torque_on_joint_one_is_not_braked_by_the_base_hull(sim):
+    """The failure the exclusion was found from: a slow joint-1 approach stalls.
+
+    With the base/shoulder contact live, arriving at ``q1 ~ 0.22`` under a
+    compliant torque controller parked the joint: 5 Nm commanded, -4.99 Nm of
+    contact friction back, ``dq1 = -0.004``. Starting *inside* the overlap band
+    and pushing with a torque of the same order must accelerate the joint
+    through it like any other angle.
+    """
+    inside = ARM_INITIAL_Q.copy()
+    inside[0] = 0.223
+    _hold_at(sim, inside)
+
+    sim.set_control_mode(ControlMode.TORQUE)
+    sim.update_torques(np.array([5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    sim.step(200)
+
+    state = sim.get_robot_state()
+    assert state["q"][0] > inside[0] + 0.05
+    assert state["dq"][0] > 0.5
+    # Only the Menagerie's own 0.2 Nm of Coulomb friction resisted it.
+    assert sim.data.qfrc_constraint[sim.arm_dofs_idx[0]] == pytest.approx(-0.2, abs=1e-6)
 
 
 def test_folding_joint_four_onto_the_shoulder_is_detected(sim):
