@@ -1,8 +1,5 @@
 name: 'franka-sim server'
-description: >-
-  Start a headless franka-sim server (libfranka FCI simulator) in Docker and
-  wait until it serves the real wire protocol. Point any libfranka client or
-  franka_ros2 at 127.0.0.1 — no robot required.
+description: 'Start a franka-sim FCI server in Docker so libfranka and franka_ros2 CI jobs run against a simulated FR3 - no robot needed.'
 author: 'Baris Yazici'
 branding:
   icon: 'cpu'
