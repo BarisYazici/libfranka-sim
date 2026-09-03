@@ -146,14 +146,18 @@ class FrankaGripperServer:
         The status a command that did not succeed gets is not free-form:
         ``franka::Gripper``'s ``executeCommand`` (libfranka ``src/gripper.cpp``)
         maps kSuccess -> True, kUnsuccessful -> False, and both kFail and
-        kAborted -> a thrown ``CommandException``. A grasp that ends outside
-        the epsilon band is a *failed* grasp on the real hand -- the client is
-        supposed to see ``CommandException("libfranka gripper: Command
-        failed!")``, not a quiet False -- so it answers kFail.
+        kAborted -> a thrown ``CommandException``. So the two outcomes must not
+        be mixed up: a grasp that ran correctly and simply closed on nothing is
+        kUnsuccessful (``Gripper::grasp`` returns false, which
+        ``examples/grasp_object.cpp`` branches on), while kFail is reserved for
+        a command that could not be executed at all -- an out-of-stroke width,
+        an unparsable payload, an unknown command id. Backends signal the
+        latter by raising, which lands in the ``except`` below.
+
+        ``homing``/``move``/``stop`` return bools of the same kind: both
+        backends always succeed at them, so they only reach kFail by raising.
         """
         cmd = header.command
-        # What this command answers when the backend reports no success.
-        failure_status = GripperStatus.kUnsuccessful
         try:
             if cmd == GripperCommand.kHoming:
                 ok = self.backend.homing()
@@ -161,7 +165,6 @@ class FrankaGripperServer:
                 req = MoveRequest.from_bytes(payload)
                 ok = self.backend.move(req.width, req.speed)
             elif cmd == GripperCommand.kGrasp:
-                failure_status = GripperStatus.kFail
                 req = GraspRequest.from_bytes(payload)
                 ok = self.backend.grasp(
                     req.width, req.epsilon_inner, req.epsilon_outer, req.speed, req.force
@@ -172,7 +175,7 @@ class FrankaGripperServer:
                 logger.warning(f"Unknown gripper command: {cmd}")
                 sock.sendall(build_command_response(cmd, header.command_id, GripperStatus.kFail))
                 return
-            status = GripperStatus.kSuccess if ok else failure_status
+            status = GripperStatus.kSuccess if ok else GripperStatus.kUnsuccessful
         except Exception as exc:
             logger.error(f"Gripper command {cmd} failed: {exc}")
             status = GripperStatus.kFail

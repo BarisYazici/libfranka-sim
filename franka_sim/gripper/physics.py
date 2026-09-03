@@ -10,6 +10,7 @@ from franka_sim.gripper.backend import (
     FRANKA_HAND_MAX_WIDTH,
     GripperBackend,
     GripperStateData,
+    validate_grasp_width,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,9 +28,9 @@ class FrankaHandPhysics(GripperBackend):
     polling the sim's finger snapshot until the fingers settle (velocity ~0) or a
     timeout elapses -- matching the real franka::Gripper blocking semantics.
     ``get_state`` only reads the lock-free snapshot, so it is safe to call from
-    the UDP broadcaster thread concurrently. ``is_grasped``/``is_stuck`` are read
-    off where the fingers came to rest -- the epsilon band of
-    ``franka::Gripper::grasp`` -- so no engine contact-force API is needed.
+    the UDP broadcaster thread concurrently. ``is_grasped``/``is_stuck`` come from
+    a finger-position stall -- a grasp closes the fingers all the way and sees
+    where they were stopped -- so no engine contact-force API is needed.
     """
 
     def __init__(
@@ -40,6 +41,7 @@ class FrankaHandPhysics(GripperBackend):
         settle_timeout: float = 4.0,
         settle_velocity: float = 1e-3,
         poll_dt: float = 0.01,
+        stall_polls: int = 3,
     ):
         self.sim = physics_sim
         self.max_width = max_width
@@ -47,6 +49,7 @@ class FrankaHandPhysics(GripperBackend):
         self.settle_timeout = settle_timeout
         self.settle_velocity = settle_velocity
         self.poll_dt = poll_dt
+        self.stall_polls = stall_polls
         self.is_grasped = False
         self.is_stuck = False
 
@@ -70,6 +73,12 @@ class FrankaHandPhysics(GripperBackend):
         settled target (dq ~= 0). Treat low velocity as settled only after the
         fingers either reached the target or have visibly moved from the initial
         width, which covers both free motion and object-stall grasping.
+
+        Fingers that are already blocked when the command arrives -- a second
+        grasp on an object still held from the first -- neither reach the
+        target nor move, so a run of ``stall_polls`` consecutive near-zero
+        velocities also counts as settled. Without it that case would block for
+        the whole ``settle_timeout`` and then report itself stuck.
         """
         target = self._clamp_width(width)
         initial = self._current_width()
@@ -78,13 +87,15 @@ class FrankaHandPhysics(GripperBackend):
         if self.poll_dt:
             time.sleep(self.poll_dt)
         deadline = time.monotonic() + self.settle_timeout
+        still = 0
         while time.monotonic() < deadline:
             fs = self.sim.get_finger_state()
             current = float(fs["q"][0] + fs["q"][1])
             speed = float(np.max(np.abs(fs["dq"])))
             at_target = abs(current - target) < 1e-4
             moved = moved or abs(current - initial) > 1e-4
-            if speed < self.settle_velocity and (at_target or moved):
+            still = still + 1 if speed < self.settle_velocity else 0
+            if still and (at_target or moved or still >= self.stall_polls):
                 return current, True
             if self.poll_dt:
                 time.sleep(self.poll_dt)
@@ -122,31 +133,31 @@ class FrankaHandPhysics(GripperBackend):
         speed: float,
         force: float,
     ) -> bool:
-        """Close the fingers toward ``width`` and report the epsilon check.
+        """Close the fingers until they stall, then apply the epsilon band.
 
-        Success is where the fingers came to rest, exactly as
-        ``franka::Gripper::grasp`` documents it (``include/franka/gripper.h``):
-        the final distance ``d`` must satisfy ``width - epsilon_inner < d <
-        width + epsilon_outer``. That covers both outcomes the real hand has:
-        an object stalls the fingers wider than commanded (in band if it is
-        close enough to the commanded width), and free space lets them reach
-        the commanded width itself -- which is a success, not a failure.
+        The real hand does not *move* to ``width``: it closes under force until
+        the fingers stall, on an object or on each other, and then judges the
+        stall width against the band ``franka::Gripper::grasp`` documents
+        (``include/franka/gripper.h``): ``width - epsilon_inner < d < width +
+        epsilon_outer``, around the width the client asked for. So this drives
+        the fingers fully closed and reads where the object stopped them --
+        free space stops them at ~0, which is outside the band of any
+        meaningful commanded width and correctly returns False.
 
-        The band is around the width the client asked for, *not* the
-        stroke-clamped one, so a grasp commanded wider than the hand can open
-        fails instead of trivially matching its own clamp.
-        ``speed``/``force`` are accepted for protocol compatibility but not
-        used (no contact-force API here).
+        Position-stall stands in for force sensing: ``speed``/``force`` are
+        accepted for protocol compatibility but not used (no contact-force API
+        here). A ``width`` outside the stroke raises ``ValueError`` -> kFail.
         """
-        final, settled = self._drive_and_settle(width)
+        validate_grasp_width(width, self.max_width)
+        final, settled = self._drive_and_settle(0.0)
         grasped = width - epsilon_inner < final < width + epsilon_outer
         self.is_grasped = bool(grasped)
-        # Stuck = ended outside the band and never settled (still pushing at
-        # the timeout) rather than having come to rest somewhere wrong.
+        # Stuck = caught nothing and never settled (still pushing at the
+        # timeout) rather than having come to rest somewhere wrong.
         self.is_stuck = (not grasped) and (not settled)
         if not grasped:
             logger.info(
-                f"grasp: fingers settled at {final:.4f} m, outside the band "
+                f"grasp: fingers stalled at {final:.4f} m, outside the band "
                 f"({width - epsilon_inner:.4f}, {width + epsilon_outer:.4f}) m"
             )
         return self.is_grasped

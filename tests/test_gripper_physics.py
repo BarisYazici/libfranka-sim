@@ -1,6 +1,9 @@
-import numpy as np
+import time
 
-from franka_sim.gripper.backend import GripperStateData
+import numpy as np
+import pytest
+
+from franka_sim.gripper.backend import FrankaHandSim, GripperStateData
 from franka_sim.gripper.physics import FrankaHandPhysics
 
 
@@ -81,20 +84,45 @@ def test_grasp_ignores_stale_settled_snapshot_after_recommand():
     assert abs(hand.get_state().width - 0.03) < 5e-3
 
 
-def test_grasp_in_free_space_succeeds_at_the_commanded_width():
-    """Nothing in the way is a success, not a failure.
+def test_grasp_in_free_space_closes_fully_and_fails():
+    """Nothing in the way: the fingers close on each other and nothing is grasped.
 
-    ``franka::Gripper::grasp`` (``include/franka/gripper.h``) defines success
-    as the final finger distance landing in ``(width - epsilon_inner, width +
-    epsilon_outer)``; with nothing to stall on, the fingers reach the
-    commanded 0.02 exactly, the middle of that band.
+    The real hand closes under force until it stalls and only then applies
+    ``franka::Gripper::grasp``'s band ``(width - epsilon_inner, width +
+    epsilon_outer)``. With nothing to stall on, the stall width is ~0, far
+    outside the band around the commanded 0.04 -> false, per gripper.h's "True
+    if an object has been grasped, false otherwise".
     """
     sim = FakeSim(object_half=None)
     hand = _hand(sim)
-    ok = hand.grasp(0.02, epsilon_inner=0.005, epsilon_outer=0.02, speed=0.1, force=40)
+    ok = hand.grasp(0.04, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40)
+    assert ok is False
+    assert hand.get_state().is_grasped is False
+    assert hand.get_state().width < 5e-3
+
+
+def test_grasp_of_an_object_at_the_commanded_width_succeeds():
+    """Object exactly as wide as the command: the centre of the band, a grasp.
+
+    The pre-existing stall heuristic required the stall to be at least 1e-4
+    *wider* than the commanded width, so this -- the most natural way to
+    command a grasp -- failed. It must not.
+    """
+    sim = FakeSim(object_half=0.02)  # object 0.04 wide
+    hand = _hand(sim)
+    ok = hand.grasp(0.04, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40)
     assert ok is True
     assert hand.get_state().is_grasped is True
-    assert abs(hand.get_state().width - 0.02) < 5e-3
+    assert abs(hand.get_state().width - 0.04) < 5e-3
+
+
+def test_grasp_of_an_object_narrower_than_epsilon_inner_fails():
+    """A 0.03 object under a 0.04 command is 0.01 too small for eps_inner 0.005."""
+    hand = _hand(FakeSim(object_half=0.015))  # object 0.03 wide
+    assert hand.grasp(0.04, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40) is False
+    # The same object inside a wider inner tolerance is a grasp.
+    hand = _hand(FakeSim(object_half=0.015))
+    assert hand.grasp(0.04, epsilon_inner=0.02, epsilon_outer=0.005, speed=0.1, force=40) is True
 
 
 def test_grasp_object_outside_epsilon_is_unsuccessful():
@@ -107,19 +135,28 @@ def test_grasp_object_outside_epsilon_is_unsuccessful():
     assert hand.get_state().is_grasped is False
 
 
-def test_grasp_beyond_the_stroke_is_unsuccessful():
-    """The band is around the *requested* width, not the stroke-clamped one.
+def test_grasp_beyond_the_stroke_raises():
+    """An unreachable width is an error the server answers with kFail.
 
-    Commanding 0.09 m drives the fingers to the 0.08 m limit; 0.08 is outside
-    the band (0.085, 0.095), so this is a failed grasp rather than a trivial
-    match against the hand's own clamp. This is the franky-suite case
+    libfranka maps kUnsuccessful -> a quiet false and kFail -> CommandException
+    (``src/gripper.cpp``); a command outside the 0..0.08 m stroke belongs in
+    the second bucket. This is the franky-suite case
     (``test_gripper_grasp_failure``).
     """
-    sim = FakeSim(object_half=None)
+    hand = _hand(FakeSim(object_half=None))
+    with pytest.raises(ValueError):
+        hand.grasp(0.09, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40)
+
+
+def test_a_second_grasp_on_a_held_object_settles_without_waiting_out_the_timeout():
+    """Fingers already stalled on the object neither move nor reach the target."""
+    sim = FakeSim(object_half=0.02)  # object 0.04 wide
     hand = _hand(sim)
-    ok = hand.grasp(0.09, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40)
-    assert ok is False
-    assert hand.get_state().is_grasped is False
+    assert hand.grasp(0.04, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40) is True
+    started = time.monotonic()
+    assert hand.grasp(0.04, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40) is True
+    assert time.monotonic() - started < hand.settle_timeout / 2
+    assert hand.is_stuck is False
 
 
 def test_get_state_returns_gripper_state_data():
@@ -143,3 +180,27 @@ def test_stop_releases_grasp_and_opens_fully():
     state = hand.get_state()
     assert state.is_grasped is False
     assert abs(state.width - 0.08) < 5e-3
+
+
+@pytest.mark.parametrize(
+    "object_width, width, eps_in, eps_out, expected",
+    [
+        (None, 0.04, 0.005, 0.005, False),  # free space: fingers close on each other
+        (0.04, 0.04, 0.005, 0.005, True),  # object exactly at the commanded width
+        (0.03, 0.04, 0.005, 0.005, False),  # 0.01 too small for eps_inner 0.005
+        (0.03, 0.04, 0.02, 0.005, True),  # ... but inside eps_inner 0.02
+        (0.06, 0.02, 0.005, 0.02, False),  # object too big for eps_outer
+    ],
+)
+def test_stub_and_physics_backends_agree(object_width, width, eps_in, eps_out, expected):
+    """Same scenario, same answer: the kinematic stub is a faithful stand-in.
+
+    CI runs the stub; the viewer runs the physics backend. A client must not
+    have to know which one it is talking to.
+    """
+    stub = FrankaHandSim(object_width=object_width)
+    physics = _hand(FakeSim(object_half=None if object_width is None else object_width / 2))
+    assert stub.grasp(width, eps_in, eps_out, 0.1, 40.0) is expected
+    assert physics.grasp(width, eps_in, eps_out, 0.1, 40.0) is expected
+    assert stub.get_state().is_grasped is physics.get_state().is_grasped
+    assert abs(stub.get_state().width - physics.get_state().width) < 5e-3

@@ -289,9 +289,9 @@ def _exclude_base_shoulder_contact(spec, prefix: str) -> None:
     filter deliberately keeps world-vs-child contacts (a body must be able to
     rest on the floor it is attached to). So on the unmodified Menagerie
     ``fr3v2`` model the two convex collision hulls *are* collided, and they sit
-    0.1-1.2 mm apart, interpenetrating by ~0.1 mm over a band of joint-1 angles
-    (measured: ``dist = -0.096 mm`` at ``q1 = 0.226 rad`` with libccd, and
-    negative from about 0.20 to 0.23 rad).
+    0.1-1.2 mm apart, interpenetrating by ~0.1 mm over a narrow band of joint-1
+    angles (measured with libccd: ``dist = -0.096 mm`` at ``q1 = 0.226 rad``,
+    negative over 0.2144-0.2272 rad).
 
     That overlap is a physical brake the real arm does not have. Passing
     through it at speed costs one step of ~75 Nm of ``qfrc_constraint`` on
@@ -304,11 +304,15 @@ def _exclude_base_shoulder_contact(spec, prefix: str) -> None:
     this was found from. The position servo (4.5 kNm/rad) never noticed.
 
     A pair exclusion is the exact MuJoCo counterpart of what the parent-child
-    filter does for every other neighbour, and it changes nothing else: the
-    self-collision reflex only monitors links three or more apart
-    (:data:`SELF_COLLISION_MIN_LINK_SEPARATION`), and the pair was already
-    skipped there by name. Skipped silently if either body is missing, so a
-    caller pointing ``$FR3_MJCF`` at a model without them still compiles.
+    filter does for every other neighbour -- and it is what Menagerie itself
+    does: both ``franka_fr3/fr3.xml`` and ``franka_emika_panda/panda.xml`` ship
+    a ``<contact><exclude body1="link0" body2="link1"/></contact>``. Only the
+    ``fr3v2`` model this sim loads is missing it, so this adds it back. It
+    changes nothing else: the self-collision reflex only monitors links three
+    or more apart (:data:`SELF_COLLISION_MIN_LINK_SEPARATION`), and the pair
+    was already skipped there by name. Skipped silently if either body is
+    missing, so a caller pointing ``$FR3_MJCF`` at a model without them still
+    compiles.
     """
     first, second = f"{prefix}link0", f"{prefix}link1"
     if spec.find_body(first) is None or spec.find_body(second) is None:

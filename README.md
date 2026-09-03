@@ -183,8 +183,9 @@ python -m franka_sim.run_server -v
 
 # Arm + gripper, physics-backed Franka Hand: the hand mesh is loaded and the
 # finger DOFs are simulated, so homing/move/grasp visibly move the fingers in
-# the viewer (a grasp succeeds when the fingers settle within epsilon of the
-# commanded width, whether they stalled on an object or reached it in free air)
+# the viewer (as on the real hand, a grasp closes the fingers until they stall
+# and succeeds only if the stall width is within epsilon of the commanded one,
+# so grasping thin air returns false)
 python -m franka_sim.run_server -v --gripper-physics
 
 # Disable the gripper server entirely

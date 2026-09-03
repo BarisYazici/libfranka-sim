@@ -19,6 +19,20 @@ class GripperStateData:
     temperature: int
 
 
+def validate_grasp_width(width: float, max_width: float) -> None:
+    """Raise ``ValueError`` if ``width`` is not a width the hand can be asked for.
+
+    A grasp width outside the 0..``max_width`` stroke is not a grasp that
+    missed, it is a command the hand cannot execute. libfranka distinguishes
+    the two: ``executeCommand`` (``src/gripper.cpp``) turns kUnsuccessful into
+    a quiet ``false`` and kFail into ``CommandException``. The server turns the
+    exception raised here into kFail; a grasp that ran and simply found nothing
+    returns ``False`` instead.
+    """
+    if not 0.0 <= width <= max_width:
+        raise ValueError(f"grasp width {width} m is outside the 0..{max_width} m stroke")
+
+
 class GripperBackend(ABC):
     """Swappable gripper backend.
 
@@ -48,16 +62,25 @@ class GripperBackend(ABC):
         speed: float,
         force: float,
     ) -> bool:
-        """Grasp at ``width`` (m); return True if the grasp succeeded.
+        """Grasp at ``width`` (m); return True only if an object was grasped.
 
-        Success is defined exactly as ``franka::Gripper::grasp`` documents it
-        (``include/franka/gripper.h``): "An object is considered grasped if
-        the distance d between the gripper fingers satisfies (width -
-        epsilon_inner) < d < (width + epsilon_outer)" -- a check on where the
-        fingers came to rest, not on whether something was configured to be
-        between them. The band is centred on the width the *client* asked
-        for, even when that is outside the hand's stroke, so a command the
-        fingers cannot reach fails.
+        A grasp is not a move to ``width``: the real Franka Hand closes the
+        fingers *under force* until they stall -- on an object, or on each
+        other at ~0 m -- and only then judges the result. The judgement is the
+        one ``franka::Gripper::grasp`` documents (``include/franka/gripper.h``):
+        "An object is considered grasped if the distance d between the gripper
+        fingers satisfies (width - epsilon_inner) < d < (width +
+        epsilon_outer)", the band being centred on the width the *client* asked
+        for.
+
+        So with nothing between the fingers they close to ~0, which is outside
+        the band of any non-zero commanded width, and the call returns False --
+        "True if an object has been grasped, false otherwise", which is what
+        libfranka's own ``examples/grasp_object.cpp`` branches on.
+
+        Implementations raise ``ValueError`` for a width outside the hand's
+        stroke (see :func:`validate_grasp_width`); the server answers that with
+        kFail rather than the kUnsuccessful of a missed grasp.
         """
 
     @abstractmethod
@@ -78,12 +101,11 @@ class FrankaHandSim(GripperBackend):
     Width updates are instant: a command sets the final width and returns,
     which is enough to be wire-compatible with ``franka::Gripper`` and fully
     unit-testable. An optional ``object_width`` stands in for something
-    between the fingers: it stops them there instead of at the commanded
-    width. Whether the resulting grasp *succeeded* is then the same epsilon
-    check the real hand applies (see :meth:`GripperBackend.grasp`), so a
-    free-space close to a reachable width succeeds, exactly as it does on the
-    robot. Timed/physical motion can replace the internals later without
-    changing the interface.
+    between the fingers: a grasp closes toward 0 and stops there instead,
+    which is what the physics backend gets from an actual stall. Whether the
+    resulting grasp *succeeded* is then the same epsilon check the real hand
+    applies (see :meth:`GripperBackend.grasp`). Timed/physical motion can
+    replace the internals later without changing the interface.
     """
 
     def __init__(
@@ -123,19 +145,24 @@ class FrankaHandSim(GripperBackend):
         speed: float,
         force: float,
     ) -> bool:
-        """Close to ``width`` and report whether the fingers settled in the band.
+        """Close the fingers until they stall, then apply the epsilon band.
 
-        An object wider than the commanded width stops the fingers early (the
-        fingers can only close, so it never pushes them further open than they
-        already are); otherwise they reach the commanded width, clamped to the
-        hand's stroke. The epsilon band is around the *requested* ``width``,
-        unclamped -- asking for more than the hand can open to must fail.
+        Modelled on the real hand (see :meth:`GripperBackend.grasp`): the
+        fingers close from where they are toward 0 and stop at the first thing
+        they meet -- a configured ``object_width`` narrower than the current
+        opening, or each other. ``speed`` is not simulated (the stub has no
+        clock), and ``force`` is not applied as a limit.
+
+        An object at least as wide as the current opening cannot be between
+        the fingers -- they are already inside it -- so it does not stall
+        them; without that guard a stale ``self.width`` would report a grasp
+        with the fingers narrower than the object they supposedly hold.
         """
-        target = self._clamp(width)
-        if self.object_width is not None and self.object_width > target:
-            final = min(self.object_width, self.width)
+        validate_grasp_width(width, self.max_width)
+        if self.object_width is not None and self.object_width < self.width:
+            final = max(self.object_width, 0.0)
         else:
-            final = target
+            final = 0.0
         self.width = final
         self.is_grasped = width - epsilon_inner < final < width + epsilon_outer
         return self.is_grasped

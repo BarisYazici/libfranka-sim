@@ -138,13 +138,14 @@ def test_grasp_success_with_object(gripper_server, gripper_backend):
         udp.close()
 
 
-def test_grasp_in_free_space_is_a_success(gripper_server):
-    """No object is not a failure: the fingers reach the commanded width.
+def test_grasp_in_free_space_is_unsuccessful(gripper_server):
+    """A grasp that closed on nothing is kUnsuccessful, not kFail.
 
-    ``franka::Gripper::grasp`` (``include/franka/gripper.h``) calls a grasp
-    successful when the final finger distance is inside ``(width -
-    epsilon_inner, width + epsilon_outer)``, which the commanded width itself
-    always is.
+    ``franka::Gripper``'s ``executeCommand`` (libfranka ``src/gripper.cpp``)
+    turns kUnsuccessful into the quiet ``false`` that ``Gripper::grasp``
+    documents ("True if an object has been grasped, false otherwise") and
+    kFail into ``CommandException``. Nothing errored here -- the fingers just
+    met each other -- so the client must see ``false``.
     """
     sock = _open_client()
     udp, udp_port = _open_udp()
@@ -154,28 +155,25 @@ def test_grasp_in_free_space_is_a_success(gripper_server):
         _send_with_payload(sock, GripperCommand.kGrasp, 5, payload)
         header, resp = _recv_response(sock)
         (status,) = struct.unpack("<H", resp)
-        assert status == GripperStatus.kSuccess
+        assert status == GripperStatus.kUnsuccessful
     finally:
         sock.close()
         udp.close()
 
 
-def test_grasp_outside_epsilon_answers_kfail(gripper_server):
-    """A grasp that ends outside the band is kFail, not kUnsuccessful.
+def test_grasp_beyond_the_stroke_answers_kfail(gripper_server):
+    """A width the hand has no way to reach is an error: kFail -> CommandException.
 
-    ``franka::Gripper``'s ``executeCommand`` (libfranka ``src/gripper.cpp``)
-    turns kUnsuccessful into a quiet ``false`` and kFail into
-    ``CommandException("libfranka gripper: Command failed!")`` -- the latter
-    is what a client is supposed to see from a grasp that did not take hold.
-    Commanded 0.09 m is past the 0.08 m stroke, so the fingers stop outside
-    the band (0.085, 0.095).
+    kFail is what libfranka turns into ``CommandException("libfranka gripper:
+    Command failed!")``, which is the right answer for a command that could
+    not be executed at all -- as opposed to one that ran and grasped nothing.
     """
     sock = _open_client()
     udp, udp_port = _open_udp()
     try:
         _connect(sock, udp_port)
         payload = struct.pack("<ddddd", 0.09, 0.005, 0.005, 0.1, 60.0)
-        _send_with_payload(sock, GripperCommand.kGrasp, 5, payload)
+        _send_with_payload(sock, GripperCommand.kGrasp, 6, payload)
         header, resp = _recv_response(sock)
         assert header.command == GripperCommand.kGrasp
         (status,) = struct.unpack("<H", resp)
