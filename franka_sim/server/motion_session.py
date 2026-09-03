@@ -2031,6 +2031,11 @@ class MotionSessionMixin:
 
     def handle_stop_move_command(self, client_socket, header: MessageHeader):
         """Handle StopMove command received over TCP"""
+        responded = False
+        # Snapshot the peer the state stream is talking to: it is set by the
+        # state thread when transmission starts and cleared by reset_state on
+        # disconnect, and this handler runs on neither of those threads.
+        peer = (self.client_address, self.client_udp_port)
         try:
             logger.info("Processing StopMove command")
 
@@ -2044,11 +2049,12 @@ class MotionSessionMixin:
 
             self._send_tcp(client_socket, header_bytes + response_data)
             logger.info("Sent StopMove success response")
+            responded = True
 
             self._engage_idle_hold("StopMove")
 
             # Send one final state with both modes set to idle
-            if hasattr(self, "udp_socket") and self.udp_socket:
+            if hasattr(self, "udp_socket") and self.udp_socket and None not in peer:
                 # Update state to idle modes -- unless a reflex is latched, in
                 # which case the modes already left kMove and ``robot_mode``
                 # is kReflex. Overwriting that with kIdle would tell the
@@ -2063,7 +2069,7 @@ class MotionSessionMixin:
                 # Send state with new message ID
                 self.robot_state.update()  # This increments message_id
                 final_state = self.robot_state.pack_state()
-                self.udp_socket.sendto(final_state, (self.client_address, self.client_udp_port))
+                self.udp_socket.sendto(final_state, peer)
                 logger.info(f"Sent final robot state with message_id:\
                           {self.robot_state.state['message_id']}")
 
@@ -2103,6 +2109,11 @@ class MotionSessionMixin:
 
         except Exception as e:
             logger.error(f"Error handling StopMove command: {e}")
+            if responded:
+                # The command already has its response on the wire; a second
+                # one would be read by the client as the answer to whatever
+                # it sends next (the Move response it is waiting for).
+                return
             # Send error response
             total_size = 12 + 4
             response_header = MessageHeader(Command.kStopMove, header.command_id, total_size)
