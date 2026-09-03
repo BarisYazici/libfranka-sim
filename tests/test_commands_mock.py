@@ -167,9 +167,10 @@ def test_move_command(tcp_client, udp_client, sim_server, mock_physics_sim):
 
     # No second Move response follows kMotionStarted: Move gets exactly one
     # reply per libfranka's response-map contract, and the terminal one
-    # (kSuccess via StopMove, or an abort status) only comes once the motion
-    # actually ends -- this motion never does in this test. A short,
-    # non-blocking read confirms nothing unsolicited showed up on the wire.
+    # (kSuccess on a clean finish, kPreempted via StopMove, or an abort
+    # status) only comes once the motion actually ends -- this motion never
+    # does in this test. A short, non-blocking read confirms nothing
+    # unsolicited showed up on the wire.
     tcp_client.settimeout(0.2)
     with pytest.raises(socket.timeout):
         tcp_client.recv(16)
@@ -251,7 +252,9 @@ def test_no_unsolicited_move_reply_arrives_before_stop_move(
         tcp_client.recv(16)
 
     # StopMove now gets exactly one terminal Move response, matching this
-    # motion's command id.
+    # motion's command id, and carrying kPreempted -- the status the robot
+    # answers an interrupted Move with (libfranka's own robot model does
+    # exactly this in test/robot_impl_tests.cpp::CanCancelMotion).
     stop_header = MessageHeader(command=Command.kStopMove, command_id=3, size=12)
     tcp_client.sendall(stop_header.to_bytes())
     tcp_client.settimeout(5.0)
@@ -264,7 +267,7 @@ def test_no_unsolicited_move_reply_arrives_before_stop_move(
     assert move_response_header.command == Command.kMove
     assert move_response_header.command_id == 2
     move_status = struct.unpack("<B3x", tcp_client.recv(4))[0]
-    assert move_status == MoveStatus.kSuccess.value
+    assert move_status == MoveStatus.kPreempted.value
 
     # And nothing further follows that terminal response either.
     tcp_client.settimeout(0.2)
@@ -424,6 +427,153 @@ def test_second_move_after_stop_move_gets_live_state_on_same_connection(
     _assert_stream_makes_progress(udp_client, field_indices)
 
 
+def test_stop_move_during_torque_stream_preempts_the_move(
+    tcp_client, udp_client, sim_server, mock_physics_sim, field_indices
+):
+    """``Robot::stop()`` racing a running control loop, replayed on the wire.
+
+    This is the sequence every asynchronous libfranka/franky client produces
+    for ``move(..., asynchronous=True); stop(); join_motion()``: the control
+    loop streams torques on one thread while ``Robot::stop()``
+    (``src/robot.cpp``) sends ``StopMove`` from another. libfranka's *own*
+    model of what the robot answers is in ``test/robot_impl_tests.cpp``
+    (``CanCancelMotion``): on ``StopMove`` the robot sends
+    ``Move::Response(Move::Status::kPreempted)`` for the running motion id and
+    ``StopMove::Response(kSuccess)`` for the stop, and keeps publishing state.
+
+    ``kPreempted`` rather than ``kSuccess`` is the whole point. The control
+    thread, not the stopping thread, is what reads the Move response: its
+    ``throwOnMotionError`` (``src/robot_impl.cpp``) notices the idle modes in
+    the state stream, reads the Move reply, and runs it through
+    ``handleCommandResponse<Move>`` (``src/robot_impl.h``). kPreempted throws
+    a CommandException there -- surfacing as the ControlException "Move
+    command preempted!" a stopped motion is meant to raise -- while kSuccess
+    throws nothing and falls through to
+    ``ProtocolException("Unexpected reply to a Move command")``.
+
+    The client then answers that ControlException from ``ControlLoop::loop``'s
+    catch-all with ``cancelMotion`` -- a *second* StopMove -- which must be
+    answered on its own (no second Move reply, since the motion is over) with
+    the state stream still running, because ``cancelMotion``'s
+    ``do { receiveRobotState(); } while (...)`` reads at least one more
+    datagram before it returns.
+    """
+    udp_client.bind(("0.0.0.0", 0))
+    udp_port = udp_client.getsockname()[1]
+
+    tcp_client.connect(("localhost", COMMAND_PORT))
+    connect_payload = struct.pack("<HH", 10, udp_port)
+    connect_header = MessageHeader(
+        command=Command.kConnect, command_id=1, size=12 + len(connect_payload)
+    )
+    tcp_client.sendall(connect_header.to_bytes() + connect_payload)
+    tcp_client.recv(12)
+    connect_status, _ = struct.unpack("<BH", tcp_client.recv(3))
+    assert connect_status == ConnectStatus.kSuccess
+
+    # An external-controller motion: what JointImpedanceMotion and every other
+    # franky impedance motion starts (ControlLoop uses kExternalController).
+    header, payload = _pack_move_command(command_id=2, torque_control=True)
+    tcp_client.sendall(header.to_bytes() + payload)
+    assert _recv_move_response_status(tcp_client) == MoveStatus.kMotionStarted.value
+
+    # Stream torque commands the way the control loop does: answer each state
+    # datagram, echoing its message_id.
+    udp_client.settimeout(2.0)
+    for _ in range(5):
+        data, server_udp = udp_client.recvfrom(4096)
+        message_id = _ROBOT_STATE_PACKER.unpack(data)[field_indices["message_id"]]
+        udp_client.sendto(_pack_torque_command(message_id, [0.5] * 7), server_udp)
+
+    # StopMove arrives mid-stream, from the client's other thread.
+    stop_header = MessageHeader(command=Command.kStopMove, command_id=3, size=12)
+    tcp_client.sendall(stop_header.to_bytes())
+    tcp_client.settimeout(5.0)
+
+    stop_response_header = MessageHeader.from_bytes(_recv_exact(tcp_client, 12))
+    assert stop_response_header.command == Command.kStopMove
+    assert stop_response_header.command_id == 3
+    assert struct.unpack("<B3x", _recv_exact(tcp_client, 4))[0] == 0  # kSuccess
+
+    # Then the interrupted motion's one terminal Move response. (libfranka
+    # demultiplexes TCP responses by command id -- ``received_responses_`` in
+    # ``src/network.h`` -- so it tolerates either order; this pins the order
+    # the server actually sends, which is the one the log has to make sense
+    # against.)
+    move_response_header = MessageHeader.from_bytes(_recv_exact(tcp_client, 12))
+    assert move_response_header.command == Command.kMove
+    assert move_response_header.command_id == 2
+    assert struct.unpack("<B3x", _recv_exact(tcp_client, 4))[0] == MoveStatus.kPreempted.value
+
+    # The state stream keeps running, now reporting the idle hold: this is
+    # what cancelMotion's do/while reads before it returns.
+    idle_values = _assert_stream_makes_progress(udp_client, field_indices)
+    assert idle_values[field_indices["motion_generator_mode"]] == 0  # kIdle / kNone
+    assert idle_values[field_indices["controller_mode"]] == 3  # kOther
+
+    # cancelMotion's own StopMove, with no motion left to stop: answered on its
+    # own, and no second Move response follows (Move gets exactly one reply per
+    # command id, and motion 2 already had its terminal one).
+    cancel_header = MessageHeader(command=Command.kStopMove, command_id=4, size=12)
+    tcp_client.sendall(cancel_header.to_bytes())
+    cancel_response_header = MessageHeader.from_bytes(_recv_exact(tcp_client, 12))
+    assert cancel_response_header.command == Command.kStopMove
+    assert cancel_response_header.command_id == 4
+    assert struct.unpack("<B3x", _recv_exact(tcp_client, 4))[0] == 0  # kSuccess
+
+    tcp_client.settimeout(0.3)
+    with pytest.raises(socket.timeout):
+        tcp_client.recv(16)
+
+    # And the connection is still good for the next motion.
+    tcp_client.settimeout(5.0)
+    header, payload = _pack_move_command(command_id=5, torque_control=True)
+    tcp_client.sendall(header.to_bytes() + payload)
+    assert _recv_move_response_status(tcp_client) == MoveStatus.kMotionStarted.value
+    _assert_stream_makes_progress(udp_client, field_indices)
+
+
+def test_stop_move_idles_the_modes_even_before_the_peer_is_known(mock_physics_sim):
+    """The idle modes are published whether or not the UDP peer is known yet.
+
+    ``handle_stop_move_command`` also sends one state datagram itself, which
+    it can only do once the state thread has recorded where the client's UDP
+    socket is. Those idle modes used to be set *inside* that "do we know the
+    peer?" branch, so a StopMove that won the race against the state thread
+    (real, and visible in CI as ``test_stop_move_command`` failing with
+    "Failed to enter idle mode after stop") left the published state saying
+    kMove for the rest of the session -- and libfranka watches exactly those
+    modes to learn the motion is over (``throwOnMotionError`` and
+    ``cancelMotion``, ``src/robot_impl.cpp``), so it would wait for ever.
+    """
+    server = _bare_server(mock_physics_sim)
+    server.robot_state.state["motion_generator_mode"] = 1
+    server.robot_state.state["controller_mode"] = 2
+    server.robot_state.state["robot_mode"] = RobotMode.kMove
+    # The state thread has not started transmitting yet, so no peer is known.
+    server.client_address = None
+    server.client_udp_port = None
+
+    sent = []
+
+    class _Socket:
+        def sendall(self, data):
+            sent.append(data)
+
+    server.handle_stop_move_command(_Socket(), MessageHeader(Command.kStopMove, 3, 12))
+
+    # The StopMove itself is still answered, exactly once...
+    assert len(sent) == 1
+    header = MessageHeader.from_bytes(sent[0][:12])
+    assert header.command == Command.kStopMove
+    assert struct.unpack("<B3x", sent[0][12:16])[0] == 0  # kSuccess
+
+    # ...and the published state reports the idle hold.
+    assert server.robot_state.state["motion_generator_mode"] == 0  # kIdle / kNone
+    assert server.robot_state.state["controller_mode"] == 3  # kOther
+    assert server.robot_state.state["robot_mode"] == RobotMode.kIdle
+
+
 def _assert_stream_makes_progress(udp_client, field_indices, count=8):
     """Read ``count`` datagrams and prove the stream is actually live.
 
@@ -469,10 +619,20 @@ def _recv_move_response_status(tcp_client):
     return struct.unpack("<B3x", _recv_exact(tcp_client, 4))[0]
 
 
-def _pack_move_command(command_id):
+def _pack_move_command(command_id, torque_control=False):
+    """Build one Move request; ``torque_control`` selects the external controller.
+
+    The default is the joint-impedance/joint-position pair most tests here
+    use; ``torque_control=True`` is what libfranka's ``ControlLoop`` sends for
+    a torque callback (``kExternalController`` with no motion generator).
+    """
     move_cmd = MoveCommand(
-        controller_mode=ControllerMode.kJointImpedance,
-        motion_generator_mode=MotionGeneratorMode.kJointPosition,
+        controller_mode=(
+            ControllerMode.kExternalController if torque_control else ControllerMode.kJointImpedance
+        ),
+        motion_generator_mode=(
+            MotionGeneratorMode.kNone if torque_control else MotionGeneratorMode.kJointPosition
+        ),
         maximum_path_deviation=(0.1, 0.1, 0.1),
         maximum_goal_pose_deviation=(0.1, 0.1, 0.1),
     )
@@ -485,6 +645,21 @@ def _pack_move_command(command_id):
     )
     header = MessageHeader(command=Command.kMove, command_id=command_id, size=12 + len(payload))
     return header, payload
+
+
+def _pack_torque_command(message_id, tau_j_d):
+    """Pack one UDP RobotCommand carrying torques, as a torque loop sends it."""
+    message = struct.pack("<Q", message_id)
+    message += struct.pack("<7d", *([0.0] * 7))  # q_c
+    message += struct.pack("<7d", *([0.0] * 7))  # dq_c
+    message += struct.pack("<16d", *([0.0] * 16))  # O_T_EE_c
+    message += struct.pack("<6d", *([0.0] * 6))  # O_dP_EE_c
+    message += struct.pack("<2d", *([0.0] * 2))  # elbow_c
+    message += struct.pack("<B", 0)  # valid_elbow
+    message += struct.pack("<B", 0)  # motion_generation_finished
+    message += struct.pack("<7d", *tau_j_d)  # tau_J_d
+    message += struct.pack("<B", 0)  # torque_command_finished
+    return message
 
 
 def _read_state_datagram(udp_client, field_indices):

@@ -97,8 +97,8 @@ def send_move(tcp_client, controller_mode, motion_generator_mode, command_id=2):
 
     Move gets exactly one reply per command id: kMotionStarted, sent the
     moment the Move is accepted. The *terminal* response (kSuccess via
-    StopMove or a motion-finished datagram, or an abort status) only arrives
-    once the motion actually ends -- so it is not read here. A previous
+    a motion-finished datagram, kPreempted via StopMove, or an abort status)
+    only arrives once the motion actually ends -- so it is not read here. A previous
     motion's terminal response can still be unread on the socket when this
     fires; it is drained and discarded since it does not match `command_id`.
 

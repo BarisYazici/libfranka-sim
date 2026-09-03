@@ -2032,10 +2032,6 @@ class MotionSessionMixin:
     def handle_stop_move_command(self, client_socket, header: MessageHeader):
         """Handle StopMove command received over TCP"""
         responded = False
-        # Snapshot the peer the state stream is talking to: it is set by the
-        # state thread when transmission starts and cleared by reset_state on
-        # disconnect, and this handler runs on neither of those threads.
-        peer = (self.client_address, self.client_udp_port)
         try:
             logger.info("Processing StopMove command")
 
@@ -2053,19 +2049,34 @@ class MotionSessionMixin:
 
             self._engage_idle_hold("StopMove")
 
-            # Send one final state with both modes set to idle
-            if hasattr(self, "udp_socket") and self.udp_socket and None not in peer:
-                # Update state to idle modes -- unless a reflex is latched, in
-                # which case the modes already left kMove and ``robot_mode``
-                # is kReflex. Overwriting that with kIdle would tell the
-                # client the motion ended cleanly while ``errors`` still says
-                # why it did not, and kReflex is the flag that has to survive
-                # until AutomaticErrorRecovery. Mirrors _finish_motion.
-                if self.robot_state.state["robot_mode"] != RobotMode.kReflex:
-                    self.robot_state.state["motion_generator_mode"] = 0  # kNone
-                    self.robot_state.state["controller_mode"] = 3  # kOther
-                    self.robot_state.state["robot_mode"] = RobotMode.kIdle
+            # Put the published state back to idle modes -- unless a reflex is
+            # latched, in which case the modes already left kMove and
+            # ``robot_mode`` is kReflex. Overwriting that with kIdle would tell
+            # the client the motion ended cleanly while ``errors`` still says
+            # why it did not, and kReflex is the flag that has to survive until
+            # AutomaticErrorRecovery. Mirrors _finish_motion.
+            #
+            # This is unconditional: it is the modes libfranka watches to learn
+            # the motion is over (``throwOnMotionError``/``cancelMotion`` in
+            # ``src/robot_impl.cpp`` both key off them), and the publish loop
+            # carries them out on its own next cycle. It used to sit inside the
+            # "do we know the peer?" guard below, so a StopMove that arrived
+            # before the state thread had recorded the peer left the stream
+            # reporting kMove for the rest of the session.
+            if self.robot_state.state["robot_mode"] != RobotMode.kReflex:
+                self.robot_state.state["motion_generator_mode"] = 0  # kNone
+                self.robot_state.state["controller_mode"] = 3  # kOther
+                self.robot_state.state["robot_mode"] = RobotMode.kIdle
 
+            # Then hand the client one state carrying them straight away rather
+            # than waiting for the loop's next cycle. Snapshot the peer at the
+            # point of use: it is set by the state thread when transmission
+            # starts and cleared by reset_state on disconnect, and this handler
+            # runs on neither of those threads -- so reading it once, here,
+            # avoids both a half-updated target and a value read before the
+            # state thread had one.
+            peer = (self.client_address, self.client_udp_port)
+            if hasattr(self, "udp_socket") and self.udp_socket and None not in peer:
                 # Send state with new message ID
                 self.robot_state.update()  # This increments message_id
                 final_state = self.robot_state.pack_state()
@@ -2094,16 +2105,42 @@ class MotionSessionMixin:
             # motion-finished handler above, which has never stopped the
             # publish loop either).
 
-            # Send Move response to break the waiting loop in the client
+            # Terminate the interrupted motion's Move with ``kPreempted``, the
+            # status the robot itself sends when a StopMove cuts a Move short.
+            # libfranka's own model of the robot pins this: its cancelMotion
+            # tests (``test/robot_impl_tests.cpp``, CanCancelMotion and
+            # CancelMotionErrorThrowsControlException) answer StopMove by
+            # sending ``Move::Response(Move::Status::kPreempted)`` for the
+            # running motion id before the StopMove response itself.
+            #
+            # The status is not cosmetic. ``Robot::stop()`` is called from a
+            # different thread than the running control loop, so it races that
+            # loop: the loop's ``throwOnMotionError`` (``src/robot_impl.cpp``)
+            # sees the idle modes in the state below, reads *this* response and
+            # runs it through ``handleCommandResponse<Move>``
+            # (``src/robot_impl.h``). kPreempted throws CommandException there,
+            # which becomes the ControlException ("Move command preempted!")
+            # that a stopped motion is supposed to raise out of the control
+            # thread. kSuccess throws nothing, so the code right after it --
+            # ``throw ProtocolException("Unexpected reply to a Move command")``
+            # -- fires instead, which is what clients used to see here.
+            #
+            # A conforming client answers that ControlException by calling
+            # ``cancelMotion`` (``ControlLoop::loop``'s catch-all), i.e. a
+            # *second* StopMove on the same connection. It arrives with no
+            # motion running, gets its own kSuccess below, and no Move response
+            # (``current_motion_id`` is already 0) -- and its
+            # ``do { receiveRobotState(); } while (...)`` needs the publish
+            # loop to still be running, which is why nothing here stops it.
             with self._motion_lock:
                 if self.current_motion_id:
                     # Create a Move response header
                     move_response_header = MessageHeader(Command.kMove, self.current_motion_id, 16)
                     move_header_bytes = move_response_header.to_bytes()
-                    move_response_data = struct.pack("<B3x", MoveStatus.kSuccess.value)
+                    move_response_data = struct.pack("<B3x", MoveStatus.kPreempted.value)
                     self._send_tcp(client_socket, move_header_bytes + move_response_data)
                     logger.info(
-                        "Sent Move success response for motion ID: %s", self.current_motion_id
+                        "Sent Move kPreempted response for motion ID: %s", self.current_motion_id
                     )
                     self.current_motion_id = 0
 

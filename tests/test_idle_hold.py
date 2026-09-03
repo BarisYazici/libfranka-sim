@@ -99,9 +99,9 @@ def send_move(tcp_client, controller_mode, motion_generator_mode, command_id=2):
     """Send a Move and drain TCP through this command's own reply.
 
     Move gets exactly one reply per command id: kMotionStarted, sent the
-    moment the Move is accepted. The *terminal* response (kSuccess via
-    StopMove or a motion-finished datagram, or an abort status) only arrives
-    once the motion actually ends -- so it is not read here.
+    moment the Move is accepted. The *terminal* response (kSuccess via a
+    motion-finished datagram, kPreempted via StopMove, or an abort status)
+    only arrives once the motion actually ends -- so it is not read here.
 
     A caller starting a second motion on a connection where the previous one
     already finished (e.g. via a `motion_finished` UDP datagram) can still

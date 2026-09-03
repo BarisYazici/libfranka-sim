@@ -381,8 +381,9 @@ class StateStreamMixin:
                         # response here. handle_move_command already answered
                         # this motion's Move with kMotionStarted when it was
                         # accepted -- Move gets exactly one reply on the wire,
-                        # and the terminal one (kSuccess via StopMove, or
-                        # kReflexAborted/etc. via _pending_move_response) is
+                        # and the terminal one (kSuccess on a clean finish,
+                        # kPreempted via StopMove, or kReflexAborted/etc.
+                        # via _pending_move_response) is
                         # sent elsewhere. A second kSuccess sent from here
                         # used to sit unread in libfranka's response map,
                         # keyed by command id; when the motion later aborted,
