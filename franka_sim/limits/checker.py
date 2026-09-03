@@ -473,6 +473,34 @@ class MotionLimitChecker:
         is still refused -- as the step it is, over the interval the server
         observed, which is what :meth:`check` promises and what
         :meth:`cycles_since_applied` measures.
+
+        **What the window costs, stated plainly.** Two things are true of the
+        two commands it covers, and both are accepted rather than worked
+        around:
+
+        * *A genuine acceleration step inside the window is reported under a
+          different name.* A client that resumes with a real discontinuity is
+          still caught -- the first difference is untouched, so the step lands
+          on the **velocity** envelope (``..._velocity_limits_violation``) or
+          on the joint range -- but not by the acceleration/jerk checks, which
+          are the ones reporting zero. The error name a C++ provocation sees
+          therefore depends on whether 20 cycles were lost just before it. That
+          is only reachable by *deliberately* stalling the client for the full
+          :data:`~franka_sim.comm_constraints.MAX_CONSECUTIVE_LOST_CYCLES`
+          first, which hardware answers with
+          ``communication_constraints_violation`` and a stopped motion rather
+          than with either name.
+
+        * *Up to 2 ms of acceleration and jerk go unmeasured.* Whatever the
+          resumed stream does across those two cycles is bounded only by the
+          velocity envelope, which still bounds the physics: a command inside
+          it cannot move the reference faster than the joint may go, so the
+          worst the window admits is two cycles at a legal velocity. It cannot
+          hide a runaway, only the *rate* at which a legal one was reached.
+
+        Both are the price of not inventing an acceleration nobody commanded,
+        and both are unreachable on hardware, which never gets past this count
+        with a motion still running.
         """
         with self._lock:
             self._mark_reseeding_locked()
@@ -491,6 +519,36 @@ class MotionLimitChecker:
         self._twist.mark_reseeding(commands)
         self._pose.mark_reseeding(commands)
         self._elbow.mark_reseeding(commands)
+        if self._gap_snapshot is not None:
+            # The hold happens *inside* an open run of losses, after that run's
+            # snapshot was taken. A late datagram from the run rewinds to that
+            # snapshot (:meth:`rewind_extrapolation`), and restoring a window
+            # of zero there would un-arm the very boundary the hold declared.
+            # The window is a fact about the run, not about the history, so it
+            # is stamped onto the snapshot the run rewinds to.
+            self._gap_snapshot["reseeding"] = self._reseeding_locked()
+
+    def _reseeding_locked(self) -> Dict[str, int]:
+        """The re-seed window still owed on each history; lock held."""
+        return {
+            name: (history.reseeding, history.reseeding_third)
+            for name, history in self._histories().items()
+        }
+
+    def _set_reseeding_locked(self, windows) -> None:
+        """Put the re-seed windows back to a :meth:`_reseeding_locked`; lock held."""
+        for name, history in self._histories().items():
+            history.reseeding, history.reseeding_third = windows[name]
+
+    def _histories(self) -> Dict[str, Any]:
+        """The five differencing histories by name."""
+        return {
+            "joint": self._joint,
+            "torque": self._torque,
+            "twist": self._twist,
+            "pose": self._pose,
+            "elbow": self._elbow,
+        }
 
     def cycles_since_applied(self, command: Dict[str, Any]) -> int:
         """How many 1 ms cycles separate ``command`` from the applied history.
@@ -1173,6 +1231,15 @@ class MotionLimitChecker:
             self._gap_first_id = None
             self._gap_last_id = None
 
+        # A late datagram is the real answer to a cycle that was guessed, not
+        # the client coming back: the resume the re-seed window was armed for
+        # is still ahead. So absorbing one must not eat a command out of the
+        # window -- the history it advances onto is pre-gap data restored by
+        # :meth:`rewind_extrapolation`, and the boundary the hold declared has
+        # not been crossed yet. Restored after the advance below, which
+        # consumes one on whichever history it touches.
+        window = self._reseeding_locked() if absorbing_late else None
+
         if self._mode is ControlMode.POSITION:
             # The first waypoint of a motion is a standstill by
             # construction (the start-pose check has just confirmed it sits
@@ -1213,6 +1280,9 @@ class MotionLimitChecker:
             self._twist.advance(command["O_dP_EE_c"], cycles)
             if self._mode is ControlMode.CARTESIAN_VELOCITY:
                 self._record_elbow_locked(command, cycles)
+
+        if window is not None:
+            self._set_reseeding_locked(window)
 
         if clean:
             self._mark_clean_locked()
@@ -1648,6 +1718,10 @@ class MotionLimitChecker:
         """
         return {
             "applied_id": self._applied_id,
+            # The re-seed window travels with the history it qualifies: a
+            # restore that left it behind would judge the restored derivatives
+            # by a window belonging to a state that is no longer installed.
+            "reseeding": self._reseeding_locked(),
             "joint": (
                 list(self._joint.value),
                 list(self._joint.first),
@@ -1670,6 +1744,7 @@ class MotionLimitChecker:
     def _restore_locked(self, snapshot: Dict[str, Any]) -> None:
         """Put every differencing history back to a :meth:`_snapshot_locked`; lock held."""
         self._applied_id = snapshot["applied_id"]
+        self._set_reseeding_locked(snapshot["reseeding"])
         self._joint.value, self._joint.first, self._joint.second = (
             list(values) for values in snapshot["joint"]
         )

@@ -54,6 +54,10 @@ class _Differentiator:
         #: How many more commands re-seed this history rather than being
         #: differenced against it; see :meth:`mark_reseeding`.
         self.reseeding = 0
+        #: The same window for the *third* difference, which needs one command
+        #: more than the second before it is measurable; see
+        #: :meth:`mark_reseeding`.
+        self.reseeding_third = 0
 
     def mark_reseeding(self, commands: int = 2) -> None:
         """The stored ``first`` derivative is meaningless: rebuild it from the client.
@@ -69,22 +73,46 @@ class _Differentiator:
 
         Two commands, because a velocity needs two samples: the first re-seeds
         the value, the second the rate. While armed, :meth:`derivatives` reports
-        the second and third differences as zero -- not "within limits", but
-        *not measurable across this boundary* -- and :meth:`advance` stores a
-        zero acceleration so the jerk of the command after the window is
-        differenced against nothing stale either. The first difference is
-        untouched throughout, so the velocity envelope and the position range
-        judge every one of these commands exactly as they always do: a resume
-        that teleports is still refused, it is only judged as the step it is
-        rather than as an acceleration against a reference the client was never
-        told about.
+        the second difference as zero -- not "within limits", but *not
+        measurable across this boundary*. The first difference is untouched
+        throughout, so the velocity envelope and the position range judge every
+        one of these commands exactly as they always do: a resume that
+        teleports is still refused, it is only judged as the step it is rather
+        than as an acceleration against a reference the client was never told
+        about.
+
+        **The third difference is suppressed one command longer than the
+        second**, because that is when each becomes measurable. Counting the
+        resumed commands ``c0, c1, c2, ...``: the first differences of ``c1``
+        onwards are taken between two commands the client actually sent, so the
+        second difference is honest from ``c2`` -- but the third is built from
+        two second differences, and ``c1``'s is not one. Every command in the
+        window stores a zero second difference (that being what
+        :meth:`derivatives` reports and :meth:`advance` records), so with the
+        third armed for only two commands ``c2`` was differenced against that
+        zero and charged a jerk of ``a / dt`` for a stream whose real jerk is
+        nought: a conforming 6 rad/s^2 position ramp resumed after a 160-cycle
+        hold aborted with
+        ``joint_motion_generator_acceleration_discontinuity: 6000 rad/s^3``,
+        and the elbow ramp this window was written for came out at
+        -13083 rad/s^3 -- the same defect, one command past the report that had
+        been suppressed. By ``c3`` the history has been advanced onto ``c2``'s
+        measured acceleration and the jerk is honest again.
+
+        The zeros are also what the history *should* hold meanwhile: a gap
+        opening inside the window freezes and integrates ``second``
+        (:meth:`extrapolate_position`), and zero is exactly the safe fallback
+        :meth:`freeze_flat_position` installs for a rate nobody can vouch for.
         """
         self.reseeding = int(commands)
+        self.reseeding_third = int(commands) + 1 if commands else 0
 
     def _consume_reseeding(self) -> None:
         """One re-seed command has been accepted; see :meth:`mark_reseeding`."""
         if self.reseeding:
             self.reseeding -= 1
+        if self.reseeding_third:
+            self.reseeding_third -= 1
 
     def mark_clean(self) -> None:
         """Remember the current derivatives as the last unflagged ones."""
@@ -156,12 +184,14 @@ class _Differentiator:
         """
         step = cycles * DELTA_T
         first = [(command[i] - self.value[i]) / step for i in range(self.width)]
-        if self.reseeding:
-            # Nothing above the first difference survives a held reference; see
-            # :meth:`mark_reseeding`.
-            return first, [0.0] * self.width, [0.0] * self.width
         second = [(first[i] - self.first[i]) / step for i in range(self.width)]
         third = [(second[i] - self.second[i]) / step for i in range(self.width)]
+        # Nothing above the first difference survives a held reference, and the
+        # third outlives the second by one command; see :meth:`mark_reseeding`.
+        if self.reseeding:
+            second = [0.0] * self.width
+        if self.reseeding_third:
+            third = [0.0] * self.width
         return first, second, third
 
     def advance(self, command: Sequence[float], cycles: int = 1) -> None:
@@ -490,13 +520,21 @@ class _CartesianDifferentiator:
         self.clean_first = [0.0] * 6
         #: See :attr:`_Differentiator.reseeding`.
         self.reseeding = 0
+        #: Unused at this depth -- a twist has no third difference -- and kept
+        #: only so the checker can arm, snapshot and restore all five histories
+        #: through one uniform pair of fields.
+        self.reseeding_third = 0
 
     def mark_reseeding(self, commands: int = 2) -> None:
         """See :meth:`_Differentiator.mark_reseeding`.
 
         One derivative up, as everything on this class is: ``first`` is the
         twist *acceleration*, so what a held reference makes meaningless -- and
-        what the window suppresses -- is the jerk.
+        what the window suppresses -- is the jerk. Which is also why there is
+        no third window here: the twist this class stores is the client's own
+        command rather than a difference, so the acceleration is honest from
+        the second resumed command and the jerk from the third, exactly the two
+        commands ``commands`` already covers.
         """
         self.reseeding = int(commands)
 
@@ -600,15 +638,20 @@ class _PoseDifferentiator:
         self.clean_second = [0.0] * 6
         #: See :attr:`_Differentiator.reseeding`.
         self.reseeding = 0
+        #: See :attr:`_Differentiator.reseeding_third`.
+        self.reseeding_third = 0
 
     def mark_reseeding(self, commands: int = 2) -> None:
         """See :meth:`_Differentiator.mark_reseeding`."""
         self.reseeding = int(commands)
+        self.reseeding_third = int(commands) + 1 if commands else 0
 
     def _consume_reseeding(self) -> None:
         """See :meth:`_Differentiator._consume_reseeding`."""
         if self.reseeding:
             self.reseeding -= 1
+        if self.reseeding_third:
+            self.reseeding_third -= 1
 
     def mark_clean(self) -> None:
         """Remember the current twist derivatives as the last unflagged ones."""
@@ -646,11 +689,14 @@ class _PoseDifferentiator:
         linear = (matrix[:3, 3] - self.translation) / step
         angular = rotation_log(self.rotation.T @ matrix[:3, :3]) / step
         velocity = [float(value) for value in (*linear, *angular)]
-        if self.reseeding:
-            # See :meth:`_Differentiator.mark_reseeding`.
-            return velocity, [0.0] * 6, [0.0] * 6
         acceleration = [(velocity[i] - self.first[i]) / step for i in range(6)]
         jerk = [(acceleration[i] - self.second[i]) / step for i in range(6)]
+        # Reported only; see :meth:`_Differentiator.mark_reseeding`. The
+        # measured values are what :meth:`advance` stores.
+        if self.reseeding:
+            acceleration = [0.0] * 6
+        if self.reseeding_third:
+            jerk = [0.0] * 6
         return velocity, acceleration, jerk
 
     def advance(self, pose: Sequence[float], cycles: int = 1) -> None:

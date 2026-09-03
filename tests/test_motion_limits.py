@@ -4177,7 +4177,7 @@ def _elbow_ramp(elapsed):
     return math.pi / 15.0 * (1.0 - math.cos(math.pi / 5.0 * elapsed))
 
 
-def _held_elbow_session(mock_physics_sim, lost_cycles):
+def _held_elbow_session(mock_physics_sim, lost_cycles, opening=False):
     """A pose+elbow motion whose client says nothing for ``lost_cycles`` cycles.
 
     Everything a stalled 2-core runner does to this server, minus the sockets:
@@ -4186,6 +4186,10 @@ def _held_elbow_session(mock_physics_sim, lost_cycles):
     run of losses reaches the bound. Enforcement is *on* for the motion limits
     and off for the communication constraints -- the configuration the CI job
     runs and the one this whole scenario is about.
+
+    ``opening`` records one real command before the losses start, which is what
+    the reference run did *not* have; without it the run is never extrapolated
+    and so never rewindable.
     """
     from franka_sim.franka_sim_server import FrankaSimServer
 
@@ -4206,7 +4210,17 @@ def _held_elbow_session(mock_physics_sim, lost_cycles):
     # so the checker's history is still unwritten while the losses pile up --
     # which is exactly the state the reference run was in.
     server.comm.command_received(0)
-    for message_id in range(1, lost_cycles + 1):
+    first_lost = 1
+    if opening:
+        # A recorded command, so the losses that follow are *extrapolated*
+        # rather than skipped: ``extrapolate`` returns early until the motion
+        # has a history to extend. That is what makes the run rewindable, which
+        # is the state a late datagram needs.
+        datagram = elbow_command(1, HOME_ELBOW[0])
+        server.motion_limits.note_published(1)
+        assert server._absorb_within_motion_limits(datagram, fresh=True)
+        first_lost = 2
+    for message_id in range(first_lost, lost_cycles + 1):
         server.robot_state.state["message_id"] = message_id
         server._account_for_communication_cycle()
     return server
@@ -4309,6 +4323,158 @@ def test_the_re_seed_window_closes_after_two_commands(mock_physics_sim):
     assert server.robot_state.state["errors"][
         CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX
     ] is True
+
+
+def _joint_ramp_command(offset, message_id):
+    """A joint-position waypoint ``offset`` rad past :data:`HOME` on joint 1."""
+    waypoint = list(HOME)
+    waypoint[0] += offset
+    return command(message_id=message_id, q_c=waypoint)
+
+
+def _pose_ramp_command(offset, message_id):
+    """A Cartesian pose waypoint ``offset`` m out along z."""
+    return command(message_id=message_id, O_T_EE_c=pose(z=offset))
+
+
+def _elbow_ramp_command(offset, message_id):
+    """An elbow waypoint ``offset`` rad past the robot's own, identity pose."""
+    return elbow_command(message_id, HOME_ELBOW[0] + offset)
+
+
+#: The three position-like generators the re-seed window covers, as
+#: ``(name, mode, builder, seed, acceleration)``. The torque and velocity
+#: interfaces are not here: neither differences a *third* time, so neither has
+#: a jerk for the window to leave behind.
+#:
+#: The accelerations are 2, 6 and 9 of each generator's own unit, staying
+#: inside its cap: ``MAX_JOINT_ACCELERATION``/``MAX_ELBOW_ACCELERATION`` are
+#: 10 rad/s^2, so 9 is a conforming ramp there, but
+#: ``MAX_TRANSLATIONAL_ACCELERATION`` is 9.0 m/s^2 exactly -- a 9 m/s^2 ramp is
+#: *at* the cap, not under it, so the Cartesian one tops out at 8.
+_RAMP_GENERATORS = [
+    (name, mode, build, seed, acceleration)
+    for name, mode, build, seed, accelerations in (
+        ("joint", ControlMode.POSITION, _joint_ramp_command, {}, (2.0, 6.0, 9.0)),
+        (
+            "pose",
+            ControlMode.CARTESIAN_POSE,
+            _pose_ramp_command,
+            {"O_T_EE": pose()},
+            (2.0, 6.0, 8.0),
+        ),
+        (
+            "elbow",
+            ControlMode.CARTESIAN_POSE,
+            _elbow_ramp_command,
+            {"O_T_EE": pose()},
+            (2.0, 6.0, 9.0),
+        ),
+    )
+    for acceleration in accelerations
+]
+
+
+def _stream_constant_acceleration_ramp(mode, build, seed, acceleration, *, hold, gap=160):
+    """Stream ``0.5 a t^2`` for five cycles, optionally across a held reference.
+
+    Returns one verdict description per command (None where it passed). The
+    ramp is conforming by construction: its backward second difference is
+    exactly ``a`` from the second waypoint on and its third difference is zero
+    from the third, so *every* verdict here should be None.
+    """
+    checker = MotionLimitChecker(enforce=True)
+    checker.start_motion(mode, robot_state_at(q=HOME, **seed), motion_id=1)
+    opening = build(0.0, 1)
+    checker.note_published(1)
+    assert checker.check(opening) is None, "the opening waypoint is a standstill"
+    checker.record(opening, clean=True)
+
+    base = 2
+    if hold:
+        checker.note_published(1 + gap)
+        checker.note_hold()
+        base = 1 + gap
+
+    verdicts = []
+    for index in range(5):
+        message_id = base + index
+        waypoint = build(0.5 * acceleration * (index * DELTA_T) ** 2, message_id)
+        checker.note_published(message_id)
+        violation = checker.check(waypoint)
+        verdicts.append(None if violation is None else violation.describe())
+        if violation is None:
+            checker.record(waypoint, clean=True)
+    return verdicts
+
+
+@pytest.mark.parametrize("name, mode, build, seed, acceleration", _RAMP_GENERATORS)
+def test_a_conforming_ramp_resuming_after_a_hold_is_clean_all_the_way_through(
+    name, mode, build, seed, acceleration
+):
+    """DEFECT REGRESSION: the window ended on a fabricated zero acceleration.
+
+    While re-seeding, ``advance`` stored the *reported* second difference --
+    zero -- rather than the measured one, so the first command past the window
+    was differenced against an acceleration nobody commanded and reported a
+    jerk of ``a / dt``. A conforming 6 rad/s^2 position ramp resumed after a
+    160-cycle hold aborted three commands in with
+    ``joint_motion_generator_acceleration_discontinuity: 6000 rad/s^3``.
+
+    Nothing in these streams is a discontinuity at any of the three
+    accelerations, on any of the position-like generators. Every command must
+    pass, exactly as it does with no hold at all (the control below).
+    """
+    verdicts = _stream_constant_acceleration_ramp(mode, build, seed, acceleration, hold=True)
+    assert verdicts == [None] * 5, f"{name} ramp at {acceleration} refused after a hold"
+
+
+@pytest.mark.parametrize("name, mode, build, seed, acceleration", _RAMP_GENERATORS)
+def test_the_same_ramp_with_no_hold_is_clean(name, mode, build, seed, acceleration):
+    """Control for the regression above: the ramps themselves are conforming.
+
+    Without this the test above could pass on a checker that had stopped
+    judging anything at all.
+    """
+    verdicts = _stream_constant_acceleration_ramp(mode, build, seed, acceleration, hold=False)
+    assert verdicts == [None] * 5, f"{name} ramp at {acceleration} is not conforming"
+
+
+def test_a_late_datagram_absorbed_after_a_hold_does_not_eat_the_window(mock_physics_sim):
+    """The window is for the *resume*, and a late datagram is not one.
+
+    A datagram from inside the run of losses is the real answer to a cycle that
+    was guessed: ``rewind_extrapolation`` puts the history back on pre-gap data
+    and it is differenced honestly against that. Recording it used to consume a
+    command out of the re-seed window all the same, so the client's actual
+    resume got one command of suppression instead of two -- and the second one
+    was then differenced against the boundary the window exists to hide.
+    """
+    gap = 160
+    server = _held_elbow_session(mock_physics_sim, gap, opening=True)
+    checker = server.motion_limits
+    assert checker._elbow.reseeding == 2, "the hold did not arm the window"
+
+    # A datagram answering one of the extrapolated cycles: rewound, recorded,
+    # and no part of the resume.
+    late_id = checker._gap_first_id
+    assert late_id is not None, "the run of losses left nothing to rewind"
+    late = elbow_command(late_id, HOME_ELBOW[0] + _elbow_ramp(late_id * DELTA_T))
+    assert server._absorb_within_motion_limits(late, fresh=False)
+    assert checker._elbow.reseeding == 2, "the late datagram ate part of the window"
+
+    # ...and now the real resume, which must still get both of its commands.
+    for index in range(4):
+        message_id = gap + index
+        elapsed = (gap - 1 + index) * DELTA_T
+        datagram = elbow_command(message_id, HOME_ELBOW[0] + _elbow_ramp(elapsed))
+        checker.note_published(message_id)
+        assert server._absorb_within_motion_limits(datagram, fresh=True), (
+            f"conforming elbow ramp refused {index} cycles after the hold"
+        )
+    assert not any(server.robot_state.state["errors"])
+    assert checker.violated is False
+
 
 # --- layer 2: the server over the wire, with a mocked simulator --------------
 
