@@ -382,6 +382,9 @@ class MotionLimitChecker:
             # elbow is (q[2], sign(q[3])) and there is nothing to look up.
             self._elbow.seed([self._joint_positions[2]])
             self._elbow_sign = None
+            # A window left open by the *previous* motion's packet loss is not
+            # this motion's business; every history starts differencing again.
+            self._mark_reseeding_locked(0)
             # The robot's own reported derivatives are clean by construction:
             # nothing has been commanded yet for the checker to object to.
             self._mark_clean_locked()
@@ -431,6 +434,63 @@ class MotionLimitChecker:
         """
         with self._lock:
             self._published_id = int(published_id)
+
+    def note_hold(self) -> None:
+        """The run of lost cycles reached the bound: the reference is being *held*.
+
+        Called from the state-publish thread on the one tick where the loss
+        counter reaches
+        :data:`~franka_sim.comm_constraints.MAX_CONSECUTIVE_LOST_CYCLES` --
+        where the caller stops extrapolating the motion generator and freezes
+        the reference (``FrankaSimServer._account_for_communication_cycle``).
+        The checker still counts no cycles: it is told that the boundary
+        happened, not how long the gap is.
+
+        **What it changes.** The derivative history stops being a description of
+        anything the client is doing. Its ``first`` difference is the velocity
+        the client was commanding when it vanished (or zero, when it vanished
+        before commanding anything at all), and the reference has stood still
+        since; the resumed stream's velocity, differenced against that, is an
+        "acceleration" of ``v / dt`` that nobody commanded and that no client
+        can avoid. So the first two commands after this point re-seed the
+        history instead of being differenced against it -- value, then rate --
+        with the second and third differences reported as zero for those two
+        cycles. See :meth:`_Differentiator.mark_reseeding`.
+
+        **Why this is the faithful reading.** The hold is a state the robot
+        never occupies: at this exact count Control latches
+        ``communication_constraints_violation`` and stops the motion, so there
+        is no hardware behaviour to copy for "the client came back". Running
+        without ``--enforce-comm-constraints`` says *do not abort for the gap*;
+        it cannot also mean *abort one millisecond later for the gap's arithmetic
+        shadow*, which is what a 2-core CI runner hit --
+        ``cartesian_motion_generator_elbow_limit_violation: 13.1659 rad/s^2``
+        for an elbow ramp whose real acceleration is 0.0827 rad/s^2, because the
+        client's ``robot_time``-driven generator had run 160 ms while its
+        commands could not get out. Everything that judges the resumed command
+        on its own terms is untouched: the joint and elbow *ranges*, the
+        velocity envelopes, and the start-pose checks. A resume that teleports
+        is still refused -- as the step it is, over the interval the server
+        observed, which is what :meth:`check` promises and what
+        :meth:`cycles_since_applied` measures.
+        """
+        with self._lock:
+            self._mark_reseeding_locked()
+
+    def _mark_reseeding_locked(self, commands: int = 2) -> None:
+        """Arm (or, with 0, disarm) the re-seed window on every history; lock held.
+
+        All five, for the reason :meth:`_mark_clean_locked` gives: the mode can
+        change between motions and a window left armed on the *other*
+        generator's history is a trap for the next one. The torque history reads
+        only its first difference (``tau_J_d``'s rate, which the window leaves
+        alone), so arming it changes nothing there and is done for symmetry.
+        """
+        self._joint.mark_reseeding(commands)
+        self._torque.mark_reseeding(commands)
+        self._twist.mark_reseeding(commands)
+        self._pose.mark_reseeding(commands)
+        self._elbow.mark_reseeding(commands)
 
     def cycles_since_applied(self, command: Dict[str, Any]) -> int:
         """How many 1 ms cycles separate ``command`` from the applied history.

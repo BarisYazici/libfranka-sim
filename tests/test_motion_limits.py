@@ -4162,6 +4162,154 @@ def test_enforced_an_out_of_range_elbow_latches_its_bit_in_the_robot_state(mock_
     assert server.motion_limits.violated is True
 
 
+def _elbow_ramp(elapsed):
+    """``cartesian_elbow_example_controller``'s commanded elbow offset, verbatim.
+
+    ``M_PI / 15.0 * (1.0 - std::cos(M_PI / 5.0 * elapsed_time_))``
+    (``franka_example_controllers/src/fr3/cartesian_elbow_example_controller.cpp``).
+    Its ``elapsed_time_`` is ``robot_time - initial_robot_time``, i.e. driven by
+    the *sim's* published clock rather than the client's wall clock, so it keeps
+    running through a stall in which no command of the client's gets out. Peak
+    acceleration ``pi^2 / 375`` = 0.0263 rad/s^2, two orders under
+    ``kMaxElbowAcceleration``: nothing this controller commands is a
+    discontinuity.
+    """
+    return math.pi / 15.0 * (1.0 - math.cos(math.pi / 5.0 * elapsed))
+
+
+def _held_elbow_session(mock_physics_sim, lost_cycles):
+    """A pose+elbow motion whose client says nothing for ``lost_cycles`` cycles.
+
+    Everything a stalled 2-core runner does to this server, minus the sockets:
+    the ``Move`` is handled, the publish loop runs its communication accounting
+    once per cycle with no answer arriving, and the reference is held once the
+    run of losses reaches the bound. Enforcement is *on* for the motion limits
+    and off for the communication constraints -- the configuration the CI job
+    runs and the one this whole scenario is about.
+    """
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(
+        physics_sim=mock_physics_sim, enable_gripper=False, enforce_motion_limits=True
+    )
+    server.robot_state.state["q"] = list(HOME)
+    server.robot_state.state["q_d"] = list(HOME)
+    server._motion_generation = 5
+    server.motion_limits.start_motion(
+        ControlMode.CARTESIAN_POSE, robot_state_at(O_T_EE=pose()), motion_id=5
+    )
+    server.comm.start_motion(motion_id=5)
+    # The accounting arms on the first datagram of the motion, whenever it
+    # arrives and however late: a client answering at all is a client in a
+    # control loop. A datagram that misses its cycle is applied and judged but
+    # never *recorded* (``absorb_command``'s ``recorded = fresh or rewound``),
+    # so the checker's history is still unwritten while the losses pile up --
+    # which is exactly the state the reference run was in.
+    server.comm.command_received(0)
+    for message_id in range(1, lost_cycles + 1):
+        server.robot_state.state["message_id"] = message_id
+        server._account_for_communication_cycle()
+    return server
+
+
+def test_a_client_resuming_after_a_held_reference_is_not_charged_its_own_velocity(
+    mock_physics_sim,
+):
+    """DEFECT REGRESSION: 13.1659 rad/s^2 off a ramp that never exceeds 0.0263.
+
+    The 2-core GitHub runner, franka_ros2's ``cartesian_elbow_example_controller``,
+    ``--enforce-motion-limits`` and no communication enforcement::
+
+        Motion started with ID: 4
+        WARNING 20 consecutive lost command cycles: no longer extrapolating the
+                motion generator, holding the last reference (not enforced)
+        ERROR cartesian_motion_generator_elbow_limit_violation:
+                elbow_c angle = 13.1659 rad/s^2, limit 10 rad/s^2
+
+    The client could not get a datagram out for 160 cycles after the ``Move``,
+    but its elbow ramp is driven by the *robot's* clock, so its first recorded
+    command was ``_elbow_ramp(0.159)`` and carried the ramp's velocity at that
+    point, 13.166 mrad/s. That command opens the motion, so it re-seeds the
+    history at a standstill -- and the very next command, one honest millisecond
+    of the same ramp later, was differenced against that fabricated zero:
+    ``0.0131659 / 0.001`` = the number in the log, to six figures. The cycle
+    after it then broke ``kMaxElbowJerk`` the same way, at -13083 rad/s^3.
+
+    Nothing in that stream is a discontinuity, and no client can avoid it: the
+    gap it is charged for is the gap the run was told not to enforce.
+    """
+    gap = 160
+    server = _held_elbow_session(mock_physics_sim, gap)
+
+    for index in range(4):
+        message_id = gap + index
+        elapsed = (gap - 1 + index) * DELTA_T
+        datagram = elbow_command(message_id, HOME_ELBOW[0] + _elbow_ramp(elapsed))
+        server.motion_limits.note_published(message_id)
+        assert server._absorb_within_motion_limits(datagram, fresh=True), (
+            f"conforming elbow ramp refused {index} cycles after the hold"
+        )
+
+    assert not any(server.robot_state.state["errors"])
+    assert server.motion_limits.violated is False
+
+
+def test_a_genuine_jump_after_a_held_reference_is_still_refused(mock_physics_sim):
+    """The re-seed window costs the second difference, not the envelope.
+
+    A resume is judged on its own terms whatever the gap was -- the elbow's
+    range and its *velocity* are facts about the commanded signal alone, not
+    about a reference the client could not see. A 0.1 rad step in one cycle is
+    100 rad/s against a 1.5 rad/s cap, and it is still refused inside the
+    window, which is what keeps ``note_hold`` from being a hole a full-range
+    teleport walks through.
+    """
+    gap = 160
+    server = _held_elbow_session(mock_physics_sim, gap)
+
+    opening = elbow_command(gap, HOME_ELBOW[0])
+    server.motion_limits.note_published(gap)
+    assert server._absorb_within_motion_limits(opening, fresh=True)
+
+    jump = elbow_command(gap + 1, HOME_ELBOW[0] + 0.1)
+    server.motion_limits.note_published(gap + 1)
+    assert server._absorb_within_motion_limits(jump, fresh=True) is False
+
+    latched = server.robot_state.state
+    assert latched["errors"][CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX] is True
+    assert sum(latched["errors"]) == 1
+    assert server.motion_limits.violated is True
+
+
+def test_the_re_seed_window_closes_after_two_commands(mock_physics_sim):
+    """It is two samples wide -- a value and a rate -- and then differencing resumes.
+
+    The window exists because a velocity cannot be read off one sample. Once the
+    client has supplied two, the history describes the client again and a real
+    acceleration discontinuity is caught exactly as it would be mid-motion.
+    """
+    gap = 160
+    server = _held_elbow_session(mock_physics_sim, gap)
+
+    # Two conforming cycles at 1 mrad/s: value, then rate.
+    for index, angle in enumerate((HOME_ELBOW[0], HOME_ELBOW[0] + 1e-6)):
+        message_id = gap + index
+        server.motion_limits.note_published(message_id)
+        assert server._absorb_within_motion_limits(
+            elbow_command(message_id, angle), fresh=True
+        )
+
+    # ...and now a 0.02 rad/s step, which is 20 rad/s^2 over one cycle: inside
+    # the elbow's velocity cap, outside its acceleration cap, and caught.
+    step = HOME_ELBOW[0] + 1e-6 + 0.02 * DELTA_T
+    server.motion_limits.note_published(gap + 2)
+    accepted = server._absorb_within_motion_limits(elbow_command(gap + 2, step), fresh=True)
+
+    assert accepted is False
+    assert server.robot_state.state["errors"][
+        CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX
+    ] is True
+
 # --- layer 2: the server over the wire, with a mocked simulator --------------
 
 

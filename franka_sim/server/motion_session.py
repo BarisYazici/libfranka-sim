@@ -1389,6 +1389,12 @@ class MotionSessionMixin:
             if outcome.consecutive_lost < self.comm.max_consecutive_lost:
                 self._extrapolate_missed_cycle(outcome.closed_id)
             elif outcome.bound_reached:
+                # Past this point the reference is *held*, so the derivatives
+                # the checker would judge a resumed command against describe a
+                # client that is no longer there. It re-seeds them from the
+                # client's own first two commands instead; see
+                # :meth:`MotionLimitChecker.note_hold`.
+                self.motion_limits.note_hold()
                 # The bound the robot stops at. With enforcement on, the abort
                 # below is about to fire and this line is its explanation; with
                 # enforcement off it is the whole report, which is why it is not

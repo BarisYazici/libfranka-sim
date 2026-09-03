@@ -51,6 +51,40 @@ class _Differentiator:
         #: there promises.
         self.clean_first = [0.0] * width
         self.clean_second = [0.0] * width
+        #: How many more commands re-seed this history rather than being
+        #: differenced against it; see :meth:`mark_reseeding`.
+        self.reseeding = 0
+
+    def mark_reseeding(self, commands: int = 2) -> None:
+        """The stored ``first`` derivative is meaningless: rebuild it from the client.
+
+        Armed after a run of lost cycles long enough that the reference stopped
+        being extrapolated and was *held*
+        (:data:`~franka_sim.comm_constraints.MAX_CONSECUTIVE_LOST_CYCLES`), a
+        state the real robot never reaches because it aborts the motion there.
+        Past that point the history's ``first`` derivative describes a client
+        that is not there any more, and the second difference taken against it
+        is not a rate anybody commanded -- it is the *velocity* of the resumed
+        stream divided by one cycle.
+
+        Two commands, because a velocity needs two samples: the first re-seeds
+        the value, the second the rate. While armed, :meth:`derivatives` reports
+        the second and third differences as zero -- not "within limits", but
+        *not measurable across this boundary* -- and :meth:`advance` stores a
+        zero acceleration so the jerk of the command after the window is
+        differenced against nothing stale either. The first difference is
+        untouched throughout, so the velocity envelope and the position range
+        judge every one of these commands exactly as they always do: a resume
+        that teleports is still refused, it is only judged as the step it is
+        rather than as an acceleration against a reference the client was never
+        told about.
+        """
+        self.reseeding = int(commands)
+
+    def _consume_reseeding(self) -> None:
+        """One re-seed command has been accepted; see :meth:`mark_reseeding`."""
+        if self.reseeding:
+            self.reseeding -= 1
 
     def mark_clean(self) -> None:
         """Remember the current derivatives as the last unflagged ones."""
@@ -122,6 +156,10 @@ class _Differentiator:
         """
         step = cycles * DELTA_T
         first = [(command[i] - self.value[i]) / step for i in range(self.width)]
+        if self.reseeding:
+            # Nothing above the first difference survives a held reference; see
+            # :meth:`mark_reseeding`.
+            return first, [0.0] * self.width, [0.0] * self.width
         second = [(first[i] - self.first[i]) / step for i in range(self.width)]
         third = [(second[i] - self.second[i]) / step for i in range(self.width)]
         return first, second, third
@@ -132,12 +170,14 @@ class _Differentiator:
         self.value = [float(command[i]) for i in range(self.width)]
         self.first = first
         self.second = second
+        self._consume_reseeding()
 
     def rebase(self, command: Sequence[float]) -> None:
         """Accept ``command`` as a fresh standstill: derivatives reset to zero."""
         self.value = [float(command[i]) for i in range(self.width)]
         self.first = [0.0] * self.width
         self.second = [0.0] * self.width
+        self._consume_reseeding()
 
     # -- packet-loss extrapolation ----------------------------------------
     #
@@ -448,6 +488,22 @@ class _CartesianDifferentiator:
         self.first = [0.0] * 6
         #: See :attr:`_Differentiator.clean_first`.
         self.clean_first = [0.0] * 6
+        #: See :attr:`_Differentiator.reseeding`.
+        self.reseeding = 0
+
+    def mark_reseeding(self, commands: int = 2) -> None:
+        """See :meth:`_Differentiator.mark_reseeding`.
+
+        One derivative up, as everything on this class is: ``first`` is the
+        twist *acceleration*, so what a held reference makes meaningless -- and
+        what the window suppresses -- is the jerk.
+        """
+        self.reseeding = int(commands)
+
+    def _consume_reseeding(self) -> None:
+        """See :meth:`_Differentiator._consume_reseeding`."""
+        if self.reseeding:
+            self.reseeding -= 1
 
     def mark_clean(self) -> None:
         """Remember the current acceleration as the last unflagged one."""
@@ -472,6 +528,9 @@ class _CartesianDifferentiator:
         """Acceleration and jerk implied by ``command``, without advancing."""
         step = cycles * DELTA_T
         acceleration = [(command[i] - self.value[i]) / step for i in range(6)]
+        if self.reseeding:
+            # See :meth:`mark_reseeding`.
+            return acceleration, [0.0] * 6
         jerk = [(acceleration[i] - self.first[i]) / step for i in range(6)]
         return acceleration, jerk
 
@@ -480,6 +539,7 @@ class _CartesianDifferentiator:
         acceleration, _ = self.derivatives(command, cycles)
         self.value = [float(command[i]) for i in range(6)]
         self.first = acceleration
+        self._consume_reseeding()
 
     def extrapolate(self) -> List[float]:
         """The next twist of a missed cycle, at frozen twist-acceleration.
@@ -538,6 +598,17 @@ class _PoseDifferentiator:
         #: See :attr:`_Differentiator.clean_first`.
         self.clean_first = [0.0] * 6
         self.clean_second = [0.0] * 6
+        #: See :attr:`_Differentiator.reseeding`.
+        self.reseeding = 0
+
+    def mark_reseeding(self, commands: int = 2) -> None:
+        """See :meth:`_Differentiator.mark_reseeding`."""
+        self.reseeding = int(commands)
+
+    def _consume_reseeding(self) -> None:
+        """See :meth:`_Differentiator._consume_reseeding`."""
+        if self.reseeding:
+            self.reseeding -= 1
 
     def mark_clean(self) -> None:
         """Remember the current twist derivatives as the last unflagged ones."""
@@ -575,6 +646,9 @@ class _PoseDifferentiator:
         linear = (matrix[:3, 3] - self.translation) / step
         angular = rotation_log(self.rotation.T @ matrix[:3, :3]) / step
         velocity = [float(value) for value in (*linear, *angular)]
+        if self.reseeding:
+            # See :meth:`_Differentiator.mark_reseeding`.
+            return velocity, [0.0] * 6, [0.0] * 6
         acceleration = [(velocity[i] - self.first[i]) / step for i in range(6)]
         jerk = [(acceleration[i] - self.second[i]) / step for i in range(6)]
         return velocity, acceleration, jerk
@@ -588,10 +662,12 @@ class _PoseDifferentiator:
         self.translation = np.array(matrix[:3, 3])
         self.first = velocity
         self.second = acceleration
+        self._consume_reseeding()
 
     def rebase(self, pose: Sequence[float]) -> None:
         """Accept ``pose`` as a fresh standstill: derivatives reset to zero."""
         self.seed(pose)
+        self._consume_reseeding()
 
     def extrapolate(self) -> List[float]:
         """The next commanded pose of a missed cycle, at frozen acceleration.
