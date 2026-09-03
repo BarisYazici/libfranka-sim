@@ -34,7 +34,7 @@ jobs:
 
 Inputs (all optional): `image` / `tag` (defaults
 `ghcr.io/barisyazici/franka-sim:latest`), `args` (extra
-`run-franka-sim-server` flags), `port`, `container-name`, `wait-timeout`.
+`run-franka-sim-server` flags), `port`, `container-name`, `cpu-shares` (Docker CPU weight for the simulator, default 4096 so the 1 kHz loop wins contention on small runners), `wait-timeout`.
 Outputs: `host`, `port`, `container-name`. The container keeps running for
 the rest of the job; inspect it with `docker logs franka-sim`.
 

@@ -29,6 +29,15 @@ inputs:
     description: 'Name for the started container (docker logs <name> to inspect it)'
     required: false
     default: 'franka-sim'
+  cpu-shares:
+    description: >-
+      Docker --cpu-shares weight for the simulator container (default 4096,
+      i.e. 4x a default container). Only matters under CPU contention, which
+      is exactly when the 1 kHz robot must not be the process that starves:
+      on a 2-core hosted runner a hung ros2_control_node otherwise stalls the
+      state stream long enough for the next client to time out at connect.
+    required: false
+    default: '4096'
   wait-timeout:
     description: 'Seconds to wait for the server to pass the readiness handshake'
     required: false
@@ -59,11 +68,13 @@ runs:
         FS_TAG: ${{ inputs.tag }}
         FS_NAME: ${{ inputs.container-name }}
         SERVER_ARGS: ${{ inputs.args }}
+        FS_CPU_SHARES: ${{ inputs.cpu-shares }}
       run: |
         # Host networking on purpose: the FCI is a 1 kHz UDP loop; publishing
         # ports would put Docker's NAT in the middle of it.
+        [[ "$FS_CPU_SHARES" =~ ^[0-9]+$ ]] || { echo "::error::cpu-shares must be an integer, got '$FS_CPU_SHARES'"; exit 1; }
         docker rm -f "$FS_NAME" 2>/dev/null || true
-        docker run -d --network host --name "$FS_NAME" "$FS_IMAGE:$FS_TAG" $SERVER_ARGS
+        docker run -d --network host --cpu-shares "$FS_CPU_SHARES" --name "$FS_NAME" "$FS_IMAGE:$FS_TAG" $SERVER_ARGS
 
     - name: Wait until the server serves the FCI
       shell: bash
