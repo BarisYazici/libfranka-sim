@@ -15,7 +15,7 @@ on:
       - '.github/workflows/docker.yml'
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']  # full releases only; the floating v1 tag must not republish
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/franka-sim

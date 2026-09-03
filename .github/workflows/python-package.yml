@@ -4,7 +4,7 @@ name: Python Package Build and Release
 on:
   push:
     tags:
-      - 'v*'  # Run on any tag starting with 'v' (e.g., v1.0.0)
+      - 'v[0-9]+.[0-9]+.[0-9]+'  # full releases only (v1.0.0); the floating major tag (v1) must not republish
 
 jobs:
   build:
