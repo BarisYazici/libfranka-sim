@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Start a simulated FR3
-        uses: BarisYazici/libfranka-sim@main
+        uses: BarisYazici/libfranka-sim@v1
         with:
           # Everything is optional. Fault injection makes the sim abort
           # motions the way the real robot does — see below.

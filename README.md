@@ -151,7 +151,7 @@ regression-tested on every push. Three ways in — see the
 
 ```yaml
 # GitHub Actions: start a simulated FR3, then run your tests against 127.0.0.1
-- uses: BarisYazici/libfranka-sim@main
+- uses: BarisYazici/libfranka-sim@v1
   with:
     args: '--enforce-comm-constraints --enforce-motion-limits'
 ```
