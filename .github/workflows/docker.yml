@@ -16,6 +16,12 @@ on:
   push:
     branches: [main]
     tags: ['v[0-9]+.[0-9]+.[0-9]+']  # full releases only; the floating v1 tag must not republish
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to (re)publish, e.g. v1.1.1'
+        required: true
+        type: string
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/franka-sim
@@ -31,20 +37,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0  # git describe needs the tags
 
       - name: Compute version and image name
         id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          # setuptools_scm needs PEP 440: v1.0.0 -> 1.0.0,
-          # v1.0.0-4-g523fc48 -> 1.0.0.post4+g523fc48, bare sha -> 0.0.0+g<sha>
-          raw=$(git describe --tags --always)
-          case "$raw" in
-            *.*)  # a version tag (bare `--always` shas never contain a dot)
-              version=$(echo "$raw" | sed -E 's/^v//; s/-([0-9]+)-g([0-9a-f]+)$/.post\1+g\2/') ;;
-            *)
-              version="0.0.0+g$raw" ;;
-          esac
+          # A release is named by its tag, never by git describe: on a commit
+          # that also carries the floating v1 tag, describe returned
+          # v1.1.1-0-ge2a642f, which became 1.1.1.post0+ge2a642f -- valid
+          # PEP 440, but '+' is not allowed in a Docker tag.
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ] && [ "$GITHUB_REF_TYPE" = tag ]; then tag="$GITHUB_REF_NAME"; fi
+          if [ -n "$tag" ]; then
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: $tag" >&2; exit 1; }
+            version="${tag#v}"
+          else
+            # setuptools_scm needs PEP 440: v1.0.0-4-g523fc48 -> 1.0.0.post4+g523fc48,
+            # bare sha -> 0.0.0+g<sha>
+            raw=$(git describe --tags --always)
+            case "$raw" in
+              *.*)  # a version tag (bare `--always` shas never contain a dot)
+                version=$(echo "$raw" | sed -E 's/^v//; s/-([0-9]+)-g([0-9a-f]+)$/.post\1+g\2/') ;;
+              *)
+                version="0.0.0+g$raw" ;;
+            esac
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"  # ghcr requires lowercase
 
@@ -91,7 +111,7 @@ jobs:
           docker push '${{ steps.meta.outputs.image }}:edge'
 
       - name: Publish :<version> and :latest (tag)
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch'
         run: |
           image='${{ steps.meta.outputs.image }}'
           version='${{ steps.meta.outputs.version }}'
