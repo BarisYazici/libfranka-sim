@@ -1532,6 +1532,33 @@ class MotionSessionMixin:
             # snapshot in the same step), so the guesses it was judged against
             # stand and there is nothing left to put back.
             self._extrapolated_reference = None
+        if outcome.recorded and self.control_mode is ControlMode.TORQUE:
+            # **The published reference must never lag the one this command was
+            # just recorded into.** ``tau_J_d`` is written for real by
+            # :meth:`_dispatch_control_command`, three statements and a physics
+            # call later -- and the state-publish thread runs concurrently. Its
+            # drain gate normally holds it off (``_commands_in_flight``), but the
+            # gate gives up after :data:`_DRAIN_GATE_TIMEOUT`, which is exactly
+            # what a starved 2-core CI runner makes it do. A state that goes out
+            # in that window carries the *previous* command's ``tau_J_d`` while
+            # the checker's torque reference has already advanced to this one.
+            #
+            # ``franka_hardware`` rate-limits torques against the robot's own
+            # reported reference -- ``franka::limitRate(kMaxTorqueRate, tau,
+            # current_state_.tau_J_d)`` (``franka_hardware/src/robot.cpp:171``)
+            # -- and libfranka's ``receiveRobotState`` hands it the newest state
+            # on the socket, so a client cannot route around a reference the
+            # server published one command behind. It then saturates its limiter
+            # from that stale value and the next command differences to
+            # ``999.999 + |the client's own previous torque rate|`` over one
+            # cycle: a conforming torque controller aborted with
+            # ``controller_torque_discontinuity: tau_J_d joint 4 = 1002.81 Nm/s``
+            # off a 2.81 Nm/s ramp. Hardware has no such window -- the state for
+            # cycle k carries the torque Control applied at cycle k, by
+            # construction -- so publishing the echo here, before anything else
+            # can be observed, is what makes the sim's reference honest.
+            self.robot_state.state["tau_J_d"] = list(command["tau_J_d"])
+
         if outcome.violation is None:
             return True
 
