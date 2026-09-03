@@ -53,8 +53,8 @@ from typing import Optional
 import numpy as np
 
 from franka_sim.motion_limits import (
-    MAX_ROTATIONAL_VELOCITY,
-    MAX_TRANSLATIONAL_VELOCITY,
+    LIMITER_ROTATIONAL_VELOCITY,
+    LIMITER_TRANSLATIONAL_VELOCITY,
     rotation_log,
 )
 
@@ -116,8 +116,8 @@ def pose_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
 
 def clamp_twist(
     twist: np.ndarray,
-    max_translation: float = MAX_TRANSLATIONAL_VELOCITY,
-    max_rotation: float = MAX_ROTATIONAL_VELOCITY,
+    max_translation: float = LIMITER_TRANSLATIONAL_VELOCITY,
+    max_rotation: float = LIMITER_ROTATIONAL_VELOCITY,
 ) -> np.ndarray:
     """Scale each half of ``twist`` back to the FR3's Cartesian velocity limits.
 
@@ -125,6 +125,14 @@ def clamp_twist(
     (``src/rate_limiting.cpp``) and how the FR3's specification states the
     limits -- one bound on the translation vector, one on the rotation vector,
     not six per-axis bounds.
+
+    The bounds are libfranka's own published constants
+    (:data:`franka_sim.motion_limits.LIMITER_TRANSLATIONAL_VELOCITY`), i.e. the
+    robot's thresholds less ``kLimitEps`` -- the client-side value, because this
+    is client-side code: it *emits* a twist. Saturating at the threshold itself
+    would hand :data:`franka_sim.motion_limits.MEASURED_CARTESIAN_VELOCITY_LIMIT`
+    a speed it then has to decide by rounding, which is the false positive
+    documented on :data:`franka_sim.limits.tables.LIMIT_EPS`.
 
     This is a guard rail, not a feature. On the accepted command stream it never
     binds: a twist that reaches these values has already been refused by

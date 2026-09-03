@@ -29,8 +29,28 @@ logger = logging.getLogger("franka_sim.motion_limits")
 DELTA_T = 1e-3
 
 #: ``franka::kLimitEps`` -- "Epsilon value for checking limits"
-#: (``include/franka/rate_limiting.h:24``). Every published limit below already
-#: has it subtracted, exactly as libfranka's constants do.
+#: (``include/franka/rate_limiting.h:24``).
+#:
+#: **A client-side margin, not a threshold, and the distinction is the whole
+#: point of the numbers below.** libfranka publishes every rate limit with this
+#: already subtracted, but those constants are what ``franka::limitRate`` clamps
+#: a command *to* (``src/rate_limiting.cpp``): they are the target a
+#: rate-limiting client aims at, sitting one epsilon inside the robot's own
+#: check so that a conforming command can never trip it. Copying the published
+#: numbers as the sim's *thresholds* threw that margin away and put the check
+#: exactly where a rate-limited client lands, so double rounding decided the
+#: comparison. A franka_ros2 run -- ``franka_hardware`` rate-limits its torques
+#: through ``franka::limitRate`` -- was aborted three times with
+#: ``controller_torque_discontinuity: tau_J_d joint 3 = -999.999 Nm/s, limit
+#: 999.999 Nm/s``: the limiter's own output, judged against the limiter's own
+#: target, all three false positives.
+#:
+#: Every check threshold below is therefore the *nominal* robot limit. This
+#: constant survives for the one thing it is legitimately for: code on this side
+#: that *generates* or clamps a command and wants libfranka's conservative
+#: target rather than the robot's threshold -- see
+#: :data:`LIMITER_TRANSLATIONAL_VELOCITY` and
+#: :func:`franka_sim.cartesian_ik.clamp_twist`.
 LIMIT_EPS = 1e-3
 
 #: ``franka::kNormEps`` = ``std::numeric_limits<double>::epsilon()``
@@ -48,40 +68,83 @@ NORM_EPS = sys.float_info.epsilon
 TOL_NUMBER_PACKETS_LOST = 0.0
 
 #: ``franka::kMaxJointAcceleration`` (``include/franka/rate_limiting.h:53``):
-#: 10 rad/s^2 per joint, less :data:`LIMIT_EPS`.
-MAX_JOINT_ACCELERATION = tuple(10.0 - LIMIT_EPS for _ in range(7))
+#: 10 rad/s^2 per joint.
+#:
+#: Nominal: 10 rad/s^2 *is* the robot's threshold. libfranka publishes
+#: ``10.0 - kLimitEps`` because that is what its client-side rate limiter aims
+#: at -- one epsilon inside this check, precisely so that limiting a command
+#: never trips it. Checking at 9.999 is the bug :data:`LIMIT_EPS` documents,
+#: caught as ``tau_J_d joint 3 = -999.999 Nm/s, limit 999.999 Nm/s`` on the
+#: torque-rate twin of this constant.
+MAX_JOINT_ACCELERATION = tuple(10.0 for _ in range(7))
 
 #: ``franka::kMaxJointJerk`` (``include/franka/rate_limiting.h:47``):
-#: 5000 rad/s^3 per joint, less :data:`LIMIT_EPS`.
-MAX_JOINT_JERK = tuple(5000.0 - LIMIT_EPS for _ in range(7))
+#: 5000 rad/s^3 per joint, nominal -- the robot's threshold, for the same reason
+#: :data:`MAX_JOINT_ACCELERATION` is. libfranka's ``5000.0 - kLimitEps`` is its
+#: limiter's target, deliberately one epsilon inside this.
+MAX_JOINT_JERK = tuple(5000.0 for _ in range(7))
 
 #: ``franka::kJointVelocityLimitsTolerance``
 #: (``include/franka/rate_limiting.h:62``): "Tolerance value for joint velocity
 #: limits to deal with numerical errors and data losses."
+#:
+#: :data:`LIMIT_EPS` stays *here*, and that is not an oversight. This is not a
+#: limit copied off libfranka's limiter target: it is a tolerance libfranka
+#: subtracts from the position-based velocity envelope, i.e. it *widens* what a
+#: client may command and so is already on the permissive side of the check.
+#: The formula is libfranka's verbatim, including the packet-loss term -- which
+#: is multiplied by :data:`TOL_NUMBER_PACKETS_LOST` = 0 on an FR3, so whether
+#: the acceleration it scales is nominal or eps-reduced cannot change a digit.
 JOINT_VELOCITY_LIMITS_TOLERANCE = tuple(
     LIMIT_EPS + TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_JOINT_ACCELERATION[i] for i in range(7)
 )
 
 #: ``franka::kMaxTorqueRate`` (``include/franka/rate_limiting.h:44``):
-#: 1000 Nm/s per joint, less :data:`LIMIT_EPS`.
-MAX_TORQUE_RATE = tuple(1000.0 - LIMIT_EPS for _ in range(7))
+#: 1000 Nm/s per joint.
+#:
+#: Nominal, and this is the constant the eps bug was *observed* on. 1000 Nm/s is
+#: the robot's threshold; libfranka's ``1000 - kLimitEps`` is what
+#: ``franka::limitRate`` clamps ``tau_J_d`` to, one epsilon inside it so that a
+#: rate-limited client never trips this check. With the sim checking at 999.999
+#: instead, a franka_ros2 run -- ``franka_hardware`` rate-limits torques through
+#: that very function -- was aborted three times with
+#: ``controller_torque_discontinuity: tau_J_d joint 3 = -999.999 Nm/s, limit
+#: 999.999 Nm/s``, the limiter's own saturated output judged against the
+#: limiter's own target. See :data:`LIMIT_EPS`.
+MAX_TORQUE_RATE = tuple(1000.0 for _ in range(7))
 
 #: ``franka::kMaxTranslationalVelocity`` / ``Acceleration`` / ``Jerk``
-#: (``include/franka/rate_limiting.h:70``, ``:74``, ``:78``). The velocity
-#: carries the packet-loss term, which is zero for the FR3.
-MAX_TRANSLATIONAL_ACCELERATION = 9.0 - LIMIT_EPS
-MAX_TRANSLATIONAL_JERK = 4500.0 - LIMIT_EPS
+#: (``include/franka/rate_limiting.h:70``, ``:74``, ``:78``), nominal: 3 m/s,
+#: 9 m/s^2, 4500 m/s^3. libfranka's published ``- kLimitEps`` copies are its
+#: limiter's targets, one epsilon inside these thresholds so that limiting a
+#: twist never trips them -- see :data:`LIMIT_EPS` and the ``-999.999 vs
+#: 999.999`` false positive recorded there. The packet-loss term stays on the
+#: velocity, faithfully to libfranka; it is zero for the FR3.
+MAX_TRANSLATIONAL_ACCELERATION = 9.0
+MAX_TRANSLATIONAL_JERK = 4500.0
 MAX_TRANSLATIONAL_VELOCITY = (
-    3.0 - LIMIT_EPS - TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_TRANSLATIONAL_ACCELERATION
+    3.0 - TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_TRANSLATIONAL_ACCELERATION
 )
 
 #: ``franka::kMaxRotationalVelocity`` / ``Acceleration`` / ``Jerk``
-#: (``include/franka/rate_limiting.h:82``, ``:86``, ``:90``).
-MAX_ROTATIONAL_ACCELERATION = 17.0 - LIMIT_EPS
-MAX_ROTATIONAL_JERK = 8500.0 - LIMIT_EPS
-MAX_ROTATIONAL_VELOCITY = (
-    2.5 - LIMIT_EPS - TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_ROTATIONAL_ACCELERATION
-)
+#: (``include/franka/rate_limiting.h:82``, ``:86``, ``:90``), nominal for the
+#: same reason: 2.5 rad/s, 17 rad/s^2, 8500 rad/s^3 are the robot's thresholds,
+#: and libfranka's ``- kLimitEps`` versions are what its limiter aims at.
+MAX_ROTATIONAL_ACCELERATION = 17.0
+MAX_ROTATIONAL_JERK = 8500.0
+MAX_ROTATIONAL_VELOCITY = 2.5 - TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_ROTATIONAL_ACCELERATION
+
+#: What code on *this* side that emits or clamps a Cartesian velocity should aim
+#: at: libfranka's own published constants, i.e. the two thresholds above less
+#: :data:`LIMIT_EPS`. The distinction matters in exactly one direction -- a
+#: generator that saturates at the threshold hands the checker a value the
+#: checker then has to decide by rounding, which is the bug :data:`LIMIT_EPS`
+#: documents. :func:`franka_sim.cartesian_ik.clamp_twist` is the one consumer,
+#: and its output is also what :data:`MEASURED_CARTESIAN_VELOCITY_LIMIT` ends up
+#: judging, so the epsilon of headroom is what keeps the sim's own IK from
+#: raising ``cartesian_velocity_violation`` against itself.
+LIMITER_TRANSLATIONAL_VELOCITY = MAX_TRANSLATIONAL_VELOCITY - LIMIT_EPS
+LIMITER_ROTATIONAL_VELOCITY = MAX_ROTATIONAL_VELOCITY - LIMIT_EPS
 
 #: ``franka::kMaxElbowVelocity`` / ``Acceleration`` / ``Jerk``
 #: (``include/franka/rate_limiting.h:94``, ``:99``, ``:105``). ``elbow[0]`` is a
@@ -92,11 +155,15 @@ MAX_ROTATIONAL_VELOCITY = (
 #: :data:`CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX`, and so does
 #: the range the position itself has to stay in
 #: (:data:`ELBOW_POSITION_LIMITS`).
-MAX_ELBOW_ACCELERATION = 10.0 - LIMIT_EPS
-MAX_ELBOW_JERK = 5000.0 - LIMIT_EPS
-MAX_ELBOW_VELOCITY = (
-    1.5 - LIMIT_EPS - TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_ELBOW_ACCELERATION
-)
+#:
+#: Nominal, like every other rate threshold here: 1.5 rad/s, 10 rad/s^2 and
+#: 5000 rad/s^3 are the robot's own bounds, and libfranka's ``- kLimitEps``
+#: copies are what its limiter targets so a limited elbow stream never trips
+#: them (:data:`LIMIT_EPS`, and the ``-999.999 vs 999.999`` false positive it
+#: records).
+MAX_ELBOW_ACCELERATION = 10.0
+MAX_ELBOW_JERK = 5000.0
+MAX_ELBOW_VELOCITY = 1.5 - TOL_NUMBER_PACKETS_LOST * DELTA_T * MAX_ELBOW_ACCELERATION
 
 #: ``franka::kFactorCartesianRotationPoseInterface`` = 0.99
 #: (``include/franka/rate_limiting.h:39``): "Factor for the definition of
@@ -179,7 +246,7 @@ MAX_TORQUE = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 #: integrates a constant ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 into
 #: ``elbow[0]``, so the angle grows as ``q[2] + 0.15 t^2`` and the velocity as
 #: ``0.3 t``. The angle crosses +2.9065 rad at t ~ 4.49 s; the velocity reaches
-#: :data:`MAX_ELBOW_VELOCITY` (1.499 rad/s) only at t ~ 5.00 s. Both are named
+#: :data:`MAX_ELBOW_VELOCITY` (1.5 rad/s) only at t ~ 5.00 s. Both are named
 #: :data:`CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX`, so the name
 #: hardware returns does not separate them -- but half a second separates *when*
 #: they fire, and running the commanded elbow half a second past a joint stop is
@@ -293,7 +360,7 @@ CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX = 16
 #: ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 from ``kElbowPose``. Acceleration
 #: stays at 0.3, far inside :data:`MAX_ELBOW_ACCELERATION`; the angle leaves
 #: joint 3's range after ~4.49 s and the velocity crosses
-#: :data:`MAX_ELBOW_VELOCITY` (1.499 rad/s) after ~5.00 s. The range is
+#: :data:`MAX_ELBOW_VELOCITY` (1.5 rad/s) after ~5.00 s. The range is
 #: therefore what the robot reaches first, and what this index is checked for
 #: first -- see :data:`ELBOW_POSITION_LIMITS`.
 CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX = 17
@@ -572,8 +639,8 @@ MEASURED_JOINT_VELOCITY_MARGIN = 0.1
 
 #: Bound on *measured* end-effector translational speed, in m/s, above which the
 #: safety controller latches ``cartesian_velocity_violation``. Franka's own
-#: number: :data:`MAX_TRANSLATIONAL_VELOCITY`, i.e. ``franka::kMaxTranslational``
-#: ``Velocity`` = 3.0 m/s less ``kLimitEps`` (``include/franka/rate_limiting.h:82``),
+#: number: :data:`MAX_TRANSLATIONAL_VELOCITY`, i.e. the nominal 3.0 m/s behind
+#: ``franka::kMaxTranslationalVelocity`` (``include/franka/rate_limiting.h:82``),
 #: which is the FR3 specification's Cartesian translational velocity limit
 #: (``p_dot_max = 3.0 m/s`` in Franka's "Robot and interface specifications").
 #: Nothing separate is published for the safety controller's copy of it, so the

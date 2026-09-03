@@ -2152,7 +2152,7 @@ class MotionLimitChecker:
         reference provocation cannot settle in-cycle precedence: it holds the
         pose and integrates a constant ``ddelbow = 0.3`` rad/s^2 from
         ``kElbowPose`` (``q[2] = -0.1229``), so the angle leaves joint 3's
-        range at ~4.49 s while the velocity is still at ~90% of its 1.499
+        range at ~4.49 s while the velocity is still at ~90% of its 1.5
         rad/s cap (which it would cross only at ~5.00 s) -- no single cycle
         ever breaks both. What the ramp *does* pin is when the abort lands:
         the range fires it half a second earlier, half a second in which the

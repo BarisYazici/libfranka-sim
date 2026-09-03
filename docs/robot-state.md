@@ -771,7 +771,7 @@ once per cycle:
 
 ```
 motion limit violated: joint_motion_generator_velocity_discontinuity:
-q_c joint 4 = 294.395 rad/s^2, limit 9.999 rad/s^2 (not enforced)
+q_c joint 4 = 294.395 rad/s^2, limit 10 rad/s^2 (not enforced)
 ```
 
 Aborting the motion is opt-in, for the same reason the communication violation is:
@@ -876,7 +876,7 @@ own last waypoint, and the sim latches the discontinuity hardware would:
 
 ```text
 motion limit violated: joint_motion_generator_velocity_discontinuity:
-q_c joint 1 = -763.94 rad/s^2, limit 9.999 rad/s^2
+q_c joint 1 = -763.94 rad/s^2, limit 10 rad/s^2
 ```
 
 Resume from the `q_d` in the robot state instead — the field libfranka documents

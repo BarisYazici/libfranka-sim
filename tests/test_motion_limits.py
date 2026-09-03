@@ -373,7 +373,7 @@ def test_the_velocity_limit_ramps_down_towards_the_joint_limit():
 #: into the ramp is 4500 rad/s^3, inside kMaxJointJerk), the rest at a constant
 #: 9 rad/s^2 (inside kMaxJointAcceleration, and zero jerk). Ten cycles of it
 #: move a joint 0.0855 rad/s, which is 3.3% of the tightest cap -- room enough
-#: that no plausible future change to LIMIT_EPS can decide these tests.
+#: that no plausible future nudge of a limit constant can decide these tests.
 JOINT_VELOCITY_RAMP = [0.0045] + [0.009] * 10
 
 
@@ -495,9 +495,18 @@ def test_a_velocity_step_is_an_acceleration_discontinuity():
     checker.start_motion(ControlMode.VELOCITY, robot_state_at())
     drive_velocity_history(checker, spread(0.5), spread(limit))
 
-    assert checker.check(command(dq_c=spread(0.5 + limit * DELTA_T))) is None
+    # A hair inside, not exactly on: reconstructing a waypoint from an
+    # acceleration and differencing it back is not bit-exact (0.5 + 10.0 * 1e-3
+    # differences back to 10.000000000000009), so a probe placed *on* the
+    # constant is decided by the last ulp rather than by the check. The same
+    # hair either side that
+    # ``test_acceleration_at_the_limit_passes_and_above_it_is_a_velocity_``
+    # ``discontinuity`` uses on ``q_c``. A conforming client is never on this
+    # boundary anyway: libfranka's limiter targets 10 - kLimitEps, a full
+    # millirad/s^2 clear of it.
+    assert checker.check(command(dq_c=spread(0.5 + (limit - 1e-6) * DELTA_T))) is None
 
-    over = limit + 1e-6
+    over = limit + 1e-4
     violation = checker.check(command(dq_c=spread(0.5 + over * DELTA_T)))
     assert violation.error_index == JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX
     assert violation.error_name == "joint_motion_generator_acceleration_discontinuity"
@@ -535,7 +544,7 @@ def test_a_torque_outside_the_joints_range_is_a_tau_j_range_violation():
 
 
 def test_a_torque_step_is_a_controller_torque_discontinuity():
-    """The kMaxTorqueRate boundary: 1000 - kLimitEps Nm/s, i.e. ~1 Nm per cycle."""
+    """The kMaxTorqueRate boundary: 1000 Nm/s nominal, i.e. ~1 Nm per cycle."""
     limit = MAX_TORQUE_RATE[0]
     checker = MotionLimitChecker()
     checker.start_motion(ControlMode.TORQUE, robot_state_at())
@@ -545,6 +554,143 @@ def test_a_torque_step_is_a_controller_torque_discontinuity():
     violation = checker.check(command(tau_J_d=spread(limit * DELTA_T + 1e-6)))
     assert violation.error_index == CONTROLLER_TORQUE_DISCONTINUITY_INDEX
     assert violation.error_name == "controller_torque_discontinuity"
+
+
+# -- a client that rate-limits exactly the way libfranka does --
+#
+# ``franka::limitRate`` does not clamp a command to the robot's threshold: it
+# clamps it to the threshold *less* ``kLimitEps``, and libfranka publishes only
+# those eps-reduced numbers (``kMaxTorqueRate`` = 1000 - 1e-3,
+# ``kMaxJointAcceleration`` = 10 - 1e-3, ...). A sim that lifts those constants
+# and uses them as its own *thresholds* throws the epsilon away and puts its
+# check exactly where a rate-limited client lands, so the last ulp of the
+# client's own arithmetic decides whether the motion aborts. It does abort: a
+# franka_ros2 run -- ``franka_hardware`` rate-limits torques through that very
+# function -- was killed three times with ``controller_torque_discontinuity:
+# tau_J_d joint 3 = -999.999 Nm/s, limit 999.999 Nm/s``.
+#
+# The two tests below are that client, per family: a saturated stream must be
+# clean, and one step of nominal + eps must not be.
+
+
+def rate_limited_torque_stream(rate, cycles=500, flip=100):
+    """``tau_J_d`` for joint 1 from a client saturating its rate limiter.
+
+    Element 0 is the seed the motion opens from; the rest are the commands.
+    The ramp is centred on zero so 500 cycles of ~1 Nm each stay inside joint
+    1's 87 Nm range and only the *rate* is ever on trial.
+    """
+    step = rate * DELTA_T
+    torque = -0.5 * flip * step
+    stream = [torque]
+    for cycle in range(cycles):
+        torque += step if (cycle // flip) % 2 == 0 else -step
+        stream.append(torque)
+    return stream
+
+
+def rate_limited_velocity_stream(acceleration, cycles=500, flip=100):
+    """``dq_c`` for joint 1 from a client saturating its rate limiter.
+
+    ``limitRate`` bounds jerk before acceleration, so a saturating client rides
+    at exactly ``acceleration`` through the straight stretches and turns around
+    over the four cycles ``kMaxJointJerk`` allows. An instantaneous reversal
+    would be a ``2a/dt`` = 20 000 rad/s^3 jerk instead -- a jerk violation on
+    any threshold, which would say nothing about the acceleration one.
+    """
+    jerk_step = (5000.0 - 1e-3) * DELTA_T
+    velocity, accel = 0.0, 0.0
+    # Two seeds, not one: a motion's opening command rebases the derivative
+    # history (it is the start-velocity check's business, not the
+    # differencer's), so the ramp has to begin one cycle later or its first
+    # measured jerk is taken from a standstill and doubles.
+    stream = [velocity, velocity]
+    for cycle in range(cycles):
+        target = acceleration if (cycle // flip) % 2 == 0 else -acceleration
+        accel += max(-jerk_step, min(jerk_step, target - accel))
+        velocity += accel * DELTA_T
+        stream.append(velocity)
+    return stream
+
+
+def run_torque_stream(stream):
+    """Stream ``tau_J_d`` at a torque checker; the first violation, or None."""
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.TORQUE, robot_state_at(tau_J_d=spread(stream[0])))
+    for message_id, torque in enumerate(stream[1:], start=1):
+        commanded = command(message_id=message_id, tau_J_d=spread(torque))
+        violation = checker.check(commanded)
+        if violation is not None:
+            return violation
+        checker.record(commanded)
+    return None
+
+
+def run_velocity_stream(stream):
+    """The same for ``dq_c`` at a joint-velocity checker."""
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.VELOCITY, robot_state_at(dq_d=spread(stream[0])))
+    for message_id, velocity in enumerate(stream[1:], start=1):
+        commanded = command(message_id=message_id, dq_c=spread(velocity))
+        violation = checker.check(commanded)
+        if violation is not None:
+            return violation
+        checker.record(commanded)
+    return None
+
+
+def test_a_libfranka_rate_limited_torque_stream_is_never_a_discontinuity():
+    """500 cycles saturating ``limitRate``'s own target must not trip the check.
+
+    ``kMaxTorqueRate`` = 1000 - kLimitEps is what libfranka clamps ``tau_J_d``
+    *to*; 1000 Nm/s is what the robot checks *at*. Judging the first against
+    itself is the franka_ros2 false positive (``tau_J_d joint 3 = -999.999
+    Nm/s, limit 999.999 Nm/s``), and this stream reproduces it exactly:
+    saturated in both directions, with the reversal every 100 cycles that made
+    the observed run's rate negative.
+    """
+    assert MAX_TORQUE_RATE[0] == 1000.0, "the threshold is the robot's, not the limiter's"
+    assert run_torque_stream(rate_limited_torque_stream(1000.0 - 1e-3)) is None
+
+
+def test_a_torque_stream_one_epsilon_over_nominal_is_a_discontinuity():
+    """The other side of the same boundary: nominal + eps still aborts.
+
+    Widening the threshold from 999.999 to 1000 buys the conforming client its
+    epsilon back and nothing more -- a client that asks for 1000.001 Nm/s is
+    still stopped, on its first differenced command.
+    """
+    violation = run_torque_stream(rate_limited_torque_stream(1000.0 + 1e-3))
+
+    assert violation is not None
+    assert violation.error_index == CONTROLLER_TORQUE_DISCONTINUITY_INDEX
+    assert violation.error_name == "controller_torque_discontinuity"
+    assert violation.signal == "tau_J_d"
+    assert violation.limit == 1000.0
+    assert abs(violation.value) == pytest.approx(1000.0 + 1e-3, rel=1e-9)
+
+
+def test_a_libfranka_rate_limited_velocity_stream_is_never_a_discontinuity():
+    """The joint-acceleration twin: ``kMaxJointAcceleration`` = 10 - kLimitEps.
+
+    Same shape as the torque case and the same reasoning -- ``limitRate``
+    targets 9.999 rad/s^2, the robot checks at 10, and a client riding its own
+    target for 500 cycles must be waved through.
+    """
+    assert MAX_JOINT_ACCELERATION[0] == 10.0, "the threshold is the robot's, not the limiter's"
+    assert run_velocity_stream(rate_limited_velocity_stream(10.0 - 1e-3)) is None
+
+
+def test_a_velocity_stream_one_epsilon_over_nominal_is_a_discontinuity():
+    """...and 10.001 rad/s^2 is still an acceleration discontinuity."""
+    violation = run_velocity_stream(rate_limited_velocity_stream(10.0 + 1e-3))
+
+    assert violation is not None
+    assert violation.error_index == JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX
+    assert violation.error_name == "joint_motion_generator_acceleration_discontinuity"
+    assert violation.signal == "dq_c"
+    assert violation.limit == 10.0
+    assert abs(violation.value) == pytest.approx(10.0 + 1e-3, rel=1e-9)
 
 
 # -- cartesian velocity generator (the mobile base's twist) --
@@ -623,7 +769,7 @@ def test_a_twist_acceleration_step_is_a_cartesian_acceleration_discontinuity():
     checker = MotionLimitChecker()
     checker.start_motion(ControlMode.STEERING_DRIVE, robot_state_at())
     # Ramp in at exactly the acceleration limit, which is also the jerk the
-    # first cycle carries: 8.999 / 1e-3 = 8999 < 4499999.
+    # first cycle carries: 9.0 / 1e-3 = 9000 < 4500000.
     checker.record(command(O_dP_EE_c=[limit * DELTA_T, 0, 0, 0, 0, 0]))
 
     violation = checker.check(command(O_dP_EE_c=[3 * limit * DELTA_T, 0, 0, 0, 0, 0]))
@@ -1041,7 +1187,7 @@ def test_an_elbow_ramp_past_its_velocity_limit_is_an_elbow_limit_violation():
 
     Holding the pose and integrating a constant
     ``ddelbow = 0.0003 / 0.001 = 0.3`` rad/s^2 into the elbow makes elbow
-    velocity grow linearly and cross ``kMaxElbowVelocity`` (1.499 rad/s) after
+    velocity grow linearly and cross ``kMaxElbowVelocity`` (1.5 rad/s) after
     ~5 s while acceleration stays at 0.3 -- two orders of magnitude inside
     ``kMaxElbowAcceleration``. Hardware answers
     ``cartesian_motion_generator_elbow_limit_violation``.
@@ -1144,7 +1290,7 @@ def test_the_reference_elbow_ramp_reaches_joint_3s_stop_before_its_velocity_cap(
     Which of the elbow's bounds that ramp reaches first is arithmetic, and it is
     the *range*: the angle grows as ``q[2] + 0.15 t^2`` and crosses joint 3's
     +2.9065 rad stop at t ~ 4.49 s, while the velocity grows as ``0.3 t`` and
-    only reaches ``kMaxElbowVelocity`` (1.499 rad/s) at t ~ 5.00 s. Half a
+    only reaches ``kMaxElbowVelocity`` (1.5 rad/s) at t ~ 5.00 s. Half a
     second apart, and both are named 17 -- so the error name hardware returns
     cannot tell them apart, but the *moment* it returns it can, and the range
     check is what puts the sim's abort at the same place.
@@ -2871,14 +3017,14 @@ def test_the_description_names_the_error_the_axis_the_value_and_the_limit():
         "q_c",
         "joint 4",
         12.5,
-        9.999,
+        10.0,
         "rad/s^2",
     ).describe()
 
     assert "joint_motion_generator_velocity_discontinuity" in described
     assert "joint 4" in described
     assert "12.5 rad/s^2" in described
-    assert "9.999 rad/s^2" in described
+    assert "10 rad/s^2" in described
 
 
 def test_ending_a_motion_stops_the_checking_but_keeps_the_latch():
@@ -4602,9 +4748,16 @@ def test_the_safety_controller_reports_without_enforcement_but_does_not_abort(
 
 
 def test_the_ee_speed_limit_is_the_published_translational_one():
-    """The limit is franka::kMaxTranslationalVelocity, not a number of our own."""
+    """The limit is franka::kMaxTranslationalVelocity, not a number of our own.
+
+    The *nominal* 3.0 m/s, not libfranka's published ``3.0 - kLimitEps``: that
+    epsilon is what libfranka's client-side limiter aims at, one step inside the
+    robot's threshold, and adopting it as the threshold is what produced the
+    ``-999.999 vs 999.999`` false positive documented on
+    ``franka_sim.limits.tables.LIMIT_EPS``.
+    """
     assert MEASURED_CARTESIAN_VELOCITY_LIMIT == MAX_TRANSLATIONAL_VELOCITY
-    assert MEASURED_CARTESIAN_VELOCITY_LIMIT == pytest.approx(3.0 - 1e-3)
+    assert MEASURED_CARTESIAN_VELOCITY_LIMIT == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize(

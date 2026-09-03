@@ -23,8 +23,8 @@ from franka_sim.cartesian_ik import (
     tracking_twist,
 )
 from franka_sim.motion_limits import (
-    MAX_ROTATIONAL_VELOCITY,
-    MAX_TRANSLATIONAL_VELOCITY,
+    LIMITER_ROTATIONAL_VELOCITY,
+    LIMITER_TRANSLATIONAL_VELOCITY,
     rotation_exp,
 )
 
@@ -79,8 +79,8 @@ def test_clamp_twist_scales_each_half_to_its_own_limit_by_norm():
     twist = np.array([30.0, 40.0, 0.0, 0.0, 0.0, 25.0])
     clamped = clamp_twist(twist)
 
-    assert np.linalg.norm(clamped[:3]) == pytest.approx(MAX_TRANSLATIONAL_VELOCITY)
-    assert np.linalg.norm(clamped[3:]) == pytest.approx(MAX_ROTATIONAL_VELOCITY)
+    assert np.linalg.norm(clamped[:3]) == pytest.approx(LIMITER_TRANSLATIONAL_VELOCITY)
+    assert np.linalg.norm(clamped[3:]) == pytest.approx(LIMITER_ROTATIONAL_VELOCITY)
     # Direction preserved: scaled, not truncated per axis.
     assert clamped[:3] / np.linalg.norm(clamped[:3]) == pytest.approx([0.6, 0.8, 0.0])
 
@@ -89,7 +89,7 @@ def test_clamp_twist_bounds_a_teleporting_command_with_checks_off():
     """The guard rail: an unchecked 10 m pose step must not become 400 m/s."""
     desired = transform((10.0, 0.0, 0.0))
     twist = tracking_twist(desired, np.eye(4), np.zeros(6))
-    assert np.linalg.norm(twist[:3]) == pytest.approx(MAX_TRANSLATIONAL_VELOCITY)
+    assert np.linalg.norm(twist[:3]) == pytest.approx(LIMITER_TRANSLATIONAL_VELOCITY)
 
 
 # -- tracking twist -----------------------------------------------------------
