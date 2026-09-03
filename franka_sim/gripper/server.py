@@ -141,7 +141,19 @@ class FrankaGripperServer:
             self.broadcast_thread.start()
 
     def _dispatch_command(self, sock, header: GripperCommandHeader, payload: bytes):
+        """Run one gripper command on the backend and answer it on the wire.
+
+        The status a command that did not succeed gets is not free-form:
+        ``franka::Gripper``'s ``executeCommand`` (libfranka ``src/gripper.cpp``)
+        maps kSuccess -> True, kUnsuccessful -> False, and both kFail and
+        kAborted -> a thrown ``CommandException``. A grasp that ends outside
+        the epsilon band is a *failed* grasp on the real hand -- the client is
+        supposed to see ``CommandException("libfranka gripper: Command
+        failed!")``, not a quiet False -- so it answers kFail.
+        """
         cmd = header.command
+        # What this command answers when the backend reports no success.
+        failure_status = GripperStatus.kUnsuccessful
         try:
             if cmd == GripperCommand.kHoming:
                 ok = self.backend.homing()
@@ -149,6 +161,7 @@ class FrankaGripperServer:
                 req = MoveRequest.from_bytes(payload)
                 ok = self.backend.move(req.width, req.speed)
             elif cmd == GripperCommand.kGrasp:
+                failure_status = GripperStatus.kFail
                 req = GraspRequest.from_bytes(payload)
                 ok = self.backend.grasp(
                     req.width, req.epsilon_inner, req.epsilon_outer, req.speed, req.force
@@ -159,7 +172,7 @@ class FrankaGripperServer:
                 logger.warning(f"Unknown gripper command: {cmd}")
                 sock.sendall(build_command_response(cmd, header.command_id, GripperStatus.kFail))
                 return
-            status = GripperStatus.kSuccess if ok else GripperStatus.kUnsuccessful
+            status = GripperStatus.kSuccess if ok else failure_status
         except Exception as exc:
             logger.error(f"Gripper command {cmd} failed: {exc}")
             status = GripperStatus.kFail

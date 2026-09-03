@@ -100,7 +100,7 @@ run-franka-sim-server -v --gripper-physics
 ```
 
 The kinematic default snaps the width instantly and ignores the commanded speed;
-the physics backend runs a real PD servo and infers grasp from a finger stall. See
+the physics backend runs a real PD servo and lets the fingers stall on an object. See
 [gripper fidelity](robot-state.md#gripper-fidelity) for exactly what each backend
 does and does not model.
 

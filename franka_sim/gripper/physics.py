@@ -27,9 +27,9 @@ class FrankaHandPhysics(GripperBackend):
     polling the sim's finger snapshot until the fingers settle (velocity ~0) or a
     timeout elapses -- matching the real franka::Gripper blocking semantics.
     ``get_state`` only reads the lock-free snapshot, so it is safe to call from
-    the UDP broadcaster thread concurrently. ``is_grasped``/``is_stuck`` come from
-    finger-position stall (fingers settling above the commanded width = caught an
-    object), so no engine contact-force API is needed.
+    the UDP broadcaster thread concurrently. ``is_grasped``/``is_stuck`` are read
+    off where the fingers came to rest -- the epsilon band of
+    ``franka::Gripper::grasp`` -- so no engine contact-force API is needed.
     """
 
     def __init__(
@@ -122,25 +122,32 @@ class FrankaHandPhysics(GripperBackend):
         speed: float,
         force: float,
     ) -> bool:
-        """Close the fingers toward ``width`` and infer whether an object was caught.
+        """Close the fingers toward ``width`` and report the epsilon check.
 
-        An object is considered caught when the fingers settle wider than the
-        commanded width and within [``width`` - epsilon_inner, ``width`` +
-        epsilon_outer]. Returns ``is_grasped``. ``speed``/``force`` are accepted
-        for protocol compatibility but not used (no contact-force API here).
+        Success is where the fingers came to rest, exactly as
+        ``franka::Gripper::grasp`` documents it (``include/franka/gripper.h``):
+        the final distance ``d`` must satisfy ``width - epsilon_inner < d <
+        width + epsilon_outer``. That covers both outcomes the real hand has:
+        an object stalls the fingers wider than commanded (in band if it is
+        close enough to the commanded width), and free space lets them reach
+        the commanded width itself -- which is a success, not a failure.
+
+        The band is around the width the client asked for, *not* the
+        stroke-clamped one, so a grasp commanded wider than the hand can open
+        fails instead of trivially matching its own clamp.
+        ``speed``/``force`` are accepted for protocol compatibility but not
+        used (no contact-force API here).
         """
-        commanded = self._clamp_width(width)
         final, settled = self._drive_and_settle(width)
-        caught = final > commanded + 1e-4 and (
-            commanded - epsilon_inner <= final <= commanded + epsilon_outer
-        )
-        self.is_grasped = bool(caught)
-        # Stuck = settled short of the commanded close with nothing caught, or
-        # never settled (still pushing at timeout).
-        self.is_stuck = (not caught) and (not settled)
-        if not caught:
+        grasped = width - epsilon_inner < final < width + epsilon_outer
+        self.is_grasped = bool(grasped)
+        # Stuck = ended outside the band and never settled (still pushing at
+        # the timeout) rather than having come to rest somewhere wrong.
+        self.is_stuck = (not grasped) and (not settled)
+        if not grasped:
             logger.info(
-                f"grasp: no object caught (final={final:.4f} m, commanded={commanded:.4f} m)"
+                f"grasp: fingers settled at {final:.4f} m, outside the band "
+                f"({width - epsilon_inner:.4f}, {width + epsilon_outer:.4f}) m"
             )
         return self.is_grasped
 

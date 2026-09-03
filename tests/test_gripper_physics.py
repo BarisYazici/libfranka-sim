@@ -81,22 +81,45 @@ def test_grasp_ignores_stale_settled_snapshot_after_recommand():
     assert abs(hand.get_state().width - 0.03) < 5e-3
 
 
-def test_grasp_without_object_is_unsuccessful():
-    # No object: fingers reach the commanded 0.02 without stalling above it -> no grasp.
+def test_grasp_in_free_space_succeeds_at_the_commanded_width():
+    """Nothing in the way is a success, not a failure.
+
+    ``franka::Gripper::grasp`` (``include/franka/gripper.h``) defines success
+    as the final finger distance landing in ``(width - epsilon_inner, width +
+    epsilon_outer)``; with nothing to stall on, the fingers reach the
+    commanded 0.02 exactly, the middle of that band.
+    """
     sim = FakeSim(object_half=None)
+    hand = _hand(sim)
+    ok = hand.grasp(0.02, epsilon_inner=0.005, epsilon_outer=0.02, speed=0.1, force=40)
+    assert ok is True
+    assert hand.get_state().is_grasped is True
+    assert abs(hand.get_state().width - 0.02) < 5e-3
+
+
+def test_grasp_object_outside_epsilon_is_unsuccessful():
+    # Object 0.06 wide stalls the fingers at 0.06, outside the band (0.015, 0.04)
+    # around the commanded 0.02 (object too big) -> unsuccessful.
+    sim = FakeSim(object_half=0.03)  # object 0.06 wide, above commanded 0.02 + eps_outer
     hand = _hand(sim)
     ok = hand.grasp(0.02, epsilon_inner=0.005, epsilon_outer=0.02, speed=0.1, force=40)
     assert ok is False
     assert hand.get_state().is_grasped is False
 
 
-def test_grasp_object_outside_epsilon_is_unsuccessful():
-    # Object 0.06 wide stalls the fingers at 0.06, outside the band [0.015, 0.04]
-    # around the commanded 0.02 (object too big) -> unsuccessful.
-    sim = FakeSim(object_half=0.03)  # object 0.06 wide, above commanded 0.02 + eps_outer
+def test_grasp_beyond_the_stroke_is_unsuccessful():
+    """The band is around the *requested* width, not the stroke-clamped one.
+
+    Commanding 0.09 m drives the fingers to the 0.08 m limit; 0.08 is outside
+    the band (0.085, 0.095), so this is a failed grasp rather than a trivial
+    match against the hand's own clamp. This is the franky-suite case
+    (``test_gripper_grasp_failure``).
+    """
+    sim = FakeSim(object_half=None)
     hand = _hand(sim)
-    ok = hand.grasp(0.02, epsilon_inner=0.005, epsilon_outer=0.02, speed=0.1, force=40)
+    ok = hand.grasp(0.09, epsilon_inner=0.005, epsilon_outer=0.005, speed=0.1, force=40)
     assert ok is False
+    assert hand.get_state().is_grasped is False
 
 
 def test_get_state_returns_gripper_state_data():

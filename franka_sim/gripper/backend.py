@@ -48,8 +48,16 @@ class GripperBackend(ABC):
         speed: float,
         force: float,
     ) -> bool:
-        """Grasp at ``width`` (m); return True only if an object was
-        grasped.
+        """Grasp at ``width`` (m); return True if the grasp succeeded.
+
+        Success is defined exactly as ``franka::Gripper::grasp`` documents it
+        (``include/franka/gripper.h``): "An object is considered grasped if
+        the distance d between the gripper fingers satisfies (width -
+        epsilon_inner) < d < (width + epsilon_outer)" -- a check on where the
+        fingers came to rest, not on whether something was configured to be
+        between them. The band is centred on the width the *client* asked
+        for, even when that is outside the hand's stroke, so a command the
+        fingers cannot reach fails.
         """
 
     @abstractmethod
@@ -69,10 +77,13 @@ class FrankaHandSim(GripperBackend):
 
     Width updates are instant: a command sets the final width and returns,
     which is enough to be wire-compatible with ``franka::Gripper`` and fully
-    unit-testable. ``grasp`` succeeds only if a configured ``object_width``
-    lies within the commanded width's epsilon band -- the same notion of "did
-    the fingers catch something" the real hand reports. Timed/physical motion
-    can replace the internals later without changing the interface.
+    unit-testable. An optional ``object_width`` stands in for something
+    between the fingers: it stops them there instead of at the commanded
+    width. Whether the resulting grasp *succeeded* is then the same epsilon
+    check the real hand applies (see :meth:`GripperBackend.grasp`), so a
+    free-space close to a reachable width succeeds, exactly as it does on the
+    robot. Timed/physical motion can replace the internals later without
+    changing the interface.
     """
 
     def __init__(
@@ -112,15 +123,22 @@ class FrankaHandSim(GripperBackend):
         speed: float,
         force: float,
     ) -> bool:
-        if self.object_width is not None and (
-            width - epsilon_inner <= self.object_width <= width + epsilon_outer
-        ):
-            self.width = self.object_width
-            self.is_grasped = True
-            return True
-        self.width = self._clamp(width)
-        self.is_grasped = False
-        return False
+        """Close to ``width`` and report whether the fingers settled in the band.
+
+        An object wider than the commanded width stops the fingers early (the
+        fingers can only close, so it never pushes them further open than they
+        already are); otherwise they reach the commanded width, clamped to the
+        hand's stroke. The epsilon band is around the *requested* ``width``,
+        unclamped -- asking for more than the hand can open to must fail.
+        """
+        target = self._clamp(width)
+        if self.object_width is not None and self.object_width > target:
+            final = min(self.object_width, self.width)
+        else:
+            final = target
+        self.width = final
+        self.is_grasped = width - epsilon_inner < final < width + epsilon_outer
+        return self.is_grasped
 
     def stop(self) -> bool:
         self.width = self.max_width
