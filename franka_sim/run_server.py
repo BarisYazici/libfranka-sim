@@ -8,6 +8,7 @@ import threading
 from typing import Optional
 
 from franka_sim.franka_protocol import COMMAND_PORT
+from franka_sim.gripper.backend import FRANKA_HAND_MAX_WIDTH
 from franka_sim.mobile.spine_stub import SPINE_DEFAULT_HOST, SPINE_DEFAULT_PORT
 
 # Configure logging to silence Numba debug output
@@ -169,6 +170,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the physics gripper (9-DOF, fingers move in the viewer)",
     )
     parser.add_argument(
+        "--gripper-object-width",
+        type=float,
+        default=None,
+        help="Put a virtual object this wide (metres) between the fingers, so a "
+        "grasp of that width succeeds. Off by default: the scene holds nothing "
+        "graspable and a grasp of thin air correctly answers false, which is "
+        "what the real hand does -- but it also means franka_ros2's "
+        "franka_gripper Grasp action (and any pick-and-place client) can never "
+        "succeed without this. Works with both gripper backends. Same as "
+        "setting FRANKA_SIM_GRIPPER_OBJECT_WIDTH.",
+    )
+    parser.add_argument(
         "--enforce-comm-constraints",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -259,6 +272,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args) -> None:
     """Reject incoherent CLI combinations. Raises ValueError."""
+    width = args.gripper_object_width
+    if width is not None and not 0.0 <= width <= FRANKA_HAND_MAX_WIDTH:
+        # Silently useless otherwise: the stub never sees an object wider than
+        # the stroke as being between its fingers, and the physics backend
+        # clamps it back into the stroke. Say so at startup instead.
+        raise ValueError(
+            f"--gripper-object-width {width} is outside the hand's "
+            f"0..{FRANKA_HAND_MAX_WIDTH} m stroke"
+        )
     if not args.mobile_duo:
         if args.scene_urdf or args.bind:
             raise ValueError("--scene-urdf and --bind require --mobile-duo")
@@ -272,6 +294,30 @@ def validate_args(args) -> None:
     from franka_sim.mobile.runner import parse_bind_specs
 
     parse_bind_specs(args.bind)
+
+
+def gripper_object_width_setting(args) -> Optional[float]:
+    """Width (m) of the virtual graspable object, from the flag or the environment.
+
+    The flag wins; ``$FRANKA_SIM_GRIPPER_OBJECT_WIDTH`` is the way to set it
+    for a server started from a launch file or a container that cannot easily
+    grow an argument. Unset (or unparsable, which is reported and ignored
+    rather than being allowed to take down a 1 kHz server at startup) means an
+    empty hand -- the faithful default; see
+    :meth:`franka_sim.gripper.physics.FrankaHandPhysics._blocked_target`.
+    """
+    if args.gripper_object_width is not None:
+        return args.gripper_object_width
+    raw = os.environ.get("FRANKA_SIM_GRIPPER_OBJECT_WIDTH")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Ignoring FRANKA_SIM_GRIPPER_OBJECT_WIDTH=%r: not a number", raw
+        )
+        return None
 
 
 def comm_constraints_setting(args) -> Optional[bool]:
@@ -369,6 +415,7 @@ def run_single_arm(args) -> None:
         urdf_path=args.urdf,
         enable_gripper=not args.no_gripper,
         gripper_physics=args.gripper_physics,
+        gripper_object_width=gripper_object_width_setting(args),
         physics=args.physics,
         enforce_comm_constraints=comm_constraints_setting(args),
         enforce_motion_limits=motion_limits_setting(args),

@@ -105,6 +105,17 @@ closing fingers stall. See
 [gripper fidelity](robot-state.md#gripper-fidelity) for exactly what each backend
 does and does not model.
 
+**Nothing in the scene is graspable**, so by default every `grasp` closes on
+nothing and answers `false` — faithful to the real hand in an empty workspace,
+but it means franka_ros2's `franka_gripper` Grasp action can never succeed.
+`--gripper-object-width` puts a virtual object between the fingers for either
+backend:
+
+```bash
+# a 4 cm test object: grasp(0.04) now succeeds
+run-franka-sim-server --gripper-object-width 0.04
+```
+
 ## CLI reference
 
 Everything below is `run-franka-sim-server <flags>`, or equivalently
@@ -125,6 +136,7 @@ Everything below is `run-franka-sim-server <flags>`, or equivalently
 | --- | --- | --- |
 | `--no-gripper` | off | Do not start the gripper server on 1338. |
 | `--gripper-physics` | off | Use the 9-DOF physics hand instead of the kinematic one. |
+| `--gripper-object-width W` | off (empty hand) | Put a rigid virtual object `W` metres wide between the fingers, on either backend, so a `grasp(W)` succeeds. Must be inside the 0–0.08 m stroke. Same as `FRANKA_SIM_GRIPPER_OBJECT_WIDTH=W`. |
 
 ### Mobile duo
 

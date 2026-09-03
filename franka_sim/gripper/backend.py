@@ -19,18 +19,23 @@ class GripperStateData:
     temperature: int
 
 
-def validate_grasp_width(width: float, max_width: float) -> None:
+def validate_width(width: float, max_width: float, command: str = "grasp") -> None:
     """Raise ``ValueError`` if ``width`` is not a width the hand can be asked for.
 
-    A grasp width outside the 0..``max_width`` stroke is not a grasp that
-    missed, it is a command the hand cannot execute. libfranka distinguishes
-    the two: ``executeCommand`` (``src/gripper.cpp``) turns kUnsuccessful into
-    a quiet ``false`` and kFail into ``CommandException``. The server turns the
+    A width outside the 0..``max_width`` stroke is not a command that missed,
+    it is a command the hand cannot execute. libfranka distinguishes the two:
+    ``executeCommand`` (``src/gripper.cpp``) turns kUnsuccessful into a quiet
+    ``false`` and kFail into ``CommandException``. The server turns the
     exception raised here into kFail; a grasp that ran and simply found nothing
     returns ``False`` instead.
+
+    Both ``Gripper::move`` and ``Gripper::grasp`` carry that contract --
+    ``executeCommand`` is the same template for every command
+    (``src/gripper.cpp``) -- so ``move`` outside the stroke is kFail too, not a
+    silently clamped move to the nearest reachable width.
     """
     if not 0.0 <= width <= max_width:
-        raise ValueError(f"grasp width {width} m is outside the 0..{max_width} m stroke")
+        raise ValueError(f"{command} width {width} m is outside the 0..{max_width} m stroke")
 
 
 class GripperBackend(ABC):
@@ -51,6 +56,12 @@ class GripperBackend(ABC):
     def move(self, width: float, speed: float) -> bool:
         """Move fingers to ``width`` (m) at ``speed`` (m/s); return True on
         success.
+
+        Implementations raise ``ValueError`` for a width outside the hand's
+        stroke (see :func:`validate_width`), which the server answers with
+        kFail -- ``Gripper::move`` carries the same ``CommandException``
+        contract ``Gripper::grasp`` does (``src/gripper.cpp``), so a width the
+        hand cannot reach is an error rather than a quietly clamped move.
         """
 
     @abstractmethod
@@ -79,8 +90,23 @@ class GripperBackend(ABC):
         libfranka's own ``examples/grasp_object.cpp`` branches on.
 
         Implementations raise ``ValueError`` for a width outside the hand's
-        stroke (see :func:`validate_grasp_width`); the server answers that with
+        stroke (see :func:`validate_width`); the server answers that with
         kFail rather than the kUnsuccessful of a missed grasp.
+
+        **``grasp(0.0, ...)`` in free space succeeds, by the band.** The
+        fingers close on each other at ~0 m, and 0 m is inside
+        ``(-epsilon_inner, epsilon_outer)``, so the test the real hand applies
+        passes with nothing held. That is the documented test taken literally,
+        not a special case -- the real hand answers the same way.
+
+        **``force`` is not a limit.** A grasp drives the fingers all the way
+        closed, which saturates the physics backend's finger servo at
+        :data:`~franka_sim.mujoco_franka_sim.FINGER_FORCE_LIMIT` whatever the
+        client asked for, and the kinematic backend has no force at all. The
+        width reported afterwards is therefore the *compressed* one -- where a
+        servo pushing at full force stopped -- not the width a client-requested
+        force would have settled at. See ``docs/robot-state.md`` (gripper
+        fidelity).
         """
 
     @abstractmethod
@@ -100,12 +126,18 @@ class FrankaHandSim(GripperBackend):
 
     Width updates are instant: a command sets the final width and returns,
     which is enough to be wire-compatible with ``franka::Gripper`` and fully
-    unit-testable. An optional ``object_width`` stands in for something
-    between the fingers: a grasp closes toward 0 and stops there instead,
-    which is what the physics backend gets from an actual stall. Whether the
-    resulting grasp *succeeded* is then the same epsilon check the real hand
-    applies (see :meth:`GripperBackend.grasp`). Timed/physical motion can
-    replace the internals later without changing the interface.
+    unit-testable. An optional ``object_width`` (the server's
+    ``--gripper-object-width``) stands in for something between the fingers: a
+    grasp closes toward 0 and stops there instead, which is what the physics
+    backend gets from an actual stall. Whether the resulting grasp *succeeded*
+    is then the same epsilon check the real hand applies (see
+    :meth:`GripperBackend.grasp`). Timed/physical motion can replace the
+    internals later without changing the interface.
+
+    The object blocks a ``move`` as well as a ``grasp``: it is a body between
+    the fingers, and the physics backend's fingers really are stopped by it on
+    the way in, so a stub that let a move close straight through would disagree
+    with the viewer about where the fingers ended up.
     """
 
     def __init__(
@@ -127,13 +159,33 @@ class FrankaHandSim(GripperBackend):
     def _clamp(self, width: float) -> float:
         return max(0.0, min(self.max_width, width))
 
+    def _blocked(self, width: float) -> float:
+        """Where a configured ``object_width`` stops the fingers short of ``width``.
+
+        An object wider than the current opening is not between the fingers --
+        they are already inside it -- so it does not stop them. The twin of
+        :meth:`franka_sim.gripper.physics.FrankaHandPhysics._blocked_target`,
+        down to the ``<=``: an object *exactly* as wide as the opening does
+        stop them, which is the second grasp on an object already held.
+        """
+        if self.object_width is None:
+            return width
+        obstacle = self._clamp(self.object_width)
+        return max(width, obstacle) if obstacle <= self.width else width
+
     def homing(self) -> bool:
         self.width = self.max_width
         self.is_grasped = False
         return True
 
     def move(self, width: float, speed: float) -> bool:
-        self.width = self._clamp(width)
+        """Set the width instantly; an unreachable one raises.
+
+        See :meth:`GripperBackend.move` for the kFail contract, and
+        :meth:`_blocked` for why an object in the way stops the move short.
+        """
+        validate_width(width, self.max_width, "move")
+        self.width = self._blocked(self._clamp(width))
         self.is_grasped = False
         return True
 
@@ -153,16 +205,19 @@ class FrankaHandSim(GripperBackend):
         opening, or each other. ``speed`` is not simulated (the stub has no
         clock), and ``force`` is not applied as a limit.
 
-        An object at least as wide as the current opening cannot be between
-        the fingers -- they are already inside it -- so it does not stall
-        them; without that guard a stale ``self.width`` would report a grasp
-        with the fingers narrower than the object they supposedly hold.
+        An object *wider* than the current opening cannot be between the
+        fingers -- they are already inside it -- so it does not stall them;
+        without that guard a stale ``self.width`` would report a grasp with the
+        fingers narrower than the object they supposedly hold. An object
+        *exactly* as wide as the opening does stall them, which is the case of
+        a second grasp on an object already held: the fingers are resting on it
+        and cannot close further. Comparing with ``<`` instead answered
+        kUnsuccessful there and closed to 0 m -- releasing what was held --
+        where the physics backend, whose fingers really are blocked, answers
+        True.
         """
-        validate_grasp_width(width, self.max_width)
-        if self.object_width is not None and self.object_width < self.width:
-            final = max(self.object_width, 0.0)
-        else:
-            final = 0.0
+        validate_width(width, self.max_width)
+        final = self._blocked(0.0)
         self.width = final
         self.is_grasped = width - epsilon_inner < final < width + epsilon_outer
         return self.is_grasped

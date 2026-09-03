@@ -37,6 +37,7 @@ from franka_sim.comm_constraints import (
 )
 from franka_sim.control_modes import ControlMode
 from franka_sim.franka_protocol import COMMAND_PORT, MoveStatus
+from franka_sim.gripper.backend import FrankaHandSim
 from franka_sim.gripper.server import FrankaGripperServer
 from franka_sim.motion_limits import MotionLimitChecker
 from franka_sim.motion_limits import (
@@ -87,6 +88,7 @@ class FrankaSimServer(
         enable_gripper=True,
         gripper_backend=None,
         gripper_physics: bool = False,
+        gripper_object_width: Optional[float] = None,
         mobile_base: bool = False,
         physics: str = DEFAULT_PHYSICS,
         enforce_comm_constraints: Optional[bool] = None,
@@ -105,6 +107,12 @@ class FrankaSimServer(
                 ``mujoco`` (default) or ``genesis``.
             urdf_path: URDF served to the client via GetRobotModel. Defaults to the
                 bundled hand-less FR3 arm model.
+            gripper_object_width: Width (m) of a virtual object held between the
+                fingers, for both gripper backends (``--gripper-object-width``).
+                None -- the default -- is an empty hand, which is faithful: the
+                scene contains nothing graspable, so every grasp closes on
+                nothing and answers false. Set it to make a grasp of that width
+                succeed.
             mobile_base: Serve a swerve mobile base instead of an arm. The
                 simulator must implement ``update_base_twist`` and the client
                 drives it with the kCartesianVelocity motion generator.
@@ -318,9 +326,19 @@ class FrankaSimServer(
             if gripper_physics:
                 from franka_sim.gripper.physics import FrankaHandPhysics
 
-                backend = FrankaHandPhysics(self.physics_sim)
-            else:
+                backend = FrankaHandPhysics(
+                    self.physics_sim, object_width=gripper_object_width
+                )
+            elif gripper_backend is not None:
                 backend = gripper_backend
+            else:
+                # Default: an empty hand. The scene holds nothing graspable, so
+                # every grasp closes to ~0 and answers kUnsuccessful, which is
+                # what the real hand does with nothing between its fingers.
+                # ``gripper_object_width`` is the deliberate opt-out for a
+                # client that needs a grasp to succeed (franka_ros2's
+                # ``franka_gripper`` Grasp action, any pick-and-place demo).
+                backend = FrankaHandSim(object_width=gripper_object_width)
             self.gripper_server = FrankaGripperServer(host=host, backend=backend)
         else:
             self.gripper_server = None

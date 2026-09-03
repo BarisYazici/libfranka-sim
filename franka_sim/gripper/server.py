@@ -155,7 +155,18 @@ class FrankaGripperServer:
         latter by raising, which lands in the ``except`` below.
 
         ``homing``/``move``/``stop`` return bools of the same kind: both
-        backends always succeed at them, so they only reach kFail by raising.
+        backends always succeed at them, so they only reach kFail by raising --
+        a ``move`` width outside the stroke, like a ``grasp`` one.
+
+        **Known gap: nothing can interrupt a running command.** This runs on
+        the single client connection's handler thread and the physics backend
+        blocks in it until the fingers settle, so a ``Stop`` sent mid-``Grasp``
+        is not even *read* off the socket until the grasp has returned -- the
+        real hand aborts the grasp instead. For the same reason ``is_grasped``
+        appears on the UDP broadcast only when the grasp completes, not as the
+        fingers close. Pre-existing, and not fixable without a second thread
+        (or a non-blocking backend) that the ``franka::Gripper`` client, which
+        is itself blocking and single-connection, does not exercise.
         """
         cmd = header.command
         try:

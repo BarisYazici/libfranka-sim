@@ -183,6 +183,28 @@ def test_grasp_beyond_the_stroke_answers_kfail(gripper_server):
         udp.close()
 
 
+def test_move_beyond_the_stroke_answers_kfail(gripper_server):
+    """``Move`` carries the same contract ``Grasp`` does: kFail, not a clamp.
+
+    Both go through libfranka's one ``executeCommand`` template
+    (``src/gripper.cpp``), so a width the hand cannot reach is a
+    ``CommandException`` either way. Answering kSuccess and parking the fingers
+    at the nearest reachable width would tell the client its move happened.
+    """
+    sock = _open_client()
+    udp, udp_port = _open_udp()
+    try:
+        _connect(sock, udp_port)
+        _send_with_payload(sock, GripperCommand.kMove, 7, struct.pack("<dd", 0.09, 0.1))
+        header, resp = _recv_response(sock)
+        assert header.command == GripperCommand.kMove
+        (status,) = struct.unpack("<H", resp)
+        assert status == GripperStatus.kFail
+    finally:
+        sock.close()
+        udp.close()
+
+
 def test_stop_acked(gripper_server):
     sock = _open_client()
     udp, udp_port = _open_udp()

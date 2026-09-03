@@ -50,8 +50,34 @@ class StaleFirstPollSim(FakeSim):
         return super().get_finger_state()
 
 
-def _hand(sim):
-    return FrankaHandPhysics(sim, settle_timeout=2.0, settle_velocity=1e-3, poll_dt=0.0)
+class ScriptedFingerSim:
+    """Replays a recorded finger trace: one (width, speed) sample per poll.
+
+    Closing fingers do not decelerate monotonically -- contact settling in
+    MuJoCo puts near-zero-velocity samples in the middle of the travel -- so a
+    trace is the only way to pin down which sample a settle detector picks.
+    The last sample repeats forever, which is the rest the fingers come to.
+    """
+
+    def __init__(self, trace):
+        self.trace = list(trace)
+        self.index = 0
+        self.commanded = None
+
+    def update_finger_positions(self, positions):
+        self.commanded = float(positions[0] + positions[1])
+
+    def get_finger_state(self):
+        width, speed = self.trace[min(self.index, len(self.trace) - 1)]
+        self.index += 1
+        return {"q": np.array([width / 2, width / 2]), "dq": np.array([speed, speed])}
+
+
+def _hand(sim, **kwargs):
+    kwargs.setdefault("settle_timeout", 2.0)
+    kwargs.setdefault("settle_velocity", 1e-3)
+    kwargs.setdefault("poll_dt", 0.0)
+    return FrankaHandPhysics(sim, **kwargs)
 
 
 def test_move_opens_to_commanded_width():
@@ -182,6 +208,61 @@ def test_stop_releases_grasp_and_opens_fully():
     assert abs(state.width - 0.08) < 5e-3
 
 
+def test_grasp_waits_out_a_mid_travel_quiet_poll():
+    """One near-zero-velocity sample is not a stall; ``stall_polls`` of them are.
+
+    The settle test used to accept the first quiet poll once the fingers had
+    "moved", which any sample past the start satisfies. Fingers closing onto an
+    object pass through momentary near-zero velocities before they rest, so the
+    grasp read a width the fingers were still travelling through: this trace
+    comes to rest at 0.028 m but goes quiet once at 0.050 m on the way, and the
+    band around 0.028 m rejected that sample.
+    """
+    trace = [
+        (0.080, 0.0),  # stale first snapshot, from the previous settled target
+        (0.062, 0.9),
+        (0.050, 0.0),  # momentary contact-settling quiet -- not the stall
+        (0.041, 0.7),
+        (0.030, 0.3),
+        (0.028, 0.0),  # the real rest
+    ]
+    hand = _hand(ScriptedFingerSim(trace))
+    assert hand.grasp(0.028, epsilon_inner=0.002, epsilon_outer=0.002, speed=0.1, force=40) is True
+    assert hand.get_state().width == pytest.approx(0.028)
+    assert hand.is_grasped is True
+
+
+def test_object_width_stalls_the_fingers_where_a_body_would():
+    """``--gripper-object-width`` is a rigid obstacle for the physics backend too.
+
+    The ``--gripper-physics`` scene holds nothing graspable, so without this
+    every grasp closes to ~0 and answers false. The flag clamps the drive
+    target, which is what a body between the fingers does to them.
+    """
+    sim = FakeSim(object_half=None)  # nothing in the scene
+    empty = _hand(sim)
+    assert empty.grasp(0.03, 0.005, 0.005, 0.1, 40.0) is False
+
+    hand = _hand(FakeSim(object_half=None), object_width=0.03)
+    assert hand.grasp(0.03, 0.005, 0.005, 0.1, 40.0) is True
+    assert hand.get_state().width == pytest.approx(0.03, abs=5e-3)
+    assert hand.is_grasped is True
+    # A body stops an inward move as well, and never an opening one.
+    assert hand.move(0.01, 0.1) is True
+    assert hand.get_state().width == pytest.approx(0.03, abs=5e-3)
+    assert hand.move(0.08, 0.1) is True
+    assert hand.get_state().width == pytest.approx(0.08, abs=5e-3)
+
+
+def test_move_beyond_the_stroke_raises():
+    """Same kFail contract as ``grasp``; see :func:`validate_width`."""
+    hand = _hand(FakeSim())
+    with pytest.raises(ValueError):
+        hand.move(0.09, 0.1)
+    with pytest.raises(ValueError):
+        hand.move(-0.01, 0.1)
+
+
 @pytest.mark.parametrize(
     "object_width, width, eps_in, eps_out, expected",
     [
@@ -190,6 +271,9 @@ def test_stop_releases_grasp_and_opens_fully():
         (0.03, 0.04, 0.005, 0.005, False),  # 0.01 too small for eps_inner 0.005
         (0.03, 0.04, 0.02, 0.005, True),  # ... but inside eps_inner 0.02
         (0.06, 0.02, 0.005, 0.02, False),  # object too big for eps_outer
+        # An object exactly as wide as the current (fully open) stroke: the
+        # fingers rest on it, they are not inside it, so it stalls them.
+        (0.08, 0.08, 0.005, 0.005, True),
     ],
 )
 def test_stub_and_physics_backends_agree(object_width, width, eps_in, eps_out, expected):
@@ -204,3 +288,21 @@ def test_stub_and_physics_backends_agree(object_width, width, eps_in, eps_out, e
     assert physics.grasp(width, eps_in, eps_out, 0.1, 40.0) is expected
     assert stub.get_state().is_grasped is physics.get_state().is_grasped
     assert abs(stub.get_state().width - physics.get_state().width) < 5e-3
+
+
+def test_stub_and_physics_backends_agree_on_a_repeated_grasp():
+    """Grasping twice on a held 0.04 object: True both times, still 0.04 wide.
+
+    The stub compared the object with ``<`` and so released it on the second
+    grasp while the physics backend, whose fingers are blocked, kept holding
+    it. The virtual object of ``--gripper-object-width`` has to behave the same
+    way on both, since that is the flag CI and the viewer share.
+    """
+    stub = FrankaHandSim(object_width=0.04)
+    physics = _hand(FakeSim(object_half=0.02))
+    virtual = _hand(FakeSim(object_half=None), object_width=0.04)
+    for _ in range(2):
+        for backend in (stub, physics, virtual):
+            assert backend.grasp(0.04, 0.005, 0.005, 0.1, 40.0) is True
+            assert backend.get_state().width == pytest.approx(0.04, abs=5e-3)
+            assert backend.get_state().is_grasped is True

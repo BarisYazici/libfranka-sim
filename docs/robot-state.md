@@ -200,9 +200,32 @@ and broadcasts `GripperState` over UDP at 60 Hz.
 | `width` | **physics** *(with `--gripper-physics`)* | Summed finger joint positions, polled live from a real PD servo. |
 | `width` | **approximation** *(kinematic default)* | Where the fingers ended up — the commanded target for `move`, the stall width for `grasp` — snapped instantly. No motion time, and the commanded `speed` is ignored entirely. |
 | `max_width` | constant `0.08` m | Correct — matches the real Franka Hand's 8 cm stroke. |
-| `is_grasped` | **approximation** | The real hand closes *under force* until the fingers stall — on an object, or on each other at ~0 m — and only then applies the test `franka::Gripper::grasp` documents (`include/franka/gripper.h`): the final distance `d` counts as a grasp when `width - epsilon_inner < d < width + epsilon_outer`. Both backends do exactly that. What differs is the stall: the physics backend gets it from the fingers actually being blocked, the kinematic one from a test-configured object width. **Neither backend reads a real grip force**, and the commanded `force` is not applied as a limit. |
+| `is_grasped` | **approximation** | The real hand closes *under force* until the fingers stall — on an object, or on each other at ~0 m — and only then applies the test `franka::Gripper::grasp` documents (`include/franka/gripper.h`): the final distance `d` counts as a grasp when `width - epsilon_inner < d < width + epsilon_outer`. Both backends do exactly that. What differs is the stall: the physics backend gets it from the fingers actually being blocked, the kinematic one from a configured object width. **Neither backend reads a real grip force**, and the commanded `force` is not applied as a limit. It also only updates when the grasp *completes* — see the note on interrupting a command below. |
 | `temperature` | **stub** | Constant 30 °C, always. The real hand's temperature rises with duty cycle. |
 | `message_id` | **approximation** | Broadcast-loop counter, independent of the arm's. |
+
+### Nothing in the scene is graspable — `--gripper-object-width`
+
+The shipped scene contains the arm, the hand and the ground, and **no
+graspable body**. So by default every `grasp` closes on nothing, answers
+`false`, and franka_ros2's `franka_gripper` Grasp action (and any
+pick-and-place client) fails. That is faithful — it is what the real hand does
+with an empty workspace — but it is rarely what you want in a test.
+
+`--gripper-object-width W` (or `FRANKA_SIM_GRIPPER_OBJECT_WIDTH=W`) puts a
+rigid virtual object `W` metres wide between the fingers, for **both**
+backends: the kinematic one stalls its width there, and the physics one clamps
+the finger drive target so the fingers are blocked at `W` exactly as a body
+would block them. A `grasp(W, …)` then succeeds, an inward `move` past `W`
+stops at `W`, and opening is never blocked.
+
+```bash
+# a 4 cm test object between the fingers
+run-franka-sim-server --gripper-object-width 0.04
+```
+
+The default stays empty-handed on purpose: a sim that reports a grasp of
+nothing would hide exactly the bug a pick-and-place client most needs to see.
 
 !!! note "A grasp of thin air returns `false`, and that is correct"
 
@@ -220,6 +243,31 @@ and broadcasts `GripperState` over UDP at 60 Hz.
     so it is an **expected failure** against franka-sim — the sim follows the
     real hand here deliberately.
 
+    `grasp(0.0, …)` is the one width that *does* succeed in free space: the
+    fingers close on each other at ~0 m, and 0 m is inside
+    `(-epsilon_inner, +epsilon_outer)`. That is the documented test taken
+    literally, not a special case, and the real hand answers the same way.
+
+!!! warning "`force` is not a limit, and the reported width is the compressed one"
+
+    A grasp drives the fingers all the way closed, which saturates the physics
+    backend's finger servo at `FINGER_FORCE_LIMIT` (100 N,
+    `mujoco_franka_sim.py`) whatever `force` the client asked for; the
+    kinematic backend has no force at all. So the `width` reported after a
+    grasp is where a servo pushing at *full* force stopped, not where the
+    requested force would have settled — on a compliant object the two differ.
+    Force limiting is not implemented.
+
+!!! danger "Nothing can interrupt a command in flight"
+
+    The gripper server serves **one client connection on one thread**, and the
+    physics backend blocks in it until the fingers settle. A `Stop` sent
+    mid-`Grasp` is therefore not even read off the socket until the grasp has
+    returned, where the real hand aborts the grasp; and `is_grasped` appears on
+    the UDP broadcast only once the grasp completes, rather than as the fingers
+    close. Both are known gaps. `franka::Gripper` is itself blocking and
+    single-connection, so a stock client does not exercise either.
+
 !!! danger "`stop()` reopens instead of halting"
 
     Both gripper backends implement `stop()` by driving the fingers back to fully
@@ -229,10 +277,14 @@ and broadcasts `GripperState` over UDP at 60 Hz.
 
 Command coverage: `Connect`, `Homing`, `Move`, `Grasp` and `Stop` are all
 implemented on both backends; an unknown command id replies `kFail`, as does a
-`Grasp` width outside the stroke. A `Grasp` that ran and caught nothing replies
-`kUnsuccessful`, which libfranka turns into `false`. `Homing`, `Move` and
-`Grasp` on the physics backend block until the fingers settle or a 4 s timeout
-elapses.
+`Grasp` **or `Move`** width outside the stroke — both go through libfranka's
+one `executeCommand` template (`src/gripper.cpp`), so both raise
+`CommandException` rather than being silently clamped. A `Grasp` that ran and
+caught nothing replies `kUnsuccessful`, which libfranka turns into `false`.
+`Homing`, `Move` and `Grasp` on the physics backend block until the fingers
+settle or a 4 s timeout elapses; "settled" means three consecutive
+near-zero-velocity polls, never a single one, because closing fingers pass
+through momentary quiet samples on the way in.
 
 ## Communication constraints
 

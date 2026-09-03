@@ -190,6 +190,12 @@ python -m franka_sim.run_server -v --gripper-physics
 
 # Disable the gripper server entirely
 python -m franka_sim.run_server -v --no-gripper
+
+# The scene holds nothing graspable, so a grasp of thin air correctly returns
+# false. Put a 4 cm virtual object between the fingers (either backend) when a
+# client -- franka_ros2's franka_gripper Grasp action, a pick-and-place demo --
+# needs a grasp to succeed:
+python -m franka_sim.run_server --gripper-object-width 0.04
 ```
 
 | Flag | Gripper backend | Hand in viewer |
@@ -197,6 +203,7 @@ python -m franka_sim.run_server -v --no-gripper
 | *(default)* | `FrankaHandSim` (kinematic) | no |
 | `--gripper-physics` | `FrankaHandPhysics` (physics) | yes, fingers move |
 | `--no-gripper` | none (arm only) | no |
+| `--gripper-object-width W` | either — adds a virtual object `W` m wide | unchanged |
 
 ### Mobile duo (two arms + TMR base on one scene)
 

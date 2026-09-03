@@ -12,14 +12,23 @@ def test_homing_opens_to_max_width():
     assert state.is_grasped is False
 
 
-def test_move_sets_and_clamps_width():
+def test_move_sets_width_and_refuses_one_outside_the_stroke():
+    """A reachable width moves; an unreachable one is kFail, not a silent clamp.
+
+    ``Gripper::move`` goes through the same ``executeCommand`` template as
+    ``Gripper::grasp`` (libfranka ``src/gripper.cpp``), so kFail ->
+    ``CommandException`` is its contract too. Clamping instead would have the
+    sim answer kSuccess and park the fingers somewhere the client never asked
+    for.
+    """
     gripper = FrankaHandSim()
     assert gripper.move(0.03, 0.1) is True
     assert gripper.get_state().width == 0.03
-    gripper.move(0.5, 0.1)  # above max -> clamped
-    assert gripper.get_state().width == FRANKA_HAND_MAX_WIDTH
-    gripper.move(-0.1, 0.1)  # below zero -> clamped
-    assert gripper.get_state().width == 0.0
+    assert gripper.move(FRANKA_HAND_MAX_WIDTH, 0.1) is True
+    assert gripper.move(0.0, 0.1) is True
+    for unreachable in (0.5, -0.1):
+        with pytest.raises(ValueError):
+            gripper.move(unreachable, 0.1)
 
 
 def test_move_clears_is_grasped():
@@ -101,12 +110,71 @@ def test_grasp_does_not_stall_on_an_object_wider_than_the_current_opening():
 
     With the fingers already at 0.02 a 0.05-wide object cannot be between them,
     so the grasp closes them the rest of the way instead of reporting a hold at
-    a width narrower than the object.
+    a width narrower than the object. The fingers get there by closing in free
+    space and the object appearing afterwards -- a *move* is blocked by an
+    object it meets, exactly as the physics backend's fingers are.
     """
-    gripper = FrankaHandSim(object_width=0.05)
+    gripper = FrankaHandSim()
     gripper.move(0.02, 0.1)
+    gripper.set_object_width(0.05)
     assert gripper.grasp(0.02, 0.005, 0.005, 0.1, 60.0) is False
     assert gripper.get_state().width == 0.0
+
+
+def test_a_move_is_blocked_by_the_object_it_meets():
+    """The stub's object is a body, not a grasp-only special case.
+
+    The physics backend's fingers are physically stopped by whatever is
+    between them, ``move`` included, so a stub that closed straight through
+    would disagree with the viewer about where the fingers ended up.
+    """
+    gripper = FrankaHandSim(object_width=0.06)
+    assert gripper.move(0.04, 0.1) is True
+    assert gripper.get_state().width == 0.06
+    assert gripper.move(0.08, 0.1) is True  # opening is never blocked
+    assert gripper.get_state().width == FRANKA_HAND_MAX_WIDTH
+
+
+def test_a_second_grasp_on_a_held_object_keeps_holding_it():
+    """Re-grasping what is already held must not release it.
+
+    With ``<`` the object (0.04) was not *narrower* than the opening the first
+    grasp left (0.04), so the second grasp closed to 0 m and answered
+    kUnsuccessful -- dropping the object and disagreeing with the physics
+    backend, whose fingers are still blocked by it. franka_ros2's
+    ``franka_gripper`` re-sends a Grasp goal freely, so this is reachable from
+    a stock client.
+    """
+    gripper = FrankaHandSim(object_width=0.04)
+    assert gripper.grasp(0.04, 0.005, 0.005, 0.1, 60.0) is True
+    assert gripper.get_state().width == 0.04
+    assert gripper.grasp(0.04, 0.005, 0.005, 0.1, 60.0) is True
+    assert gripper.get_state().width == 0.04
+    assert gripper.get_state().is_grasped is True
+
+
+def test_grasp_of_an_object_exactly_as_wide_as_the_opening_succeeds():
+    """Fingers resting *on* an object are blocked by it, not inside it."""
+    gripper = FrankaHandSim(object_width=FRANKA_HAND_MAX_WIDTH)
+    assert gripper.get_state().width == FRANKA_HAND_MAX_WIDTH
+    assert gripper.grasp(FRANKA_HAND_MAX_WIDTH, 0.005, 0.005, 0.1, 60.0) is True
+    assert gripper.get_state().width == FRANKA_HAND_MAX_WIDTH
+
+
+def test_object_width_flag_lets_a_grasp_succeed_in_an_otherwise_empty_scene():
+    """``--gripper-object-width`` is the escape hatch for a scene with nothing in it.
+
+    Without it the default backend holds no object, every grasp closes on
+    nothing and answers false, and franka_ros2's ``franka_gripper`` Grasp
+    action can never succeed. The flag reaches the backend as ``object_width``.
+    """
+    empty = FrankaHandSim()
+    assert empty.grasp(0.03, 0.005, 0.005, 0.1, 60.0) is False
+
+    with_object = FrankaHandSim(object_width=0.03)
+    assert with_object.grasp(0.03, 0.005, 0.005, 0.1, 60.0) is True
+    assert with_object.get_state().width == pytest.approx(0.03)
+    assert with_object.get_state().is_grasped is True
 
 
 def test_stop_returns_true():
