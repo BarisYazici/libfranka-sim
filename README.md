@@ -333,22 +333,22 @@ To switch between simulation and hardware:
 
 ## Development Status
 
-The simulation server currently implements all major features of the Franka robot:
+What the simulator implements today, checked against the real robot's own
+clients rather than against a spec:
 
-- [x] Complete network protocol implementation
-- [x] All joint interfaces
-- [x] Real-time state updates
-- [x] Visualization support
-- [x] Genesis connection
-- [x] libfranka python bindings
-- [x] v10 wire protocol (Connect, float-based RobotState, GetRobotModel/URDF)
-- [x] Robot model via URDF (client-side Pinocchio through GetRobotModel)
-- [x] Gripper simulation / Franka Hand (kinematic + Genesis physics, `--gripper-physics`)
-- [x] Automatic error recovery (so `franka_hardware` / franka_ros2 can activate)
-- [ ] Advanced collision detection (in progress)
-- [ ] Cartesian interfaces (planned)
-
-
+- [x] libfranka v10 wire protocol: Connect, 1 kHz float RobotState, GetRobotModel (URDF), Move / StopMove / SetCollisionBehavior / AutomaticErrorRecovery
+- [x] All joint interfaces: joint position, joint velocity, torque (external controller), with `q_d`/`dq_d` echoed as the robot does
+- [x] Cartesian interfaces: Cartesian pose and Cartesian velocity, with and without elbow (exercised by `franka_ros2`'s `cartesian_pose`, `cartesian_velocity`, `cartesian_orientation` and `cartesian_elbow` example controllers)
+- [x] Physics backends: MuJoCo (default, FR3 from MuJoCo Menagerie) and Genesis
+- [x] Gripper / Franka Hand server on 1338: kinematic by default, physics-simulated fingers with `--gripper-physics`, `--no-gripper` to disable
+- [x] Automatic error recovery, so `franka_hardware` / franka_ros2 can activate and recover on their own
+- [x] Motion-limit checks with the robot's error names: joint/Cartesian velocity, acceleration and jerk discontinuities, torque rate, elbow limit / sign / start-elbow, self-collision avoidance (MuJoCo contact margin, per link pair) — logged always, enforced as reflex aborts with `--enforce-motion-limits`
+- [x] Communication-constraint checks: lost-cycle extrapolation and `communication_constraints_violation` with `--enforce-comm-constraints`
+- [x] Visualization (MuJoCo viewer, `--vis`) that never teleports the robot: a stalled render slows the simulation instead of bursting physics steps
+- [x] CI-first packaging: Docker image, GitHub Action (`BarisYazici/libfranka-sim@v1`), pytest plugin, `franka-sim-check`
+- [x] Verified against Franka's own hardware smoke suite in `franka_ros2` (jazzy): 47/47 on the simulator, permissive and with motion limits enforced
+- [ ] Contact-force reflexes (`cartesian_reflex` / `joint_reflex` from `SetCollisionBehavior` thresholds): the arm has no external-force estimate yet
+- [ ] Reflex state persisting across client reconnects (the sim resets on disconnect; the robot stays in reflex until recovery)
 
 ## Contributing
 
