@@ -986,6 +986,95 @@ def test_a_pose_motion_reports_the_twist_and_acceleration_libfranka_will_differe
     assert twist[3:6] != pytest.approx(list(body_rate), abs=1e-6)
 
 
+def test_a_pose_stream_saturating_the_limiter_against_the_wire_echo_is_not_a_violation():
+    """libfranka's pose ``limitRate``, run at the acceleration limit, never trips.
+
+    The client only ever sees ``O_T_EE_c``/``O_dP_EE_c``/``O_ddP_EE_c`` as
+    float32 (``rbk_types.h``: every commanded echo is a ``floatarray``), and
+    builds each command on them: ``p_k = p32_{k-1} + v_k dt`` with
+    ``v_k = v32_{k-1} + a dt`` and ``a = 9 - kLimitEps``. Differenced against
+    the *exact* previous pose, the half-ulp the reference is off by (3e-8 m at
+    0.5 m) reads as up to 0.03 m/s^2 of acceleration and 30 m/s^3 of jerk the
+    client never commanded -- thirty times the epsilon it keeps in hand -- and
+    the sim refused the robot's own client with ``9.0016 m/s^2, limit 9``.
+    This streams exactly that arithmetic and requires every cycle to pass.
+    """
+    from franka_sim.limits.differencing import as_wire
+    from franka_sim.limits.tables import LIMIT_EPS
+
+    start = MOCK_O_T_EE
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.CARTESIAN_POSE, robot_state_at(O_T_EE=start))
+    checker.note_published(1)
+    opening = command(message_id=1, O_T_EE_c=list(start))
+    assert checker.check(opening) is None
+    checker.record(opening)
+
+    acceleration = MAX_TRANSLATIONAL_ACCELERATION - LIMIT_EPS  # the limiter's target
+    jerk = MAX_TRANSLATIONAL_JERK - LIMIT_EPS
+    commanded_acceleration = 0.0
+    for cycle in range(2, 300):  # 2.7 m/s by the end, still inside the envelope
+        checker.note_published(cycle)
+        # What the client reads back: the echoes, rounded on the wire.
+        twist, last_acceleration = checker.applied_derivatives()
+        echoed_pose = as_wire(checker._pose.translation)
+        echoed_velocity = float(as_wire(twist)[0])
+        echoed_acceleration = float(as_wire(last_acceleration)[0])
+        # ``limitRate``: jerk-limit the acceleration, cap it, integrate -- and
+        # rebuild the pose on the echo, as it does: ``last_commanded_pose`` is
+        # the wire's float32 ``O_T_EE_c`` with ``Affine3d::rotation()`` on it.
+        commanded_acceleration = min(echoed_acceleration + jerk * DELTA_T, acceleration)
+        velocity = echoed_velocity + commanded_acceleration * DELTA_T
+        matrix = np.eye(4)
+        matrix[:3, :3] = eigen_rotation(as_wire(checker._pose.rotation))
+        matrix[:3, 3] = echoed_pose
+        matrix[0, 3] += velocity * DELTA_T
+        received = command(message_id=cycle, O_T_EE_c=[float(v) for v in matrix.T.flatten()])
+        assert checker.check(received) is None, (
+            f"the limiter's own output was refused at cycle {cycle}: {checker.check(received)}"
+        )
+        checker.record(received)
+    # The stream really did run at the limit -- this is not a test of a slow ramp.
+    assert commanded_acceleration == pytest.approx(acceleration)
+    assert checker.applied_derivatives()[1][0] == pytest.approx(acceleration, abs=0.05)
+
+
+def eigen_rotation(matrix):
+    """``Eigen::Affine3d::rotation()``: the polar factor, ``U V^T`` of the SVD."""
+    left, _, right_t = np.linalg.svd(np.asarray(matrix, dtype=float))
+    return left @ right_t
+
+
+def test_an_orientation_held_from_the_wire_echo_is_at_rest():
+    """Re-sending the echoed ``O_T_EE_c`` -- as a client holding still does -- is zero motion.
+
+    What comes back over the wire is orthonormal only to float32, and what a
+    libfranka client sends back is ``Eigen::Affine3d::rotation()`` of that,
+    the polar factor. The checker differences against the rounded matrix
+    itself, and the two agree to ~1e-13 rad/s: the rounding's departure from
+    orthonormality is the symmetric factor the polar decomposition strips, and
+    :func:`rotation_log` never looks at it. The translation is exact by
+    construction, so the whole judged twist is zero, and the stream passes.
+    """
+    from franka_sim.limits.differencing import as_wire
+
+    tilt = rotation_about_x(0.7) @ rotation_about_z(0.4)
+    start = pose(0.3, 0.1, 0.5, rotation=tilt)
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.CARTESIAN_POSE, robot_state_at(O_T_EE=start))
+    for cycle in range(1, 40):
+        checker.note_published(cycle)
+        matrix = np.eye(4)
+        matrix[:3, :3] = eigen_rotation(as_wire(checker._pose.rotation))
+        matrix[:3, 3] = as_wire(checker._pose.translation)
+        received = command(message_id=cycle, O_T_EE_c=[float(v) for v in matrix.T.flatten()])
+        if cycle > 1:
+            velocity, _, _ = checker._pose.derivatives(received["O_T_EE_c"])
+            assert np.linalg.norm(velocity) < 1e-9
+        assert checker.check(received) is None
+        checker.record(received)
+
+
 def test_a_pose_step_is_a_cartesian_velocity_discontinuity():
     """A mid-motion ``O_T_EE_c`` step of 1 m in z -> index 19.
 

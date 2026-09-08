@@ -22,6 +22,21 @@ from franka_sim.limits.tables import (
     ROTATION_LOG_SMALL_ANGLE,
 )
 
+#: The precision of a commanded field as the client reads it back. The FCI v10
+#: ``RobotState`` is float-based on the wire -- every commanded echo
+#: (``O_T_EE_c``, ``O_dP_EE_c``, ``O_ddP_EE_c``, ``q_d``, ``tau_J_d``, ...) is
+#: a ``floatarray`` (``research_interface/robot/rbk_types.h``), while the
+#: ``RobotCommand`` the client sends is ``double``. So what a client is told
+#: about its own previous command is that command rounded to float32, and
+#: libfranka's ``limitRate`` differences the next one against exactly that.
+WIRE_DTYPE = np.float32
+
+
+def as_wire(values: Sequence[float]) -> "np.ndarray":
+    """``values`` as the client read them back: rounded to :data:`WIRE_DTYPE`."""
+    return np.asarray(values, dtype=float).astype(WIRE_DTYPE).astype(float)
+
+
 # -- differencing -------------------------------------------------------------
 
 
@@ -634,6 +649,37 @@ class _PoseDifferentiator:
     echoes back to the client as ``O_dP_EE_c`` and ``O_ddP_EE_c``, which the
     client's limiter then differences its next command against, so the two
     sides have to agree on the frame exactly.
+
+    **A command is judged against the history as the client read it back.**
+    The pose, twist and acceleration this class holds are exact doubles, but
+    the ``O_T_EE_c``/``O_dP_EE_c``/``O_ddP_EE_c`` the client sees are their
+    float32 roundings (:data:`WIRE_DTYPE`), and libfranka's pose ``limitRate``
+    builds its next command on those: ``p_k = p32_{k-1} + v_k dt`` with
+    ``v_k = v32_{k-1} + a_k dt``, ``a_k`` one ``kLimitEps`` inside the
+    acceleration limit. Half a float32 ulp of a 0.5 m coordinate is 3e-8 m;
+    differenced twice over 1 ms that is 0.03 m/s^2, thirty times the epsilon
+    the limiter keeps in hand, and three times over it is 30 m/s^3 -- so a
+    stream the robot's own client produced at the acceleration or jerk limit,
+    judged against the *exact* previous pose, read as 9.0016 m/s^2 against 9
+    and 4529 m/s^3 against 4500: the limiter's own output, refused. The FCI
+    promises the opposite -- the commanded values "are always sent back to the
+    user in the robot state so you will be able to compute the resulting
+    derivatives in advance" (``docs/overview.rst``) -- and that promise only
+    holds if the robot's differences are taken from the values it sent back.
+    :meth:`derivatives` therefore references the wire-rounded history, which
+    reproduces the client's own arithmetic; :meth:`advance` and the
+    extrapolation keep the exact history, which is what the robot actually
+    tracks. No threshold moves: a client that ignores the echo and differences
+    its own exact history is judged on exactly the same terms, and its noise
+    cuts both ways.
+
+    The rounded rotation is used as it is, not re-orthonormalised the way
+    ``Eigen::Affine3d::rotation()`` does it for the client: the rounding's
+    ~1e-7 departure from orthonormality is the *symmetric* factor of the polar
+    decomposition, and :func:`rotation_log` reads the angle off the skew part,
+    which a symmetric perturbation does not touch -- so the two references
+    differ by ~1e-13 rad/s, and an SVD per cycle on the receive path would buy
+    nothing.
     """
 
     def __init__(self):
@@ -689,17 +735,43 @@ class _PoseDifferentiator:
         self.first = [0.0] * 6
         self.second = [0.0] * 6
 
+    def _differences(
+        self,
+        pose: Sequence[float],
+        cycles: int,
+        rotation: "np.ndarray",
+        translation: "np.ndarray",
+        first: Sequence[float],
+        second: Sequence[float],
+    ) -> Tuple[List[float], List[float], List[float]]:
+        """The three backward differences of ``pose`` against the given history."""
+        step = cycles * DELTA_T
+        matrix = transform_matrix(pose)
+        linear = (matrix[:3, 3] - translation) / step
+        angular = rotation_log(matrix[:3, :3] @ rotation.T) / step
+        velocity = [float(value) for value in (*linear, *angular)]
+        acceleration = [(velocity[i] - first[i]) / step for i in range(6)]
+        jerk = [(acceleration[i] - second[i]) / step for i in range(6)]
+        return velocity, acceleration, jerk
+
     def derivatives(
         self, pose: Sequence[float], cycles: int = 1
     ) -> Tuple[List[float], List[float], List[float]]:
-        """Velocity, acceleration and jerk implied by ``pose``, without advancing."""
-        step = cycles * DELTA_T
-        matrix = transform_matrix(pose)
-        linear = (matrix[:3, 3] - self.translation) / step
-        angular = rotation_log(matrix[:3, :3] @ self.rotation.T) / step
-        velocity = [float(value) for value in (*linear, *angular)]
-        acceleration = [(velocity[i] - self.first[i]) / step for i in range(6)]
-        jerk = [(acceleration[i] - self.second[i]) / step for i in range(6)]
+        """Velocity, acceleration and jerk implied by ``pose``, without advancing.
+
+        Judged against the history *as the client read it back* -- see the
+        class docstring -- so a command built on the echoed ``O_T_EE_c``,
+        ``O_dP_EE_c`` and ``O_ddP_EE_c`` is differenced by the arithmetic that
+        built it.
+        """
+        velocity, acceleration, jerk = self._differences(
+            pose,
+            cycles,
+            as_wire(self.rotation),
+            as_wire(self.translation),
+            as_wire(self.first),
+            as_wire(self.second),
+        )
         # Reported only; see :meth:`_Differentiator.mark_reseeding`. The
         # measured values are what :meth:`advance` stores.
         if self.reseeding:
@@ -709,8 +781,17 @@ class _PoseDifferentiator:
         return velocity, acceleration, jerk
 
     def advance(self, pose: Sequence[float], cycles: int = 1) -> None:
-        """Accept ``pose`` as applied: it and its derivatives become the history."""
-        velocity, acceleration, _ = self.derivatives(pose, cycles)
+        """Accept ``pose`` as applied: it and its derivatives become the history.
+
+        The history is exact: differenced against the pose actually applied,
+        not its wire rounding, since this is what the robot tracks and what a
+        gap is extrapolated from.
+        """
+        velocity, acceleration, _ = self._differences(
+            pose, cycles, self.rotation, self.translation, self.first, self.second
+        )
+        if self.reseeding:
+            acceleration = [0.0] * 6
         matrix = transform_matrix(pose)
         # Explicit copies -- see the comment in seed().
         self.rotation = np.array(matrix[:3, :3])
