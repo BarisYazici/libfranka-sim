@@ -2,6 +2,7 @@
 import argparse
 import importlib
 import logging
+import math
 import os
 import sys
 import threading
@@ -205,6 +206,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-enforce-motion-limits to force it off even when that is set",
     )
     parser.add_argument(
+        "--joint-discontinuity-scale",
+        type=float,
+        default=None,
+        metavar="FACTOR",
+        help="Multiply the joint-side thresholds of the Cartesian motion "
+        "generators (cartesian_motion_generator_joint_velocity_discontinuity / "
+        "..._joint_acceleration_discontinuity, judged on the inverse kinematics "
+        "of every commanded pose) by FACTOR; 1.0 is the calibrated default, "
+        "smaller is stricter. Same as setting "
+        "FRANKA_SIM_JOINT_DISCONTINUITY_SCALE; the flag wins",
+    )
+    parser.add_argument(
         "--mobile-duo",
         action="store_true",
         default=False,
@@ -281,6 +294,9 @@ def validate_args(args) -> None:
             f"--gripper-object-width {width} is outside the hand's "
             f"0..{FRANKA_HAND_MAX_WIDTH} m stroke"
         )
+    scale = getattr(args, "joint_discontinuity_scale", None)
+    if scale is not None and not (math.isfinite(scale) and scale > 0.0):
+        raise ValueError(f"--joint-discontinuity-scale {scale} must be a positive number")
     if not args.mobile_duo:
         if args.scene_urdf or args.bind:
             raise ValueError("--scene-urdf and --bind require --mobile-duo")
@@ -419,6 +435,7 @@ def run_single_arm(args) -> None:
         physics=args.physics,
         enforce_comm_constraints=comm_constraints_setting(args),
         enforce_motion_limits=motion_limits_setting(args),
+        joint_discontinuity_scale=args.joint_discontinuity_scale,
     )
     try:
         server.start()

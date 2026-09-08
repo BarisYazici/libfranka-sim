@@ -310,6 +310,7 @@ torque path.
 
 | Variable | Meaning |
 | -------- | ------- |
+| `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE` | Multiplier (default 1.0) on the per-joint thresholds of the Cartesian generators' joint-side discontinuity checks (errors 29/30); smaller is stricter. `--joint-discontinuity-scale` wins over it. See [the joint side of a Cartesian command](docs/robot-state.md#the-joint-side-of-a-cartesian-command-29-30) |
 | `FRANKA_SIM_SPINE_PORT` | Test-suite only. `SpineApiClient` hardcodes port 443, which needs root to bind; set this to point the mobile-duo end-to-end tests at an unprivileged port instead (e.g. via an `iptables` `REDIRECT 443 -> 8443`) |
 
 ### Troubleshooting
@@ -352,6 +353,7 @@ clients rather than against a spec:
 - [x] Gripper / Franka Hand server on 1338: kinematic by default, physics-simulated fingers with `--gripper-physics`, `--no-gripper` to disable
 - [x] Automatic error recovery, so `franka_hardware` / franka_ros2 can activate and recover on their own
 - [x] Motion-limit checks with the robot's error names: joint/Cartesian velocity, acceleration and jerk discontinuities, torque rate, elbow limit / sign / start-elbow, self-collision avoidance (MuJoCo contact margin, per link pair) — logged always, enforced as reflex aborts with `--enforce-motion-limits`
+- [x] The joint side of the Cartesian generators: every commanded pose is solved to joint space and its joint velocity / acceleration steps judged per joint (`cartesian_motion_generator_joint_velocity_discontinuity` / `..._joint_acceleration_discontinuity`), calibrated against a real Panda (FCI v5) — **calibration pending on the FR3**, `--joint-discontinuity-scale` / `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE` to re-tune
 - [x] Communication-constraint checks: lost-cycle extrapolation and `communication_constraints_violation` with `--enforce-comm-constraints`
 - [x] Visualization (MuJoCo viewer, `--vis`) that never teleports the robot: a stalled render slows the simulation instead of bursting physics steps
 - [x] CI-first packaging: Docker image, GitHub Action (`BarisYazici/libfranka-sim@v1`), pytest plugin, `franka-sim-check`

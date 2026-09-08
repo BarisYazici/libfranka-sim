@@ -28,6 +28,7 @@ import numpy as np
 
 from franka_sim.cartesian_ik import (
     CartesianFeedforward,
+    CartesianJointSolver,
     elbow_null_velocity,
     resolved_rate,
     tracking_twist,
@@ -994,6 +995,53 @@ class MujocoFrankaSim:
         signal. The quantity Control watches for ``cartesian_velocity_violation``.
         """
         return self.ee_jacobian()[:3] @ self.data.qvel[self.arm_dofs_idx]
+
+    def joint_space_solver(self) -> Optional[CartesianJointSolver]:
+        """A :class:`~franka_sim.cartesian_ik.CartesianJointSolver` on this model.
+
+        The FCI layer's way of asking "where would the joints have to be for
+        this commanded pose", which the joint-side continuity check of the
+        Cartesian generators is built on (see
+        :meth:`franka_sim.limits.checker.MotionLimitChecker._check_cartesian_joint_continuity`).
+
+        Bound to a **private** ``mjData`` of its own, and that is the whole
+        design: the solver is called from the network threads, at 1 kHz, while
+        the physics thread is inside ``mj_step`` on :attr:`data`, and ``mjData``
+        is not shareable between threads. ``mjModel`` is -- nothing writes it
+        after compile -- so the copy is a few hundred kilobytes of state, not a
+        second model. Forward kinematics only (``mj_kinematics`` + ``mj_comPos``
+        for the Jacobian), never a step: the probe's data holds whatever
+        configuration was last asked about and is never integrated.
+
+        The frame is the one this backend calls the EE everywhere else:
+        ``link7`` composed with the current ``F_T_EE``
+        (:meth:`update_ee_transform`, read on every call so a ``SetEE`` mid-
+        connection is honoured), the same frame :meth:`ee_pose`,
+        :meth:`ee_jacobian` and the published ``O_T_EE`` describe.
+
+        None before :meth:`initialize_simulation` has compiled the model.
+        """
+        if self.model is None or self.ee_body_id is None:
+            return None
+        model = self.model
+        data = mujoco.MjData(model)
+        scratch = np.zeros((6, model.nv))
+        jacp, jacr = scratch[:3], scratch[3:]
+        qpos_adr, dofs, body = self.arm_qpos_adr, self.arm_dofs_idx, self.ee_body_id
+
+        def forward(q):
+            data.qpos[qpos_adr] = q
+            mujoco.mj_kinematics(model, data)
+            mujoco.mj_comPos(model, data)
+            f_t_ee = self._f_t_ee
+            rotation = data.xmat[body].reshape(3, 3)
+            pose = np.eye(4)
+            pose[:3, :3] = rotation
+            pose[:3, 3] = data.xpos[body]
+            mujoco.mj_jac(model, data, jacp, jacr, data.xpos[body] + rotation @ f_t_ee[:3, 3], body)
+            return pose @ f_t_ee, scratch[:, dofs].copy()
+
+        return CartesianJointSolver(forward)
 
     def _read_and_publish_state(self) -> None:
         """Read the model once and publish one state snapshot for the network threads."""

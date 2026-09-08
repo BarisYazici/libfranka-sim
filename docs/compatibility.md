@@ -325,10 +325,17 @@ exactly as it does on hardware.
 
 Details worth knowing:
 
-* **The checking layer is unchanged.** IK tracking is a second consumer of the
-  accepted command stream, not a filter on it. Every limit check listed under
-  [discontinuous commands](#discontinuous-commands) runs first and on the same
-  signal it always did.
+* **The checking layer is unchanged — and now has a joint side.** IK tracking
+  is a second consumer of the accepted command stream, not a filter on it.
+  Every limit check listed under [discontinuous commands](#discontinuous-commands)
+  runs first and on the same signal it always did; in addition, the commanded
+  pose is solved to joint space every cycle and the resulting joint velocity and
+  acceleration steps are held to the robot's per-joint limits, which is what
+  raises `cartesian_motion_generator_joint_velocity_discontinuity` (29) /
+  `..._joint_acceleration_discontinuity` (30) on a real Franka for a Cartesian
+  ramp that is well inside the Cartesian limits. Calibrated on a Panda, pending
+  on the FR3, tunable with `--joint-discontinuity-scale`; see [the joint
+  side](robot-state.md#the-joint-side-of-a-cartesian-command-29-30).
 * **The elbow steers the null space.** `elbow_c[0]` is the redundancy angle
   (joint 3 on an FR3) and is chased inside the Jacobian's null space, so it
   moves the elbow without moving the end effector. `elbow_c[1]`, the branch

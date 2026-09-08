@@ -39,7 +39,6 @@ from franka_sim.control_modes import ControlMode
 from franka_sim.franka_protocol import COMMAND_PORT, MoveStatus
 from franka_sim.gripper.backend import FrankaHandSim
 from franka_sim.gripper.server import FrankaGripperServer
-from franka_sim.motion_limits import MotionLimitChecker
 from franka_sim.motion_limits import (
     enforcement_enabled_by_env as motion_limit_enforcement_enabled_by_env,
 )
@@ -93,6 +92,7 @@ class FrankaSimServer(
         physics: str = DEFAULT_PHYSICS,
         enforce_comm_constraints: Optional[bool] = None,
         enforce_motion_limits: Optional[bool] = None,
+        joint_discontinuity_scale: Optional[float] = None,
     ):
         """
         Initialize the Franka simulation server.
@@ -283,7 +283,12 @@ class FrankaSimServer(
             if enforce_motion_limits is None
             else enforce_motion_limits
         )
-        self.motion_limits = MotionLimitChecker(enforce=self.enforce_motion_limits)
+        #: Multiplier on the joint-side thresholds of the Cartesian generators
+        #: (errors 29/30); None reads ``$FRANKA_SIM_JOINT_DISCONTINUITY_SCALE``.
+        #: Kept on the server because :meth:`reset_state` rebuilds the checker
+        #: per connection.
+        self.joint_discontinuity_scale = joint_discontinuity_scale
+        self.motion_limits = self._build_motion_limit_checker()
 
         # Build the physics backend unless one was injected.
         if physics_sim is None:

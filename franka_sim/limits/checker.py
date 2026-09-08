@@ -13,7 +13,7 @@ command -- is opt-in; see :data:`franka_sim.limits.tables.ENFORCE_ENV_VAR`.
 import math
 import threading
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -22,6 +22,8 @@ from franka_sim.limits.tables import (
     CARTESIAN_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX,
     CARTESIAN_MOTION_GENERATOR_ELBOW_LIMIT_VIOLATION_INDEX,
     CARTESIAN_MOTION_GENERATOR_ELBOW_SIGN_INCONSISTENT_INDEX,
+    CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX,
+    CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX,
     CARTESIAN_MOTION_GENERATOR_START_ELBOW_INVALID_INDEX,
     CARTESIAN_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX,
     CARTESIAN_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION_INDEX,
@@ -29,14 +31,17 @@ from franka_sim.limits.tables import (
     CARTESIAN_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX,
     CARTESIAN_VELOCITY_VIOLATION_INDEX,
     CONTROLLER_TORQUE_DISCONTINUITY_INDEX,
+    DELTA_T,
     ELBOW_POSITION_LIMITS,
     ERROR_NAMES,
+    JOINT_ACCELERATION_DISCONTINUITY_LIMIT,
     JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_POSITION_LIMITS_VIOLATION_INDEX,
     JOINT_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION_INDEX,
     JOINT_POSITION_LIMITS,
     JOINT_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX,
+    JOINT_VELOCITY_DISCONTINUITY_LIMIT,
     JOINT_VELOCITY_VIOLATION_INDEX,
     MAX_COALESCED_CYCLES,
     MAX_ELBOW_ACCELERATION,
@@ -64,6 +69,7 @@ from franka_sim.limits.tables import (
     START_POSE_TOLERANCE,
     START_VELOCITY_TOLERANCE,
     TAU_J_RANGE_VIOLATION_INDEX,
+    joint_discontinuity_scale_from_env,
     logger,
     lower_joint_velocity_limits,
     upper_joint_velocity_limits,
@@ -190,9 +196,46 @@ class MotionLimitChecker:
         start_cartesian_rotation_tolerance: float = START_CARTESIAN_POSE_ROTATION_TOLERANCE,
         start_elbow_tolerance: float = START_ELBOW_TOLERANCE,
         self_collision_closing_distance: float = SELF_COLLISION_CLOSING_DISTANCE,
+        joint_kinematics: Optional[Callable[[], Any]] = None,
+        joint_discontinuity_scale: Optional[float] = None,
     ):
-        """Build a checker; see the module constants for the defaults."""
+        """Build a checker; see the module constants for the defaults.
+
+        ``joint_kinematics`` is how the Cartesian generators get their joint
+        side: a zero-argument callable returning a
+        :class:`~franka_sim.cartesian_ik.CartesianJointSolver` (or None), asked
+        once per Cartesian ``Move`` in :meth:`start_motion` -- the backend's
+        model may not be compiled when the checker is built, and it is the
+        backend that owns the model. None, or a callable answering None, keeps
+        the joint-side check off: a backend with no inverse kinematics has no
+        joint trajectory to judge. See
+        :meth:`_check_cartesian_joint_continuity`.
+
+        ``joint_discontinuity_scale`` multiplies both joint-side thresholds
+        (:data:`JOINT_VELOCITY_DISCONTINUITY_LIMIT`,
+        :data:`JOINT_ACCELERATION_DISCONTINUITY_LIMIT`); None reads
+        :data:`~franka_sim.limits.tables.JOINT_DISCONTINUITY_SCALE_ENV_VAR`.
+        """
         self._lock = threading.Lock()
+        self._joint_kinematics = joint_kinematics
+        #: Multiplier on the joint-side Cartesian thresholds; see the ctor.
+        self.joint_discontinuity_scale = (
+            joint_discontinuity_scale_from_env()
+            if joint_discontinuity_scale is None
+            else float(joint_discontinuity_scale)
+        )
+        #: The solver :attr:`_joint_kinematics` answered for the running
+        #: Cartesian motion, or None (no backend IK, or a joint generator).
+        self._joint_solver: Any = None
+        #: ``(key, q, converged)`` of the last IK solution
+        #: :meth:`_check_locked` computed, so the :meth:`record` (or
+        #: extrapolation commit) that follows the check reuses it instead of
+        #: solving the same pose twice. The key is the commanded pose (or twist
+        #: and interval) it answers. See :meth:`_ik_solution_locked`.
+        self._ik_pending: Optional[Tuple[Any, List[float], bool]] = None
+        #: Once-per-motion latches for the two ways the solver can fall short.
+        self._ik_failed_logged = False
+        self._ik_diverged_logged = False
         #: Whether a violation may abort the motion. Checking and logging run
         #: either way -- that is the point of making this opt-in.
         self.enforce = enforce
@@ -210,6 +253,14 @@ class MotionLimitChecker:
         self._torque = _Differentiator(7)
         self._twist = _CartesianDifferentiator()
         self._pose = _PoseDifferentiator()
+        #: The joint trajectory the backend's inverse kinematics makes of a
+        #: Cartesian stream, differenced as a *position* history: ``first``,
+        #: ``second`` and ``third`` are the IK joint velocity, acceleration
+        #: and jerk. What errors 29 and 30 are judged on; see
+        #: :meth:`_check_cartesian_joint_continuity`. Seeded from the measured
+        #: ``q`` on every Cartesian ``Move`` and advanced on every recorded
+        #: (or extrapolated) command of the motion.
+        self._ik_joint = _Differentiator(7)
         #: ``elbow_c[0]`` -- the redundancy angle -- differenced as a position,
         #: so ``first``/``second`` are its velocity and acceleration.
         self._elbow = _Differentiator(1)
@@ -382,6 +433,19 @@ class MotionLimitChecker:
             # elbow is (q[2], sign(q[3])) and there is nothing to look up.
             self._elbow.seed([self._joint_positions[2]])
             self._elbow_sign = None
+            # The joint side of a Cartesian motion starts where the arm *is*:
+            # the measured ``q``, not a commanded field, because the IK's
+            # first solution is judged against nothing (the opening command
+            # rebases, see ``_record_ik_joint_locked``) and its seed only has
+            # to be close enough for the solver to converge from.
+            self._ik_pending = None
+            self._ik_failed_logged = False
+            self._ik_diverged_logged = False
+            self._joint_solver = None
+            if control_mode in (ControlMode.CARTESIAN_POSE, ControlMode.CARTESIAN_VELOCITY):
+                measured = list(state.get("q") or positions)
+                self._ik_joint.seed([float(value) for value in measured[:7]])
+                self._joint_solver = self._resolve_joint_solver()
             # A window left open by the *previous* motion's packet loss is not
             # this motion's business; every history starts differencing again.
             self._mark_reseeding_locked(0)
@@ -508,7 +572,7 @@ class MotionLimitChecker:
     def _mark_reseeding_locked(self, commands: int = 2) -> None:
         """Arm (or, with 0, disarm) the re-seed window on every history; lock held.
 
-        All five, for the reason :meth:`_mark_clean_locked` gives: the mode can
+        All six, for the reason :meth:`_mark_clean_locked` gives: the mode can
         change between motions and a window left armed on the *other*
         generator's history is a trap for the next one. The torque history reads
         only its first difference (``tau_J_d``'s rate, which the window leaves
@@ -519,6 +583,7 @@ class MotionLimitChecker:
         self._twist.mark_reseeding(commands)
         self._pose.mark_reseeding(commands)
         self._elbow.mark_reseeding(commands)
+        self._ik_joint.mark_reseeding(commands)
         if self._gap_snapshot is not None:
             # The hold happens *inside* an open run of losses, after that run's
             # snapshot was taken. A late datagram from the run rewinds to that
@@ -548,6 +613,7 @@ class MotionLimitChecker:
             "twist": self._twist,
             "pose": self._pose,
             "elbow": self._elbow,
+            "ik_joint": self._ik_joint,
         }
 
     def cycles_since_applied(self, command: Dict[str, Any]) -> int:
@@ -795,6 +861,7 @@ class MotionLimitChecker:
         self._twist.mark_clean()
         self._pose.mark_clean()
         self._elbow.mark_clean()
+        self._ik_joint.mark_clean()
 
     def _freeze_clean_locked(self) -> None:
         """Seed the coming gap from derivatives nobody objected to; lock held.
@@ -820,6 +887,7 @@ class MotionLimitChecker:
             self._twist.freeze_clean()
             self._pose.freeze_clean()
             self._elbow.freeze_clean()
+            self._ik_joint.freeze_clean()
             return
         # ``_joint`` is shared between two depths (see the class docstring):
         # a joint-position motion keeps its acceleration in ``second``, a
@@ -834,6 +902,10 @@ class MotionLimitChecker:
         self._twist.freeze_flat()
         self._pose.freeze_flat()
         self._elbow.freeze_flat_position()
+        # Nothing integrates this one -- it is re-derived from the IK of every
+        # extrapolated pose -- so the flat freeze only keeps its bookkeeping in
+        # step with the others.
+        self._ik_joint.freeze_flat_position()
 
     def _check_locked(self, command: Dict[str, Any], cycles: int) -> Optional[Violation]:
         """Dispatch one command to its generator's checks; lock held, ``_active`` true.
@@ -1276,10 +1348,12 @@ class MotionLimitChecker:
             else:
                 self._pose.advance(command["O_T_EE_c"], cycles)
             self._record_elbow_locked(command, cycles)
+            self._record_ik_joint_locked(command, cycles, first)
         elif self._mode in (ControlMode.STEERING_DRIVE, ControlMode.CARTESIAN_VELOCITY):
             self._twist.advance(command["O_dP_EE_c"], cycles)
             if self._mode is ControlMode.CARTESIAN_VELOCITY:
                 self._record_elbow_locked(command, cycles)
+                self._record_ik_joint_locked(command, cycles, first)
 
         if window is not None:
             self._set_reseeding_locked(window)
@@ -1500,8 +1574,11 @@ class MotionLimitChecker:
                 self._joint.commit_velocity(command["dq_c"])
             elif self._mode is ControlMode.CARTESIAN_POSE:
                 self._pose.commit(command["O_T_EE_c"])
+                self._record_ik_joint_locked(command, 1, False)
             else:
                 self._twist.commit(command["O_dP_EE_c"])
+                if self._mode is ControlMode.CARTESIAN_VELOCITY:
+                    self._record_ik_joint_locked(command, 1, False)
             if elbow is not None:
                 self._elbow.commit_position([elbow[0]])
 
@@ -1739,6 +1816,11 @@ class MotionLimitChecker:
                 list(self._elbow.first),
                 list(self._elbow.second),
             ),
+            "ik_joint": (
+                list(self._ik_joint.value),
+                list(self._ik_joint.first),
+                list(self._ik_joint.second),
+            ),
         }
 
     def _restore_locked(self, snapshot: Dict[str, Any]) -> None:
@@ -1757,6 +1839,11 @@ class MotionLimitChecker:
         self._elbow.value, self._elbow.first, self._elbow.second = (
             list(values) for values in snapshot["elbow"]
         )
+        self._ik_joint.value, self._ik_joint.first, self._ik_joint.second = (
+            list(values) for values in snapshot["ik_joint"]
+        )
+        # A solution cached for the guess being undone answers nothing now.
+        self._ik_pending = None
 
     def _extrapolate_elbow_locked(self, command: Dict[str, Any]) -> Optional[List[float]]:
         """Extend this motion's elbow through a missed cycle; lock held.
@@ -1986,6 +2073,10 @@ class MotionLimitChecker:
                 "O_T_EE_c",
                 ("m/s^3", "rad/s^3"),
             )
+            # 6. **The joint side.** What the controller's own IK makes of
+            #    the pose, judged after the pose itself (a step that breaks
+            #    both is 19, the Cartesian name) and before the elbow.
+            or self._check_cartesian_joint_continuity(command, cycles)
             or self._check_elbow_limits(command, cycles)
         )
 
@@ -2047,10 +2138,199 @@ class MotionLimitChecker:
         # An elbow rides along with a Cartesian *velocity* motion exactly as it
         # does with a pose one (``CartesianVelocities::hasElbow``,
         # ``src/control_loop.cpp:308-323``), so the same limits apply -- to the
-        # arm role only, for the reason above.
+        # arm role only, for the reason above. The joint side likewise: the
+        # base's twist is a base twist, not an EE twist, and has no IK.
         if self._mode is ControlMode.CARTESIAN_VELOCITY:
-            return self._check_elbow_limits(command, cycles)
+            return self._check_cartesian_joint_continuity(
+                command, cycles
+            ) or self._check_elbow_limits(command, cycles)
         return None
+
+    # -- the joint side of a Cartesian command ------------------------------
+
+    def _resolve_joint_solver(self) -> Any:
+        """Ask the backend for this motion's IK; None when there is none."""
+        if self._joint_kinematics is None:
+            return None
+        try:
+            return self._joint_kinematics()
+        except Exception:  # pragma: no cover - a backend that cannot answer
+            logger.exception(
+                "Could not build a joint-space solver for this Cartesian motion; "
+                "the joint-side continuity check is off for it"
+            )
+            return None
+
+    def _ik_solution_locked(
+        self, command: Dict[str, Any], cycles: int
+    ) -> Optional[List[float]]:
+        """Where the IK puts the joints for ``command``; lock held.
+
+        Cached under the command's own generator signal, so the check and the
+        record (or extrapolation commit) of one command solve once between
+        them. On the pose interface the solver is seeded from the previous
+        solution and iterated onto ``O_T_EE_c``; on the velocity interface the
+        joint velocity realising ``O_dP_EE_c`` at the previous solution is
+        integrated over the interval, which is what an IK-driven velocity
+        controller does with a twist. None when the solver failed outright
+        (logged once per motion), in which case the joint side is not judged
+        for this command and the history stays where it was.
+
+        A solution the solver reports as *not converged* -- a pose out of
+        reach, or at a singularity -- is returned all the same and stamped so
+        the check skips it (:attr:`_ik_pending` carries the flag): the history
+        has to move on to something, and the closest configuration found is
+        the least wrong something. Judging its differences would manufacture a
+        discontinuity out of the solver's own shortfall.
+        """
+        elbow = command["elbow_c"][0] if command.get("valid_elbow") else None
+        if self._mode is ControlMode.CARTESIAN_POSE:
+            key = ("pose", tuple(command["O_T_EE_c"]), elbow)
+        else:
+            key = ("twist", tuple(command["O_dP_EE_c"]), elbow, int(cycles))
+        if self._ik_pending is not None and self._ik_pending[0] == key:
+            return self._ik_pending[1]
+        seed = self._ik_joint.value
+        try:
+            if self._mode is ControlMode.CARTESIAN_POSE:
+                solution, converged = self._joint_solver.solve_pose(key[1], seed, elbow)
+            else:
+                velocity = self._joint_solver.joint_velocity(seed, key[1], elbow)
+                solution = [q + float(v) * cycles * DELTA_T for q, v in zip(seed, velocity)]
+                converged = True
+        except Exception:
+            if not self._ik_failed_logged:
+                self._ik_failed_logged = True
+                logger.exception(
+                    "Joint-space solver failed on a Cartesian command; the joint-side "
+                    "continuity check is skipped for this command"
+                )
+            return None
+        solution = [float(value) for value in solution]
+        if not converged and not self._ik_diverged_logged:
+            self._ik_diverged_logged = True
+            logger.warning(
+                "Joint-space solver did not converge on a commanded pose (out of reach "
+                "or singular); the joint-side continuity check is skipped for it"
+            )
+        self._ik_pending = (key, solution, bool(converged))
+        return solution
+
+    def _check_cartesian_joint_continuity(
+        self, command: Dict[str, Any], cycles: int
+    ) -> Optional[Violation]:
+        """Errors 29 and 30: the joint trajectory the IK makes of a Cartesian command.
+
+        The real controller does not judge a Cartesian stream on its Cartesian
+        derivatives alone. Every ``O_T_EE_c`` goes through its inverse
+        kinematics, and the *joint* velocity and acceleration that come out
+        are held to per-joint limits -- which is how a +x ramp at 2.5 m/s^2,
+        a fifth of libfranka's Cartesian acceleration limit, is refused on a
+        real FER: at the ready pose the ramp lands almost entirely on joint 2
+        (``J^+ x`` = 3.2 rad/m there), whose acceleration limit is 7.5 rad/s^2.
+        See :data:`~franka_sim.limits.tables.JOINT_VELOCITY_DISCONTINUITY_LIMIT`
+        for the calibration that pins the thresholds.
+
+        The arithmetic is the joint-position generator's, applied to the IK
+        solution instead of to ``q_c``: backward differences over the cycles
+        the command covers, the second difference against
+        :data:`JOINT_VELOCITY_DISCONTINUITY_LIMIT` (29 -- the interface-relative
+        name, one derivative above the commanded *pose*, exactly as 14 is for
+        ``q_c``) and the third against
+        :data:`JOINT_ACCELERATION_DISCONTINUITY_LIMIT` (30). A command that
+        breaks both latches both from the one abort, which is what hardware
+        does for a ramp at libfranka's own Cartesian limits. On the Cartesian
+        *velocity* interface the same two differences are an acceleration and
+        a jerk of a commanded velocity, so both land on 30 -- the rule that
+        puts ``dq_c``'s two on 15; no hardware observation pins that half.
+
+        Never on a motion's opening command (there is nothing to difference:
+        the record rebases the history on it, as the pose history is), and
+        muted by the same re-seed window every other history honours after a
+        held reference (:meth:`note_hold`), so a resumed client is not charged
+        an acceleration for the cycles it could not send. Skipped -- never
+        latched -- when the backend has no IK, when the solver fails, or when
+        it did not converge; see :meth:`_ik_solution_locked`.
+        """
+        if self._joint_solver is None or self._first_command:
+            return None
+        solution = self._ik_solution_locked(command, cycles)
+        if solution is None or not self._ik_pending[2]:
+            return None
+        _, acceleration, jerk = self._ik_joint.derivatives(solution, cycles)
+        scale = self.joint_discontinuity_scale
+        pose_interface = self._mode is ControlMode.CARTESIAN_POSE
+        signal = "IK of " + ("O_T_EE_c" if pose_interface else "O_dP_EE_c")
+        velocity_violation = self._check_per_joint(
+            acceleration,
+            [limit * scale for limit in JOINT_VELOCITY_DISCONTINUITY_LIMIT],
+            (
+                CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX
+                if pose_interface
+                else CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX
+            ),
+            signal,
+            "rad/s^2",
+        )
+        acceleration_violation = self._check_per_joint(
+            jerk,
+            [limit * scale for limit in JOINT_ACCELERATION_DISCONTINUITY_LIMIT],
+            CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX,
+            signal,
+            "rad/s^3",
+        )
+        if velocity_violation is None:
+            return acceleration_violation
+        if (
+            acceleration_violation is not None
+            and acceleration_violation.error_index != velocity_violation.error_index
+        ):
+            return replace(
+                velocity_violation, extra_error_index=acceleration_violation.error_index
+            )
+        return velocity_violation
+
+    def _record_ik_joint_locked(self, command: Dict[str, Any], cycles: int, first: bool) -> None:
+        """Advance the IK joint history onto ``command``; lock held.
+
+        The opening command of a pose motion rebases it -- the start-pose
+        check has just confirmed the pose sits where the robot is, so it is a
+        standstill, not a step from the seeded ``q`` -- exactly as the pose
+        history is rebased. A velocity motion's opening twist is differenced
+        like every other, as the twist history is: a conforming client opens
+        at rest. A command the solver could not answer leaves the history
+        where it was (see :meth:`_ik_solution_locked`).
+        """
+        if self._joint_solver is None:
+            return
+        solution = self._ik_solution_locked(command, cycles)
+        self._ik_pending = None
+        if solution is None:
+            return
+        if first and self._mode is ControlMode.CARTESIAN_POSE:
+            self._ik_joint.rebase(solution)
+        else:
+            self._ik_joint.advance(solution, cycles)
+
+    def cartesian_joint_history(
+        self,
+    ) -> Optional[Tuple[List[float], List[float], List[float]]]:
+        """``(q, dq, ddq)`` of the IK joint trajectory as last recorded, or None.
+
+        None outside a Cartesian motion, or when the backend has no IK. For
+        diagnostics and tests: it is *not* published on the wire -- the robot
+        reports ``q_d`` from its own IK during a Cartesian motion, but this sim
+        publishes the measured ``q`` there (see ``docs/robot-state.md``), and
+        the two are not the same thing.
+        """
+        with self._lock:
+            if not self._active or self._joint_solver is None:
+                return None
+            return (
+                list(self._ik_joint.value),
+                list(self._ik_joint.first),
+                list(self._ik_joint.second),
+            )
 
     # -- primitives --------------------------------------------------------
 

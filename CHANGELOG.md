@@ -9,6 +9,25 @@ come with a major version bump.
 
 ### Added
 
+- **`cartesian_motion_generator_joint_velocity_discontinuity` (29) and
+  `..._joint_acceleration_discontinuity` (30): the joint side of a Cartesian
+  command.** The real controller runs inverse kinematics on every commanded
+  `O_T_EE_c` and holds the joint trajectory that comes out to per-joint limits,
+  which is how a Cartesian ramp well inside the Cartesian limits (2.5 m/s²,
+  500 m/s³, a fifth of libfranka's) is refused on a real FER. The MuJoCo backend
+  now does the same: each commanded pose (or twist) is solved to joint space on
+  the EE frame the arm is driven in, the solutions are differenced like `q_c`,
+  and the per-joint velocity / acceleration steps latch 29 / 30 through the
+  same reflex plumbing as every other motion-limit check (`kReflexAborted`,
+  `kReflex`, `AutomaticErrorRecovery`). Thresholds are the FER's
+  `kMaxJointAcceleration` / `kMaxJointJerk`, *calibrated against a real Panda*
+  (FCI v5, 2026-09-08: the 2.5 m/s² ramp trips joint 2 at 1.07× its 7.5 rad/s²,
+  the accepted 1.5 m/s² ramp peaks at 0.64×) and pending on the FR3;
+  `--joint-discontinuity-scale` / `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE`
+  re-tunes them without a code change. Silent on a motion's opening command,
+  across a held reference and through extrapolated cycles; off on backends
+  without IK. See [the joint side of a Cartesian
+  command](docs/robot-state.md#the-joint-side-of-a-cartesian-command-29-30).
 - **`self_collision_avoidance_violation` (error 2): the arm folding onto itself
   now raises the reflex.** The third measured-side check, beside
   `joint_velocity_violation` and `cartesian_velocity_violation`: it judges the

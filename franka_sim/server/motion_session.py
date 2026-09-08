@@ -39,6 +39,7 @@ from franka_sim.franka_protocol import (
 from franka_sim.motion_limits import (
     DELTA_T,
     SINGULAR_POSE_MIN_SINGULAR_VALUE,
+    MotionLimitChecker,
     smallest_singular_value,
     transform_matrix,
 )
@@ -1144,6 +1145,38 @@ class MotionSessionMixin:
         }
         self.robot_state.state.update(setpoint)
         return setpoint
+
+    def _build_motion_limit_checker(self):
+        """One :class:`~franka_sim.motion_limits.MotionLimitChecker` for a connection.
+
+        Shared by the constructor and :meth:`reset_state`, so both hand the
+        checker the same two things beyond the enforcement switch: the
+        backend's joint-space solver (as a factory, asked at each Cartesian
+        ``Move``) and the joint-side threshold scale.
+        """
+        return MotionLimitChecker(
+            enforce=self.enforce_motion_limits,
+            joint_kinematics=self._joint_space_solver,
+            joint_discontinuity_scale=self.joint_discontinuity_scale,
+        )
+
+    def _joint_space_solver(self):
+        """The backend's IK for the joint-side Cartesian checks, or None.
+
+        Only for an arm role whose backend drives the Cartesian generators
+        (:attr:`cartesian_tracking`): the mobile base's ``kCartesianVelocity``
+        is a base twist with no joints behind it, and a backend without
+        differential IK -- Genesis, the mobile-duo scene view -- has no joint
+        trajectory to judge, so the check stays off there rather than guessing
+        one. Asked per Cartesian ``Move`` because the model is compiled by the
+        physics thread's start-up, after the server (and its checker) exist.
+        """
+        if not getattr(self, "cartesian_tracking", False):
+            return None
+        factory = getattr(self.physics_sim, "joint_space_solver", None)
+        if factory is None:
+            return None
+        return factory()
 
     def _motion_limit_seed_state(self) -> Dict[str, Any]:
         """The state snapshot a new motion's limit checker is seeded from.

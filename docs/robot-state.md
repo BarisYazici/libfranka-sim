@@ -547,6 +547,7 @@ when a single cycle breaks both. See
 | Cartesian velocity (the [mobile base](mobile-duo.md) twist) | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_acceleration_discontinuity` (20) |
 | Cartesian velocity | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
 | Cartesian velocity | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
+| Cartesian velocity (arm) | acceleration and jerk of the **IK joint velocity** realising `O_dP_EE_c` | per joint, [below](#the-joint-side-of-a-cartesian-command-29-30) — interface-relative, both on 30; **unverified on hardware** | `cartesian_motion_generator_joint_acceleration_discontinuity` (30) |
 | Cartesian pose (`kCartesianPosition`) | `O_T_EE_c` is a homogeneous transformation | `franka::isHomogeneousTransformation`: bottom row `[0,0,0,1]`, rows and columns of the rotation block unit-norm to 1e−5 | `cartesian_position_motion_generator_invalid_frame_flag` (31) — refused even with enforcement off |
 | Cartesian pose | first `O_T_EE_c` matches the robot's measured `O_T_EE` | 0.05 m / 0.1 rad (sim choices, see below) | `cartesian_position_motion_generator_start_pose_invalid` (16) |
 | Cartesian pose | first `elbow_c` matches the robot's `(q[2], sign(q[3]))` | 0.1 rad (sim choice) or a sign mismatch | `cartesian_motion_generator_start_elbow_invalid` (22) |
@@ -554,6 +555,8 @@ when a single cycle breaks both. See
 | Cartesian pose | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_velocity_discontinuity` (19) |
 | Cartesian pose | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
 | Cartesian pose | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
+| Cartesian pose | per-cycle change of the **IK joint velocity** of `O_T_EE_c`, / dt | per joint, the FER's `kMaxJointAcceleration` 15 / 7.5 / 10 / 12.5 / 15 / 20 / 20 rad/s² × `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE` — [calibrated](#the-joint-side-of-a-cartesian-command-29-30) | `cartesian_motion_generator_joint_velocity_discontinuity` (29) |
+| Cartesian pose | per-cycle change of the **IK joint acceleration**, / dt | per joint, the FER's `kMaxJointJerk` 7500 / 3750 / 5000 / 6250 / 7500 / 10000 / 10000 rad/s³ × the same scale; latched *together with* 29 when one command breaks both | `cartesian_motion_generator_joint_acceleration_discontinuity` (30) |
 | Cartesian pose / velocity | commanded `elbow_c[0]` in range | joint 3's own FR3 URDF range, ±2.9065 rad — `elbow[0]` *is* joint 3's angle, and this is the bound Franka's 0.3 rad/s² elbow ramp reaches first (at ~4.49 s, half a second before the velocity cap below) | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | Cartesian pose / velocity | elbow velocity, acceleration, jerk | `kMaxElbowVelocity` 1.5 − 1e−3 rad/s, `kMaxElbowAcceleration` 10 − 1e−3 rad/s², `kMaxElbowJerk` 5000 − 1e−3 rad/s³ | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | torque | \|τ\| | FR3 URDF `<limit effort=>`: 87/87/87/87/12/12/12 Nm | `tau_J_range_violation` (34) |
@@ -593,6 +596,8 @@ step above the commanded channel.
 | `dq_c` | acceleration → **15** | jerk → **15** |
 | `O_T_EE_c` | velocity → **19** `cartesian_motion_generator_velocity_discontinuity` | acceleration → **20** |
 | `O_dP_EE_c` | acceleration → **20** `cartesian_motion_generator_acceleration_discontinuity` | jerk → **20** |
+| IK of `O_T_EE_c` (joint side) | velocity → **29** `cartesian_motion_generator_joint_velocity_discontinuity` | acceleration → **30** `cartesian_motion_generator_joint_acceleration_discontinuity` |
+| IK of `O_dP_EE_c` (joint side) | acceleration → **30** | jerk → **30** |
 | `tau_J_d` | rate → **32** `controller_torque_discontinuity` | — |
 
 The second half of the rule is a precedence: **a discontinuity beats the
@@ -622,6 +627,87 @@ Ordering between `tau_J_range_violation` (34) and `controller_torque_discontinui
 (32) for a command that breaks both is the one precedence here that is **not**
 pinned to hardware evidence; the sim reports the range violation. See the comment
 on `MotionLimitChecker._check_torque`.
+
+### The joint side of a Cartesian command (29, 30)
+
+The controller does not judge a Cartesian stream on its Cartesian derivatives
+alone. It runs inverse kinematics on every `O_T_EE_c` and holds the *joint*
+trajectory that comes out to per-joint limits — which is how a +x ramp at
+2.5 m/s², a fifth of libfranka's Cartesian acceleration limit, gets refused on a
+real FER. franka-sim does the same on the MuJoCo backend: every commanded pose is
+solved to a joint configuration (`MujocoFrankaSim.joint_space_solver`, damped
+Gauss-Newton from the previous cycle's solution on the same EE frame the arm is
+driven in, `F_T_EE` included), the solutions are differenced with the same
+backward Euler as `q_c`, and
+
+* the per-cycle change of the IK joint velocity, over `dt`, is held to
+  `JOINT_VELOCITY_DISCONTINUITY_LIMIT` → **29**
+  `cartesian_motion_generator_joint_velocity_discontinuity`,
+* the per-cycle change of the IK joint acceleration, over `dt`, to
+  `JOINT_ACCELERATION_DISCONTINUITY_LIMIT` → **30**
+  `cartesian_motion_generator_joint_acceleration_discontinuity`,
+
+interface-relative, as 14/15 are for `q_c`. A command that breaks both latches
+both bits from the one abort. The check runs after the pose's own Cartesian
+checks (a step that breaks both is reported as 19, the Cartesian name — a sim
+ordering, not a hardware pin) and before the elbow's. It is silent on a motion's
+opening command (the joint history is rebased on it, as the pose history is),
+honours the same two-command re-seed window after a [held
+reference](#what-the-sim-does-with-a-lost-cycle), follows extrapolated poses
+through a gap, and is skipped — never latched — when the solver does not
+converge (a pose out of reach, or at a singularity; logged once per motion). On
+backends without IK (Genesis, the mobile-duo scene view) there is no joint
+trajectory to judge and the check is off. The FCI's `q_d` is *not* changed by
+this: the sim still publishes the measured `q` there during a Cartesian motion.
+
+**Calibration (FER "Panda", FCI v5 / libfranka 0.9.2 semantics, left arm,
+2026-09-08).** Start `q` = [−0.046, −0.873, −0.104, −2.437, −0.051, 1.617,
+0.748] rad, Franka Hand mounted (`F_T_EE` = Rz(45°), [0, 0, 0.1034] m), EE
+pointing down at [0.2895, −0.0550, 0.4769] m; after 0.5 s at rest the EE
+position was ramped in +x (orientation constant, no elbow) by a libfranka-style
+`limitRate` with these (velocity, acceleration, jerk) budgets:
+
+| budget | outcome on the robot |
+| --- | --- |
+| 13 m/s², 6500 m/s³ (libfranka's own FER Cartesian limits) | refused within the first cycles, **29 and 30** |
+| 0.5 m/s, 2.5 m/s², 500 m/s³ | refused on the sixth ramp cycle, **29 alone**, when the per-cycle velocity increment reached 2.5 mm/s (steps 0.5, 1.5, 3, 5, 7.5, 10 µm; increments 0.5, 1.0, 1.5, 2.0, 2.5 mm/s). 0.3 m/s cap: identical |
+| 0.3 m/s, 1.5 m/s², 200 m/s³ | passed (reached 0.22 m/s before an unrelated `cartesian_reflex`) |
+| 0.4 m/s, 1.0 m/s², 100 m/s³ and 0.3 m/s, 0.5 m/s², 20 m/s³ | passed, 19 s each |
+
+The sim's IK at that `q` and tool (its forward kinematics reproduce the
+reported EE position to 0.2 mm) gives `J⁺x` = [0.33, 3.21, 0.02, 1.61, 0.22,
+1.59, 0.17] rad/m, so the ramp lands on joint 2. At the refused 2.5 mm/s
+increment joint 2's velocity changes by 8.01e−3 rad/s in one cycle — **8.01
+rad/s², 1.069×** the FER's `kMaxJointAcceleration` of 7.5 rad/s² for joint 2 —
+and at the accepted ramp's 1.5 mm/s increment by 4.81 rad/s², 0.641×. The
+threshold therefore lies in (0.641, 1.069) × the FER's per-joint table, and
+libfranka's published limit itself (1.0) sits inside that bracket and reproduces
+the observed trip cycle exactly (the bracket's geometric mean, 0.83, would trip
+one cycle early, at the 2.0 mm/s increment). The jerk side agrees: the 500 m/s³
+ramp puts 1603 rad/s³ on joint 2, 0.43× its 3750 rad/s³ (no 30, as observed),
+the 6500 m/s³ ramp 20 800 rad/s³, 5.5× (30, as observed). **So the calibrated
+factor is 1.0** and the thresholds are the FER's `kMaxJointAcceleration` /
+`kMaxJointJerk` as libfranka 0.9 publishes them, unscaled
+(`CARTESIAN_JOINT_DISCONTINUITY_FACTOR` in `franka_sim/limits/tables.py`).
+`tests/test_cartesian_joint_continuity.py` replays every row above through the
+sim's own IK.
+
+**Calibration still pending on the FR3.** The measurement is a Panda's.
+libfranka ≥ 0.10 publishes uniform 10 rad/s² / 5000 rad/s³ joint limits for the
+FR3, under which the same 2.5 m/s² ramp (8.0 rad/s² on joint 2) would pass;
+nothing has been measured on an FR3 for this check, and the precedence between
+the Cartesian and the joint side of one command is not pinned either. To re-tune
+without a code change:
+
+```bash
+run-franka-sim-server --enforce-motion-limits --joint-discontinuity-scale 0.8
+# or
+FRANKA_SIM_JOINT_DISCONTINUITY_SCALE=0.8 run-franka-sim-server --enforce-motion-limits
+```
+
+multiplies both joint-side tables (smaller is stricter; the flag wins over the
+variable). Like every other motion-limit check it warns always and aborts only
+under `--enforce-motion-limits`.
 
 ### `joint_velocity_violation` (3): the safety controller
 
@@ -978,10 +1064,12 @@ sim will now find it for you first if you ask it to.
   changing the servo gains, so a client that lowers its stiffness sees the same
   tracking it saw before. The Cartesian *motion generators* themselves are now
   driven — see [Cartesian control](compatibility.md#cartesian-control).
-* **The `cartesian_motion_generator_joint_*` errors** (indices 27–30), which are
-  about the joint trajectory the internal IK produces. The sim's IK produces one
-  now, but those four errors are not raised from it: a Cartesian command that
-  drives a joint into its stop currently surfaces as the safety controller's
+* **The remaining `cartesian_motion_generator_joint_*` errors** (indices 27
+  and 28, the joint *position* and *velocity* envelopes of the internal IK's
+  trajectory). 29 and 30 — the joint velocity and acceleration discontinuities —
+  are raised now, calibrated on a Panda and [pending on the
+  FR3](#the-joint-side-of-a-cartesian-command-29-30). A Cartesian command that
+  drives a joint into its stop still surfaces as the safety controller's
   `joint_velocity_violation` — which is also what real hardware reports when a
   Cartesian motion generator is driven into the joint position limits.
 

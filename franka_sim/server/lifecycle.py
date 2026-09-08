@@ -16,7 +16,6 @@ from pathlib import Path
 
 from franka_sim.comm_constraints import CommConstraintTracker
 from franka_sim.control_modes import ControlMode
-from franka_sim.motion_limits import MotionLimitChecker
 from franka_sim.robot_state import RobotState
 from franka_sim.server.constants import (
     GRIPPER_JOIN_TIMEOUT_S,
@@ -65,7 +64,7 @@ class LifecycleMixin:
         self.comm = CommConstraintTracker(enforce=self.enforce_comm_constraints)
         # ...and no latched motion-limit violation, no command history to
         # difference the new client's first command against.
-        self.motion_limits = MotionLimitChecker(enforce=self.enforce_motion_limits)
+        self.motion_limits = self._build_motion_limit_checker()
         self.robot_state = RobotState()  # Create fresh robot state for new connection
         # The fresh RobotState puts F_T_NE/NE_T_EE back to identity, so the
         # backend has to be told the EE frame moved back to the flange too --
