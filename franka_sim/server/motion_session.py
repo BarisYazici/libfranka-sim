@@ -413,7 +413,19 @@ class MotionSessionMixin:
 
         ``O_T_EE_c`` is the last pose the client commanded; ``O_T_EE_d`` is the
         one the generator is tracking, which in this sim is the same value
-        because a commanded pose is applied instantly.
+        because a commanded pose is applied instantly. ``O_dP_EE_c`` and
+        ``O_ddP_EE_c`` ride along with the pose: the robot reports "the last
+        commanded end effector twist" and "the last commanded end effector
+        acceleration" in the base frame (``include/franka/robot_state.h``), and
+        libfranka's pose ``limitRate`` takes the previous cycle's twist and
+        acceleration from exactly those two fields
+        (``src/rate_limiting.cpp``) before differencing its next command
+        against them. Left at zero, a client with rate limiting on is limited
+        from rest on *every* cycle -- it creeps at ``max_jerk * dt^2`` per
+        cycle and trips the jerk check the moment it stops -- so the numbers
+        come from the checker, which has already differenced the applied pose
+        the way libfranka does (:meth:`_publish_commanded_derivatives`,
+        :class:`~franka_sim.limits.differencing._PoseDifferentiator`).
         A *lost* cycle reaches this method too: the publish loop extrapolates the
         pose across it and dispatches the result down this same path
         (:meth:`_extrapolate_missed_cycle`), so both fields keep advancing along
@@ -454,6 +466,7 @@ class MotionSessionMixin:
             pose = list(command["O_T_EE_c"])
             self.robot_state.state["O_T_EE_c"] = pose
             self.robot_state.state["O_T_EE_d"] = pose
+            self._publish_commanded_derivatives("O_dP_EE_c", "O_ddP_EE_c")
         elif mode == LibfrankaMotionGeneratorMode.kCartesianVelocity:
             twist = list(command["O_dP_EE_c"])
             self.robot_state.state["O_dP_EE_c"] = twist
@@ -1083,14 +1096,15 @@ class MotionSessionMixin:
         # The Cartesian twin of the zero ``dq_d``/``tau_J_d`` that hold setpoint
         # publishes, and the arm-role counterpart of the mobile branch above: an
         # arm held by its internal controller is commanding no end-effector
-        # motion, so the twist it reports as commanded is zero. Only a
-        # ``kCartesianVelocity`` motion ever writes anything else here
+        # motion, so the twist and acceleration it reports as commanded are
+        # zero. Only a Cartesian motion ever writes anything else here
         # (:meth:`_echo_commanded_cartesian`), and every way such a motion can
         # end -- finished, reflex, StopMove, preemption, a client that vanishes
-        # -- arrives at this method, so this is the single place the twist has
-        # to be given back.
+        # -- arrives at this method, so this is the single place they have to
+        # be given back.
         self.robot_state.state["O_dP_EE_c"] = [0.0] * 6
         self.robot_state.state["O_dP_EE_d"] = [0.0] * 6
+        self.robot_state.state["O_ddP_EE_c"] = [0.0] * 6
 
     def _publish_hold_setpoint(self, joint_positions=None) -> Dict[str, Any]:
         """Report the internal controller's own setpoint in ``q_d``/``dq_d``/``tau_J_d``.

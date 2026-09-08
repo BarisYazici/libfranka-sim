@@ -2367,7 +2367,12 @@ class MotionLimitChecker:
         server is what lets a client predict what this module will compute.
 
         For a position generator that is ``(dq_d, ddq_d)``; for a velocity
-        generator ``(ddq_d, jerk)``; for the torque controller ``(dtau, ...)``.
+        generator ``(ddq_d, jerk)``; for the torque controller ``(dtau, ...)``;
+        for the Cartesian pose generator ``(O_dP_EE_c, O_ddP_EE_c)`` -- the
+        commanded twist and its acceleration, in the base frame, differenced
+        from the commanded poses exactly as libfranka's pose ``limitRate``
+        reconstructs them (see :class:`_PoseDifferentiator`). Zero on a
+        motion's opening command, which is a standstill by construction.
         """
         with self._lock:
             if not self._active:
@@ -2376,6 +2381,8 @@ class MotionLimitChecker:
                 return list(self._joint.first), list(self._joint.second)
             if self._mode is ControlMode.TORQUE:
                 return list(self._torque.first), list(self._torque.second)
+            if self._mode is ControlMode.CARTESIAN_POSE:
+                return list(self._pose.first), list(self._pose.second)
             return None
 
     def report(self, violation: Violation, *, enforced: bool) -> None:

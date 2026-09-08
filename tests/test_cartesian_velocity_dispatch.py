@@ -17,6 +17,7 @@ from franka_sim.franka_protocol import (
     MessageHeader,
     MotionGeneratorMode,
 )
+from franka_sim.motion_limits import DELTA_T
 
 BASE_TWIST = [0.25, -0.1, 0.0, 0.0, 0.0, 0.4]
 
@@ -954,6 +955,60 @@ def test_a_constant_commanded_twist_is_not_attenuated_by_the_client_filter():
     assert sent == pytest.approx(intended, rel=1e-6)
     # Nowhere near the 0.0386 m/s a zero reference produced on every cycle.
     assert sent > 0.99 * intended
+
+
+def test_a_pose_motion_echoes_the_commanded_twist_and_acceleration():
+    """During kCartesianPosition, ``O_dP_EE_c``/``O_ddP_EE_c`` are the stream's own.
+
+    libfranka's pose ``limitRate`` takes the previous cycle's commanded twist
+    and acceleration from these two fields and differences the next command
+    against them (``src/rate_limiting.cpp``). Left at the wire struct's zero, a
+    client with ``limit_rate`` on was limited from rest on every cycle: it crept
+    at ``max_jerk * dt^2`` per cycle and tripped the jerk check the moment its
+    target stopped moving. The values are the checker's own backward differences
+    of the applied pose -- the same numbers the next command will be judged
+    against -- so what the client reads back is what the sim will compute.
+    """
+    server, sim = _arm_server_with_pose()
+    header, payload = _move_request(
+        command_id=35, motion_generator_mode=MotionGeneratorMode.kCartesianPosition
+    )
+    server.handle_move_command(MagicMock(), header, payload)
+
+    acceleration = 0.4  # m/s^2 along z, from rest at MEASURED_POSE
+
+    def waypoint(cycle):
+        shifted = list(MEASURED_POSE)
+        shifted[14] += 0.5 * acceleration * (cycle * DELTA_T) ** 2
+        return shifted
+
+    def absorb(message_id):
+        command = _pose_command(waypoint(message_id - 1), message_id=message_id)
+        assert server._absorb_within_motion_limits(command, fresh=True)
+        server._dispatch_control_command(command)
+
+    absorb(1)
+    # The opening command is a standstill by construction: both echoes are zero.
+    assert list(server.robot_state.state["O_dP_EE_c"]) == pytest.approx([0.0] * 6)
+    assert list(server.robot_state.state["O_ddP_EE_c"]) == pytest.approx([0.0] * 6)
+
+    for message_id in range(2, 21):
+        absorb(message_id)
+
+    expected_velocity = (waypoint(19)[14] - waypoint(18)[14]) / DELTA_T
+    twist = list(server.robot_state.state["O_dP_EE_c"])
+    assert twist == pytest.approx([0.0, 0.0, expected_velocity, 0.0, 0.0, 0.0], abs=1e-9)
+    assert list(server.robot_state.state["O_ddP_EE_c"]) == pytest.approx(
+        [0.0, 0.0, acceleration, 0.0, 0.0, 0.0], abs=1e-6
+    )
+    # ...and the publish loop must not stomp on the echo the next millisecond.
+    _publish_one_cycle(server, sim)
+    assert list(server.robot_state.state["O_dP_EE_c"]) == pytest.approx(twist, abs=1e-9)
+
+    # The hold gives both back, exactly as it does the twist generator's echo.
+    server._switch_to_hold_position()
+    assert list(server.robot_state.state["O_dP_EE_c"]) == pytest.approx([0.0] * 6)
+    assert list(server.robot_state.state["O_ddP_EE_c"]) == pytest.approx([0.0] * 6)
 
 
 def test_the_freeze_is_stamped_before_the_generator_mode_is_published():

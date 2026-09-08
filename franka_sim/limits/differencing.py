@@ -610,7 +610,7 @@ class _PoseDifferentiator:
 
     * **translation** -- the plain backward difference of the position column,
       which is a linear velocity in m/s;
-    * **rotation** -- the axis-angle of ``R_{k-1}^T R_k`` divided by the
+    * **rotation** -- the axis-angle of ``R_k R_{k-1}^T`` divided by the
       interval, which is an angular velocity in rad/s. Composing the *relative*
       rotation and taking its log is the only difference that means anything for
       a rotation: subtracting two rotation matrices, or two of their log-maps,
@@ -622,9 +622,18 @@ class _PoseDifferentiator:
     ``kMaxTranslational*`` / ``kMaxRotational*`` for the same reason: that is how
     ``limitRate`` treats them (``src/rate_limiting.cpp:13-55``).
 
-    The angular velocity is expressed in the *previous* commanded frame. Nothing
-    here depends on that choice: every comparison is on the norm, which the
-    frame does not change.
+    The angular velocity is expressed in the **base** frame -- ``R_k R_{k-1}^T``,
+    not ``R_{k-1}^T R_k`` -- because that is the frame libfranka's Cartesian pose
+    ``limitRate`` reconstructs it in (``src/rate_limiting.cpp``:
+    ``AngleAxisd(commanded.rotation() * last_commanded.rotation().transpose())``)
+    and the frame ``O_dP_EE_c``/``O_ddP_EE_c`` are documented in. The frame is
+    invisible to the *velocity* comparison, which is on the norm, but not to
+    the acceleration and jerk behind it: those are differences of two angular
+    velocity vectors, and two vectors expressed in different frames difference
+    to something else. :attr:`first` and :attr:`second` are also what the server
+    echoes back to the client as ``O_dP_EE_c`` and ``O_ddP_EE_c``, which the
+    client's limiter then differences its next command against, so the two
+    sides have to agree on the frame exactly.
     """
 
     def __init__(self):
@@ -687,7 +696,7 @@ class _PoseDifferentiator:
         step = cycles * DELTA_T
         matrix = transform_matrix(pose)
         linear = (matrix[:3, 3] - self.translation) / step
-        angular = rotation_log(self.rotation.T @ matrix[:3, :3]) / step
+        angular = rotation_log(matrix[:3, :3] @ self.rotation.T) / step
         velocity = [float(value) for value in (*linear, *angular)]
         acceleration = [(velocity[i] - self.first[i]) / step for i in range(6)]
         jerk = [(acceleration[i] - self.second[i]) / step for i in range(6)]
@@ -726,12 +735,13 @@ class _PoseDifferentiator:
 
         **The rotation composition, which is a choice.** The increment is the
         axis-angle vector ``theta = (omega + alpha dt) dt`` -- the rotational
-        half of the same semi-implicit integral -- applied on the *right*:
-        ``R_k = R_{k-1} exp(skew(theta))``. Right-multiplication is not
+        half of the same semi-implicit integral -- applied on the *left*:
+        ``R_k = exp(skew(theta)) R_{k-1}``. Left-multiplication is not
         arbitrary: :meth:`derivatives` recovers an angular velocity as
-        ``log(R_{k-1}^T R_k) / dt``, i.e. in the previous commanded frame, so
-        composing on the right is precisely the inverse of the differencing this
-        class already does. Feed the result straight back into
+        ``log(R_k R_{k-1}^T) / dt``, i.e. in the base frame, so composing on
+        the left is precisely the inverse of the differencing this class
+        already does -- and the same integration libfranka's pose ``limitRate``
+        performs on its limited twist. Feed the result straight back into
         :meth:`derivatives` and the angular velocity that comes out is exactly
         the ``omega + alpha dt`` :meth:`commit` stores, matching the
         translational half -- so a pose gap resumes clean with a non-zero
@@ -754,7 +764,7 @@ class _PoseDifferentiator:
         linear = velocity + acceleration * DELTA_T
         angular = omega + alpha * DELTA_T
         matrix = np.eye(4)
-        matrix[:3, :3] = self.rotation @ rotation_exp(angular * DELTA_T)
+        matrix[:3, :3] = rotation_exp(angular * DELTA_T) @ self.rotation
         matrix[:3, 3] = self.translation + linear * DELTA_T
         return [float(value) for value in matrix.T.flatten()]
 
@@ -764,7 +774,7 @@ class _PoseDifferentiator:
         Not :meth:`advance`, for the reason in
         :meth:`_Differentiator.commit_position`. The velocity advances by the
         frozen acceleration -- linear and angular alike, the angular one being
-        the body-frame rate the next increment is built from.
+        the base-frame rate the next increment is built from.
         """
         matrix = transform_matrix(pose)
         self.rotation = np.array(matrix[:3, :3])

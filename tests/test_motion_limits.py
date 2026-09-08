@@ -913,6 +913,79 @@ def pose_checker(q=None, o_t_ee=None, **state_fields):
     return checker
 
 
+def rotation_about_x(angle):
+    """A rotation of ``angle`` about x, as a 3x3 matrix."""
+    cos, sin = math.cos(angle), math.sin(angle)
+    return np.array([[1.0, 0.0, 0.0], [0.0, cos, -sin], [0.0, sin, cos]])
+
+
+def test_a_pose_motion_reports_the_twist_and_acceleration_libfranka_will_difference_against():
+    """``applied_derivatives`` on a pose motion is ``(O_dP_EE_c, O_ddP_EE_c)``.
+
+    These two are what the server echoes back during a ``kCartesianPosition``
+    motion, and what libfranka's pose ``limitRate`` reads as the previous
+    cycle's twist and acceleration before differencing the next command
+    (``src/rate_limiting.cpp``: ``last_O_dP_EE_c``, ``last_O_ddP_EE_c``). So
+    they have to be computed *its* way: translation ``(p_k - p_{k-1}) / dt``,
+    rotation as the axis-angle of ``R_k R_{k-1}^T`` over ``dt`` -- the **base**
+    frame -- and the acceleration as the plain difference of the two twists.
+    The frame is the part a norm-only check never notices, which is why the
+    stream below opens in a tilted orientation and rotates about the *base* z:
+    the body-frame rate ``R_{k-1}^T R_k`` of the same motion points along a
+    different axis, and differencing rates expressed in that frame instead
+    would hand the client an acceleration it cannot reproduce.
+    """
+    tilt = rotation_about_x(math.pi / 2)  # the frame the motion opens in
+    linear, angular = 0.4, 1.5  # m/s^2 and rad/s^2
+
+    def waypoint(cycle):
+        t = cycle * DELTA_T
+        return pose(
+            0.3, 0.0, 0.5 + 0.5 * linear * t * t,
+            rotation=rotation_about_z(0.5 * angular * t * t) @ tilt,
+        )
+
+    checker = MotionLimitChecker()
+    checker.start_motion(ControlMode.CARTESIAN_POSE, robot_state_at(O_T_EE=waypoint(0)))
+    assert checker.applied_derivatives() == ([0.0] * 6, [0.0] * 6)
+
+    checker.note_published(1)
+    opening = command(message_id=1, O_T_EE_c=waypoint(0))
+    assert checker.check(opening) is None
+    checker.record(opening)
+    # The opening command is a standstill: nothing to difference yet.
+    assert checker.applied_derivatives() == ([0.0] * 6, [0.0] * 6)
+
+    def libfranka_twist(cycle):
+        earlier = np.asarray(waypoint(cycle - 1)).reshape(4, 4).T
+        later = np.asarray(waypoint(cycle)).reshape(4, 4).T
+        translational = (later[:3, 3] - earlier[:3, 3]) / DELTA_T
+        rotational = rotation_log(later[:3, :3] @ earlier[:3, :3].T) / DELTA_T
+        return [*translational, *rotational]
+
+    for cycle in range(2, 41):
+        checker.note_published(cycle)
+        received = command(message_id=cycle, O_T_EE_c=waypoint(cycle - 1))
+        assert checker.check(received) is None, f"the stream is not conforming at {cycle}"
+        checker.record(received)
+
+    twist, acceleration = checker.applied_derivatives()
+    expected_twist = libfranka_twist(39)
+    expected_acceleration = [(a - b) / DELTA_T for a, b in zip(expected_twist, libfranka_twist(38))]
+    assert twist == pytest.approx(expected_twist, abs=1e-9)
+    assert acceleration == pytest.approx(expected_acceleration, abs=1e-6)
+    # ...which is a rate about the base z axis, accelerating at ``angular``:
+    assert twist[3:6] == pytest.approx([0.0, 0.0, angular * 38.5 * DELTA_T], abs=1e-9)
+    assert acceleration[2] == pytest.approx(linear, abs=1e-6)
+    assert acceleration[3:6] == pytest.approx([0.0, 0.0, angular], abs=1e-6)
+    # The body-frame reading of the same motion is a rate about the body *y*
+    # axis (the tilt maps base z onto body -y); that is the vector the checker
+    # used to hand out, and it is not what libfranka computes.
+    body_rate = rotation_log(tilt.T @ rotation_about_z(twist[5] * DELTA_T) @ tilt) / DELTA_T
+    assert abs(body_rate[1]) == pytest.approx(twist[5], abs=1e-9)
+    assert twist[3:6] != pytest.approx(list(body_rate), abs=1e-6)
+
+
 def test_a_pose_step_is_a_cartesian_velocity_discontinuity():
     """A mid-motion ``O_T_EE_c`` step of 1 m in z -> index 19.
 
@@ -3432,12 +3505,11 @@ def test_a_pose_gap_with_a_non_zero_rotational_acceleration_resumes_clean():
 
     # The stream really is accelerating in *both* halves -- differenced here the
     # way the checker does it, so the premise of the test is on the record and a
-    # plateau cannot creep back into it. (``applied_derivatives`` reports the
-    # joint generators only, which is why this is spelled out.)
+    # plateau cannot creep back into it.
     def rate(cycle):
         earlier = np.asarray(waypoint(cycle - 1)).reshape(4, 4).T
         later = np.asarray(waypoint(cycle)).reshape(4, 4).T
-        angular_rate = rotation_log(earlier[:3, :3].T @ later[:3, :3]) / DELTA_T
+        angular_rate = rotation_log(later[:3, :3] @ earlier[:3, :3].T) / DELTA_T
         return (later[2, 3] - earlier[2, 3]) / DELTA_T, float(angular_rate[2])
 
     assert (rate(59)[0] - rate(58)[0]) / DELTA_T == pytest.approx(linear, abs=1e-6)
