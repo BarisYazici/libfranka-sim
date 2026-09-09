@@ -333,8 +333,10 @@ Details worth knowing:
   acceleration steps are held to the robot's per-joint limits, which is what
   raises `cartesian_motion_generator_joint_velocity_discontinuity` (29) /
   `..._joint_acceleration_discontinuity` (30) on a real Franka for a Cartesian
-  ramp that is well inside the Cartesian limits. Calibrated on a Panda, pending
-  on the FR3, tunable with `--joint-discontinuity-scale`; see [the joint
+  ramp that is well inside the Cartesian limits. The limits are the simulated
+  robot's: the FER's per-joint tables under FCI v5 (calibrated on a Panda), the
+  FR3's published 10 rad/s² / 5000 rad/s³ under v10 (not yet confirmed against
+  an FR3); tunable with `--joint-discontinuity-scale`; see [the joint
   side](robot-state.md#the-joint-side-of-a-cartesian-command-29-30).
 * **The elbow steers the null space.** `elbow_c[0]` is the redundancy angle
   (joint 3 on an FR3) and is chased inside the Jacobian's null space, so it

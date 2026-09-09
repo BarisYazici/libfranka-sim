@@ -89,6 +89,7 @@ class FrankaSimServer(
         gripper_physics: bool = False,
         gripper_object_width: Optional[float] = None,
         mobile_base: bool = False,
+        protocol_version: int = 10,
         physics: str = DEFAULT_PHYSICS,
         enforce_comm_constraints: Optional[bool] = None,
         enforce_motion_limits: Optional[bool] = None,
@@ -116,6 +117,10 @@ class FrankaSimServer(
             mobile_base: Serve a swerve mobile base instead of an arm. The
                 simulator must implement ``update_base_twist`` and the client
                 drives it with the kCartesianVelocity motion generator.
+            protocol_version: FCI version of the simulated robot -- ``10``
+                (FR3, libfranka >= 0.10, the default) or ``5`` (FER / Panda,
+                libfranka 0.9). Selects the robot's limit tables for the
+                joint-side Cartesian checks (errors 29/30).
             enforce_comm_constraints: Whether a run of lost command cycles
                 aborts the motion with ``communication_constraints_violation``.
                 ``None`` (the default) takes it from
@@ -288,6 +293,8 @@ class FrankaSimServer(
         #: Kept on the server because :meth:`reset_state` rebuilds the checker
         #: per connection.
         self.joint_discontinuity_scale = joint_discontinuity_scale
+        #: FCI version of the simulated robot (10 = FR3, 5 = FER); see the ctor.
+        self.protocol_version = protocol_version
         self.motion_limits = self._build_motion_limit_checker()
 
         # Build the physics backend unless one was injected.

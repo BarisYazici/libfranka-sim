@@ -987,7 +987,7 @@ def test_a_pose_motion_reports_the_twist_and_acceleration_libfranka_will_differe
 
 
 def test_a_pose_stream_saturating_the_limiter_against_the_wire_echo_is_not_a_violation():
-    """libfranka's pose ``limitRate``, run at the acceleration limit, never trips.
+    """The pose ``limitRate`` of libfranka, run at the acceleration limit, never trips.
 
     The client only ever sees ``O_T_EE_c``/``O_dP_EE_c``/``O_ddP_EE_c`` as
     float32 (``rbk_types.h``: every commanded echo is a ``floatarray``), and

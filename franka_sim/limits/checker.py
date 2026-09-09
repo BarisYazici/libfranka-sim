@@ -34,14 +34,12 @@ from franka_sim.limits.tables import (
     DELTA_T,
     ELBOW_POSITION_LIMITS,
     ERROR_NAMES,
-    JOINT_ACCELERATION_DISCONTINUITY_LIMIT,
     JOINT_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_POSITION_LIMITS_VIOLATION_INDEX,
     JOINT_MOTION_GENERATOR_VELOCITY_DISCONTINUITY_INDEX,
     JOINT_MOTION_GENERATOR_VELOCITY_LIMITS_VIOLATION_INDEX,
     JOINT_POSITION_LIMITS,
     JOINT_POSITION_MOTION_GENERATOR_START_POSE_INVALID_INDEX,
-    JOINT_VELOCITY_DISCONTINUITY_LIMIT,
     JOINT_VELOCITY_VIOLATION_INDEX,
     MAX_COALESCED_CYCLES,
     MAX_ELBOW_ACCELERATION,
@@ -69,6 +67,7 @@ from franka_sim.limits.tables import (
     START_POSE_TOLERANCE,
     START_VELOCITY_TOLERANCE,
     TAU_J_RANGE_VIOLATION_INDEX,
+    joint_discontinuity_limits,
     joint_discontinuity_scale_from_env,
     logger,
     lower_joint_velocity_limits,
@@ -198,6 +197,7 @@ class MotionLimitChecker:
         self_collision_closing_distance: float = SELF_COLLISION_CLOSING_DISTANCE,
         joint_kinematics: Optional[Callable[[], Any]] = None,
         joint_discontinuity_scale: Optional[float] = None,
+        protocol_version: int = 10,
     ):
         """Build a checker; see the module constants for the defaults.
 
@@ -211,9 +211,9 @@ class MotionLimitChecker:
         joint trajectory to judge. See
         :meth:`_check_cartesian_joint_continuity`.
 
-        ``joint_discontinuity_scale`` multiplies both joint-side thresholds
-        (:data:`JOINT_VELOCITY_DISCONTINUITY_LIMIT`,
-        :data:`JOINT_ACCELERATION_DISCONTINUITY_LIMIT`); None reads
+        ``protocol_version`` (FCI 10 = FR3, 5 = FER) picks the robot whose tables
+        that check uses (:func:`~franka_sim.limits.tables.joint_discontinuity_limits`);
+        ``joint_discontinuity_scale`` multiplies both, None reading
         :data:`~franka_sim.limits.tables.JOINT_DISCONTINUITY_SCALE_ENV_VAR`.
         """
         self._lock = threading.Lock()
@@ -224,6 +224,7 @@ class MotionLimitChecker:
             if joint_discontinuity_scale is None
             else float(joint_discontinuity_scale)
         )
+        self._joint_side_limits = joint_discontinuity_limits(protocol_version)
         #: The solver :attr:`_joint_kinematics` answered for the running
         #: Cartesian motion, or None (no backend IK, or a joint generator).
         self._joint_solver: Any = None
@@ -2228,21 +2229,19 @@ class MotionLimitChecker:
         a fifth of libfranka's Cartesian acceleration limit, is refused on a
         real FER: at the ready pose the ramp lands almost entirely on joint 2
         (``J^+ x`` = 3.2 rad/m there), whose acceleration limit is 7.5 rad/s^2.
-        See :data:`~franka_sim.limits.tables.JOINT_VELOCITY_DISCONTINUITY_LIMIT`
-        for the calibration that pins the thresholds.
+        Which robot's tables: :func:`~franka_sim.limits.tables.joint_discontinuity_limits`.
 
         The arithmetic is the joint-position generator's, applied to the IK
-        solution instead of to ``q_c``: backward differences over the cycles
-        the command covers, the second difference against
-        :data:`JOINT_VELOCITY_DISCONTINUITY_LIMIT` (29 -- the interface-relative
-        name, one derivative above the commanded *pose*, exactly as 14 is for
-        ``q_c``) and the third against
-        :data:`JOINT_ACCELERATION_DISCONTINUITY_LIMIT` (30). A command that
-        breaks both latches both from the one abort, which is what hardware
-        does for a ramp at libfranka's own Cartesian limits. On the Cartesian
-        *velocity* interface the same two differences are an acceleration and
-        a jerk of a commanded velocity, so both land on 30 -- the rule that
-        puts ``dq_c``'s two on 15; no hardware observation pins that half.
+        solution instead of to ``q_c``: backward differences over the cycles the
+        command covers, the second difference against the joint acceleration
+        table (29 -- the interface-relative name, one derivative above the
+        commanded *pose*, exactly as 14 is for ``q_c``) and the third against
+        the joint jerk table (30). A command that breaks both latches both from
+        the one abort, which is what hardware does for a ramp at libfranka's own
+        Cartesian limits. On the Cartesian *velocity* interface the same two
+        differences are an acceleration and a jerk of a commanded velocity, so
+        both land on 30 -- the rule that puts ``dq_c``'s two on 15; no hardware
+        observation pins that half.
 
         Never on a motion's opening command (there is nothing to difference:
         the record rebases the history on it, as the pose history is), and
@@ -2259,11 +2258,12 @@ class MotionLimitChecker:
             return None
         _, acceleration, jerk = self._ik_joint.derivatives(solution, cycles)
         scale = self.joint_discontinuity_scale
+        velocity_limits, acceleration_limits = self._joint_side_limits
         pose_interface = self._mode is ControlMode.CARTESIAN_POSE
         signal = "IK of " + ("O_T_EE_c" if pose_interface else "O_dP_EE_c")
         velocity_violation = self._check_per_joint(
             acceleration,
-            [limit * scale for limit in JOINT_VELOCITY_DISCONTINUITY_LIMIT],
+            [limit * scale for limit in velocity_limits],
             (
                 CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX
                 if pose_interface
@@ -2274,7 +2274,7 @@ class MotionLimitChecker:
         )
         acceleration_violation = self._check_per_joint(
             jerk,
-            [limit * scale for limit in JOINT_ACCELERATION_DISCONTINUITY_LIMIT],
+            [limit * scale for limit in acceleration_limits],
             CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX,
             signal,
             "rad/s^3",

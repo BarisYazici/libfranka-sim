@@ -555,8 +555,8 @@ when a single cycle breaks both. See
 | Cartesian pose | ‖a‖ / ‖α‖ | 9 − 1e−3 m/s², 17 − 1e−3 rad/s² | `cartesian_motion_generator_velocity_discontinuity` (19) |
 | Cartesian pose | ‖v‖ / ‖ω‖ | `kMaxTranslationalVelocity` 3 − 1e−3 m/s, `kMaxRotationalVelocity` 2.5 − 1e−3 rad/s | `cartesian_motion_generator_velocity_limits_violation` (18) |
 | Cartesian pose | ‖jerk‖ | 4500 − 1e−3 m/s³, 8500 − 1e−3 rad/s³ | `cartesian_motion_generator_acceleration_discontinuity` (20) |
-| Cartesian pose | per-cycle change of the **IK joint velocity** of `O_T_EE_c`, / dt | per joint, the FER's `kMaxJointAcceleration` 15 / 7.5 / 10 / 12.5 / 15 / 20 / 20 rad/s² × `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE` — [calibrated](#the-joint-side-of-a-cartesian-command-29-30) | `cartesian_motion_generator_joint_velocity_discontinuity` (29) |
-| Cartesian pose | per-cycle change of the **IK joint acceleration**, / dt | per joint, the FER's `kMaxJointJerk` 7500 / 3750 / 5000 / 6250 / 7500 / 10000 / 10000 rad/s³ × the same scale; latched *together with* 29 when one command breaks both | `cartesian_motion_generator_joint_acceleration_discontinuity` (30) |
+| Cartesian pose | per-cycle change of the **IK joint velocity** of `O_T_EE_c`, / dt | per joint, the simulated robot's `kMaxJointAcceleration`: FR3 (FCI v10) 10 rad/s² on every joint, FER (v5) 15 / 7.5 / 10 / 12.5 / 15 / 20 / 20 rad/s², × `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE` — [calibration](#the-joint-side-of-a-cartesian-command-29-30) | `cartesian_motion_generator_joint_velocity_discontinuity` (29) |
+| Cartesian pose | per-cycle change of the **IK joint acceleration**, / dt | per joint, the simulated robot's `kMaxJointJerk`: FR3 5000 rad/s³ on every joint, FER 7500 / 3750 / 5000 / 6250 / 7500 / 10000 / 10000 rad/s³, × the same scale; latched *together with* 29 when one command breaks both | `cartesian_motion_generator_joint_acceleration_discontinuity` (30) |
 | Cartesian pose / velocity | commanded `elbow_c[0]` in range | joint 3's own FR3 URDF range, ±2.9065 rad — `elbow[0]` *is* joint 3's angle, and this is the bound Franka's 0.3 rad/s² elbow ramp reaches first (at ~4.49 s, half a second before the velocity cap below) | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | Cartesian pose / velocity | elbow velocity, acceleration, jerk | `kMaxElbowVelocity` 1.5 − 1e−3 rad/s, `kMaxElbowAcceleration` 10 − 1e−3 rad/s², `kMaxElbowJerk` 5000 − 1e−3 rad/s³ | `cartesian_motion_generator_elbow_limit_violation` (17) |
 | torque | \|τ\| | FR3 URDF `<limit effort=>`: 87/87/87/87/12/12/12 Nm | `tau_J_range_violation` (34) |
@@ -640,17 +640,23 @@ Gauss-Newton from the previous cycle's solution on the same EE frame the arm is
 driven in, `F_T_EE` included), the solutions are differenced with the same
 backward Euler as `q_c`, and
 
-* the per-cycle change of the IK joint velocity, over `dt`, is held to
-  `JOINT_VELOCITY_DISCONTINUITY_LIMIT` → **29**
+* the per-cycle change of the IK joint velocity, over `dt`, is held to the
+  robot's per-joint `kMaxJointAcceleration` → **29**
   `cartesian_motion_generator_joint_velocity_discontinuity`,
-* the per-cycle change of the IK joint acceleration, over `dt`, to
-  `JOINT_ACCELERATION_DISCONTINUITY_LIMIT` → **30**
+* the per-cycle change of the IK joint acceleration, over `dt`, to its
+  `kMaxJointJerk` → **30**
   `cartesian_motion_generator_joint_acceleration_discontinuity`,
 
-interface-relative, as 14/15 are for `q_c`. A command that breaks both latches
-both bits from the one abort. The check runs after the pose's own Cartesian
-checks (a step that breaks both is reported as 19, the Cartesian name — a sim
-ordering, not a hardware pin) and before the elbow's. It is silent on a motion's
+where *the robot* is the one behind the FCI version the server is built for
+(`FrankaSimServer(protocol_version=...)`, `joint_discontinuity_limits` in
+`franka_sim/limits/tables.py`): under v10 the FR3's uniform 10 rad/s² / 5000
+rad/s³ (libfranka ≥ 0.10), under v5 the FER's 15 / 7.5 / 10 / 12.5 / 15 / 20 /
+20 rad/s² and 7500 / 3750 / 5000 / 6250 / 7500 / 10000 / 10000 rad/s³
+(libfranka 0.9). The check is interface-relative, as 14/15 are for `q_c`; a
+command that breaks both latches both bits from the one abort. It runs after
+the pose's own Cartesian checks (a step that breaks both is reported as 19, the
+Cartesian name — a sim ordering, not a hardware pin) and before the elbow's. It
+is silent on a motion's
 opening command (the joint history is rebased on it, as the pose history is),
 honours the same two-command re-seed window after a [held
 reference](#what-the-sim-does-with-a-lost-cycle), follows extrapolated poses
@@ -686,17 +692,18 @@ the observed trip cycle exactly (the bracket's geometric mean, 0.83, would trip
 one cycle early, at the 2.0 mm/s increment). The jerk side agrees: the 500 m/s³
 ramp puts 1603 rad/s³ on joint 2, 0.43× its 3750 rad/s³ (no 30, as observed),
 the 6500 m/s³ ramp 20 800 rad/s³, 5.5× (30, as observed). **So the calibrated
-factor is 1.0** and the thresholds are the FER's `kMaxJointAcceleration` /
-`kMaxJointJerk` as libfranka 0.9 publishes them, unscaled
-(`CARTESIAN_JOINT_DISCONTINUITY_FACTOR` in `franka_sim/limits/tables.py`).
-`tests/test_cartesian_joint_continuity.py` replays every row above through the
-sim's own IK.
+factor is 1.0** and under FCI v5 the thresholds are the FER's
+`kMaxJointAcceleration` / `kMaxJointJerk` as libfranka 0.9 publishes them,
+unscaled (`CARTESIAN_JOINT_DISCONTINUITY_FACTOR` in
+`franka_sim/limits/tables.py`). `tests/test_cartesian_joint_continuity.py`
+replays every row above through the sim's own IK, as an FER.
 
-**Calibration still pending on the FR3.** The measurement is a Panda's.
-libfranka ≥ 0.10 publishes uniform 10 rad/s² / 5000 rad/s³ joint limits for the
-FR3, under which the same 2.5 m/s² ramp (8.0 rad/s² on joint 2) would pass;
-nothing has been measured on an FR3 for this check, and the precedence between
-the Cartesian and the joint side of one command is not pinned either. To re-tune
+**The FR3 uses its published limits, not yet confirmed against an FR3.** Under
+FCI v10 the tables are libfranka ≥ 0.10's uniform 10 rad/s² / 5000 rad/s³ at
+the same factor 1.0, under which the 2.5 m/s² ramp above (8.0 rad/s² on joint
+2) passes and a 3.5 m/s² one (11.2 rad/s²) is refused. Nothing has been
+measured on an FR3 for this check, and the precedence between the Cartesian and
+the joint side of one command is not pinned either. To re-tune either robot
 without a code change:
 
 ```bash

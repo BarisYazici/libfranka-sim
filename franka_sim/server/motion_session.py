@@ -1150,14 +1150,16 @@ class MotionSessionMixin:
         """One :class:`~franka_sim.motion_limits.MotionLimitChecker` for a connection.
 
         Shared by the constructor and :meth:`reset_state`, so both hand the
-        checker the same two things beyond the enforcement switch: the
-        backend's joint-space solver (as a factory, asked at each Cartesian
-        ``Move``) and the joint-side threshold scale.
+        checker the same things beyond the enforcement switch: the backend's
+        joint-space solver (as a factory, asked at each Cartesian ``Move``),
+        the joint-side threshold scale and the FCI version that picks the
+        robot's joint-side tables.
         """
         return MotionLimitChecker(
             enforce=self.enforce_motion_limits,
             joint_kinematics=self._joint_space_solver,
             joint_discontinuity_scale=self.joint_discontinuity_scale,
+            protocol_version=self.protocol_version,
         )
 
     def _joint_space_solver(self):

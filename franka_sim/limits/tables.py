@@ -15,7 +15,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -183,94 +183,68 @@ FACTOR_CARTESIAN_ROTATION_POSE_INTERFACE = 0.99
 
 # -- the joint side of a Cartesian command ------------------------------------
 #
-# The controller runs inverse kinematics on every commanded ``O_T_EE_c`` and
-# judges the joint trajectory that comes out; a Cartesian stream that is well
-# inside the Cartesian limits can still be refused because of what it asks one
-# joint to do. The two thresholds below are what that judgement is emulated
-# with (:meth:`franka_sim.limits.checker.MotionLimitChecker
-# ._check_cartesian_joint_continuity`): the per-cycle *change* of the IK joint
-# velocity, divided by the cycle, against
-# :data:`JOINT_VELOCITY_DISCONTINUITY_LIMIT` (-> error 29), and the per-cycle
-# change of the IK joint acceleration against
-# :data:`JOINT_ACCELERATION_DISCONTINUITY_LIMIT` (-> error 30).
+# The controller solves every commanded ``O_T_EE_c`` to joint space and holds
+# the per-cycle change of the IK joint velocity (rad/s^2 -> error 29) and of
+# the IK joint acceleration (rad/s^3 -> error 30) to per-joint limits
+# (:meth:`~franka_sim.limits.checker.MotionLimitChecker
+# ._check_cartesian_joint_continuity`). Which robot's limits depends on the
+# FCI version the server speaks: :func:`joint_discontinuity_limits`.
 #
-# **Calibration (FER "Panda", FCI v5 / libfranka 0.9.2 semantics, left arm,
-# 2026-09-08).** Start ``q`` = [-0.046, -0.873, -0.104, -2.437, -0.051, 1.617,
-# 0.748] rad, Franka Hand mounted (``F_T_EE`` = Rz(45 deg), [0, 0, 0.1034] m),
-# EE pointing down at [0.2895, -0.0550, 0.4769] m. After 0.5 s at rest the EE
-# position was ramped in +x, orientation constant, no elbow, by a libfranka-style
-# ``limitRate`` with these (velocity, acceleration, jerk) budgets:
-#
-# * 13 m/s^2, 6500 m/s^3 (libfranka's own FER Cartesian limits): refused within
-#   the first cycles with **both** 29 and 30.
-# * 0.5 m/s, 2.5 m/s^2, 500 m/s^3: refused on the sixth ramp cycle with **29
-#   alone**, i.e. when the per-cycle EE velocity increment reached 2.5 mm/s
-#   (steps 0.5, 1.5, 3, 5, 7.5, 10 um; increments 0.5, 1.0, 1.5, 2.0, 2.5 mm/s).
-#   0.3 m/s cap: identical, so the velocity cap is irrelevant.
-# * 0.3 m/s, 1.5 m/s^2, 200 m/s^3: passed (ramp reached 0.22 m/s).
-# * 0.4 m/s, 1.0 m/s^2, 100 m/s^3 and 0.3 m/s, 0.5 m/s^2, 20 m/s^3: passed, 19 s.
-#
-# The sim's own IK at that ``q`` and tool (``MujocoFrankaSim.joint_space_solver``;
-# its forward kinematics reproduce the robot's reported EE position to 0.2 mm)
-# gives ``J^+ x`` = [0.33, 3.21, 0.02, 1.61, 0.22, 1.59, 0.17] rad/m, so joint 2
-# carries the ramp. At the refused 2.5 mm/s increment its velocity changes by
-# 8.01e-3 rad/s in one cycle -- **8.01 rad/s^2, 1.069x libfranka's 7.5 rad/s^2**
-# for joint 2 -- and at the passing ramp's 1.5 mm/s increment by 4.81 rad/s^2,
-# 0.641x. The threshold therefore lies in (0.641, 1.069) x the per-joint
-# ``kMaxJointAcceleration`` of the FER, and libfranka's published limit itself
-# (factor 1.0) sits inside that bracket and reproduces the observed trip cycle
-# exactly; the geometric mean of the bracket (0.83) would have tripped one
-# cycle early, at the 2.0 mm/s increment. The jerk side agrees: the 500 m/s^3
-# ramp makes 1603 rad/s^3 on joint 2 (0.43x its 3750 rad/s^3, no 30 -- as
-# observed) and the 6500 m/s^3 ramp 20 800 rad/s^3 (5.5x, 30 latched -- as
-# observed). So the calibrated factor is 1.0 and the tables below are the FER's
-# per-joint limits as libfranka 0.9 publishes them, *unscaled*.
-#
-# **Open on the FR3.** The calibration is a Panda's. libfranka >= 0.10 publishes
-# uniform 10 rad/s^2 / 5000 rad/s^3 joint limits for the FR3, under which the
-# same 2.5 m/s^2 ramp (8.0 rad/s^2 on joint 2) would pass; nothing has been
-# measured on an FR3 for this check. :data:`JOINT_DISCONTINUITY_SCALE_ENV_VAR`
-# is the knob for re-calibrating without a code change.
+# Calibration: FER (Panda, FCI v5), left arm, 2026-09-08 -- a +x ``limitRate``
+# ramp at 2.5 m/s^2 / 500 m/s^3 puts 8.01 rad/s^2 on joint 2 (1.069x its
+# 7.5) and was refused with 29; 1.5 m/s^2 / 200 m/s^3 (4.81 rad/s^2, 0.641x)
+# passed. Factor 1.0 sits in that bracket and reproduces the trip cycle, so
+# the FER tables are used unscaled. The FR3 uses libfranka >= 0.10's published
+# limits at the same factor 1.0; not yet confirmed against an FR3. The record
+# is in ``docs/robot-state.md``.
 
-#: The FER's ``franka::kMaxJointAcceleration`` (libfranka 0.9,
-#: ``include/franka/rate_limiting.h``), rad/s^2 per joint. Kept apart from
-#: :data:`MAX_JOINT_ACCELERATION` (the FR3's uniform 10) on purpose: the
-#: joint-side Cartesian check is calibrated against a Panda, see above.
+#: The FER's ``franka::kMaxJointAcceleration`` (libfranka 0.9), rad/s^2.
 LIBFRANKA_FER_JOINT_ACCELERATION_LIMITS = (15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0)
 
-#: The FER's ``franka::kMaxJointJerk`` (libfranka 0.9), rad/s^3 per joint.
+#: The FER's ``franka::kMaxJointJerk`` (libfranka 0.9), rad/s^3.
 LIBFRANKA_FER_JOINT_JERK_LIMITS = (7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0)
 
-#: Calibrated multiplier on the two FER tables above; 1.0 per the calibration
-#: note. Change *this* (or set :data:`JOINT_DISCONTINUITY_SCALE_ENV_VAR` at run
-#: time) when a new measurement moves the bracket.
+#: Calibrated multiplier on the tables above: 1.0 on the FER (measured), 1.0
+#: on the FR3 (published, unconfirmed). Run-time re-tuning is
+#: :data:`JOINT_DISCONTINUITY_SCALE_ENV_VAR`.
 CARTESIAN_JOINT_DISCONTINUITY_FACTOR = 1.0
 
-#: Bound on the per-cycle change of the IK joint velocity of a Cartesian *pose*
-#: stream, divided by the cycle (rad/s^2, per joint) -- the joint-space
-#: acceleration limit that latches
-#: :data:`CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX` (29).
-#: Named after the error it raises, the way the enum names it.
-JOINT_VELOCITY_DISCONTINUITY_LIMIT = tuple(
-    CARTESIAN_JOINT_DISCONTINUITY_FACTOR * limit
-    for limit in LIBFRANKA_FER_JOINT_ACCELERATION_LIMITS
-)
 
-#: Bound on the per-cycle change of the IK joint acceleration, divided by the
-#: cycle (rad/s^3, per joint) -- the joint-space jerk limit that latches
-#: :data:`CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX`
-#: (30). Same factor as the acceleration table, on the FER jerk limits: the
-#: 500 / 6500 m/s^3 observations above bracket it at (0.43, 5.5) and 1.0 is the
-#: published limit.
-JOINT_ACCELERATION_DISCONTINUITY_LIMIT = tuple(
-    CARTESIAN_JOINT_DISCONTINUITY_FACTOR * limit for limit in LIBFRANKA_FER_JOINT_JERK_LIMITS
-)
+def _scaled(limits: Sequence[float]) -> Tuple[float, ...]:
+    return tuple(CARTESIAN_JOINT_DISCONTINUITY_FACTOR * limit for limit in limits)
+
+
+#: Per-joint bound on the IK joint acceleration (error 29) and jerk (30) of a
+#: Cartesian stream, per robot. The FR3's are libfranka >= 0.10's uniform
+#: :data:`MAX_JOINT_ACCELERATION` / :data:`MAX_JOINT_JERK`.
+FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT = _scaled(LIBFRANKA_FER_JOINT_ACCELERATION_LIMITS)
+FER_JOINT_ACCELERATION_DISCONTINUITY_LIMIT = _scaled(LIBFRANKA_FER_JOINT_JERK_LIMITS)
+FR3_JOINT_VELOCITY_DISCONTINUITY_LIMIT = _scaled(MAX_JOINT_ACCELERATION)
+FR3_JOINT_ACCELERATION_DISCONTINUITY_LIMIT = _scaled(MAX_JOINT_JERK)
+
+#: The two tables by FCI protocol version: 5 is the FER (Panda), 10 the FR3.
+JOINT_DISCONTINUITY_LIMITS_BY_PROTOCOL = {
+    5: (FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT, FER_JOINT_ACCELERATION_DISCONTINUITY_LIMIT),
+    10: (FR3_JOINT_VELOCITY_DISCONTINUITY_LIMIT, FR3_JOINT_ACCELERATION_DISCONTINUITY_LIMIT),
+}
+
+
+def joint_discontinuity_limits(
+    protocol_version: int,
+) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+    """The joint-side tables for the robot behind an FCI ``protocol_version``."""
+    try:
+        return JOINT_DISCONTINUITY_LIMITS_BY_PROTOCOL[protocol_version]
+    except KeyError:
+        raise ValueError(
+            f"unsupported protocol version {protocol_version!r}; "
+            f"supported: {tuple(JOINT_DISCONTINUITY_LIMITS_BY_PROTOCOL)}"
+        ) from None
+
 
 #: Environment variable holding a run-time multiplier on both joint-side
-#: thresholds (default 1.0), so the check can be re-tuned against a robot
-#: without touching the code: ``FRANKA_SIM_JOINT_DISCONTINUITY_SCALE=0.8``
-#: tightens both to 80 %, ``=1.3`` loosens them. Same as the
-#: ``--joint-discontinuity-scale`` flag, which wins when both are given.
+#: thresholds (default 1.0): ``FRANKA_SIM_JOINT_DISCONTINUITY_SCALE=0.8``
+#: tightens them to 80 %. ``--joint-discontinuity-scale`` wins over it.
 JOINT_DISCONTINUITY_SCALE_ENV_VAR = "FRANKA_SIM_JOINT_DISCONTINUITY_SCALE"
 
 # -- FR3 per-joint ranges -----------------------------------------------------
@@ -514,7 +488,7 @@ START_ELBOW_SIGN_INCONSISTENT_INDEX = 24
 #: ramp of ``O_T_EE_c`` at 2.5 m/s^2 / 500 m/s^3 from the ready pose was
 #: refused with this error alone on the cycle whose velocity increment reached
 #: 2.5 mm/s, while the same ramp at 1.5 m/s^2 / 200 m/s^3 ran clean. See
-#: :data:`JOINT_VELOCITY_DISCONTINUITY_LIMIT` for the calibration.
+#: :func:`joint_discontinuity_limits` for the calibration.
 CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX = 29
 
 #: ``kCartesianMotionGeneratorJointAccelerationDiscontinuity`` (``error.h:39``)

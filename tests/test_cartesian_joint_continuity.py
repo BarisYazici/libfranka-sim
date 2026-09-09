@@ -8,13 +8,15 @@ on a real FER with ``cartesian_motion_generator_joint_velocity_discontinuity``.
 This file pins the sim's emulation of that judgement
 (:meth:`franka_sim.limits.checker.MotionLimitChecker._check_cartesian_joint_continuity`)
 against the hardware calibration recorded next to
-:data:`franka_sim.limits.tables.JOINT_VELOCITY_DISCONTINUITY_LIMIT`:
+:func:`franka_sim.limits.tables.joint_discontinuity_limits`:
 
 * the calibration itself, cycle for cycle: the 2.5 m/s^2 / 500 m/s^3 ramp from
   the calibration pose trips 29 on joint 2 the moment the per-cycle velocity
   increment reaches 2.5 mm/s, the 1.5 m/s^2 / 200 m/s^3 ramp never does;
 * the cases that must *not* trip -- a motion's opening command, a resume after
   a held reference, lost cycles, libfranka's own Cartesian pose example;
+* the robot behind the FCI version: the FER's per-joint tables under v5, the
+  FR3's published limits under v10, the same ramp judged by each;
 * the plumbing: the scale knob (env var, CLI flag), the no-IK backend, and the
   reflex over the real wire with real physics, including recovery.
 
@@ -55,9 +57,13 @@ from franka_sim.motion_limits import (
     CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX,
     CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX,
     DELTA_T,
+    FER_JOINT_ACCELERATION_DISCONTINUITY_LIMIT,
+    FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT,
+    FR3_JOINT_ACCELERATION_DISCONTINUITY_LIMIT,
+    FR3_JOINT_VELOCITY_DISCONTINUITY_LIMIT,
     JOINT_DISCONTINUITY_SCALE_ENV_VAR,
-    JOINT_VELOCITY_DISCONTINUITY_LIMIT,
     MotionLimitChecker,
+    joint_discontinuity_limits,
     joint_discontinuity_scale_from_env,
 )
 from franka_sim.mujoco_franka_sim import MujocoFrankaSim, default_fr3_mjcf
@@ -91,6 +97,9 @@ FRANKA_HAND_F_T_EE = np.array(
 #: The errors' indices, by the short names the assertions below read best with.
 JOINT_VELOCITY = CARTESIAN_MOTION_GENERATOR_JOINT_VELOCITY_DISCONTINUITY_INDEX
 JOINT_ACCELERATION = CARTESIAN_MOTION_GENERATOR_JOINT_ACCELERATION_DISCONTINUITY_INDEX
+
+#: FCI versions, by the robot they stand for.
+FER, FR3 = 5, 10
 
 
 @pytest.fixture(scope="module")
@@ -175,11 +184,17 @@ def seed_state(sim):
     }
 
 
-def checker_for(sim, mode=ControlMode.CARTESIAN_POSE, scale=1.0, solver=True, **kwargs):
-    """A checker armed for a Cartesian motion on ``sim``'s kinematics."""
+def checker_for(
+    sim, mode=ControlMode.CARTESIAN_POSE, scale=1.0, solver=True, version=FER, **kwargs
+):
+    """A checker armed for a Cartesian motion on ``sim``'s kinematics.
+
+    An FER by default: the calibration below is a Panda's.
+    """
     checker = MotionLimitChecker(
         joint_kinematics=(lambda: sim.joint_space_solver()) if solver else None,
         joint_discontinuity_scale=scale,
+        protocol_version=version,
         **kwargs,
     )
     checker.start_motion(mode, seed_state(sim))
@@ -255,7 +270,7 @@ def test_the_refused_ramp_trips_joint_2_when_the_velocity_increment_reaches_2_5_
     assert violation.error_indices == (JOINT_VELOCITY,), "29 alone, no jerk error"
     assert violation.axis == "joint 2"
     assert violation.unit == "rad/s^2"
-    assert violation.limit == pytest.approx(JOINT_VELOCITY_DISCONTINUITY_LIMIT[1])
+    assert violation.limit == pytest.approx(FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1])
     assert abs(violation.value) == pytest.approx(8.0, abs=0.1)
     # The increments run 0.5, 1.0, 1.5, 2.0, 2.5 mm/s: the fifth command is the
     # first at 2.5 mm/s, and hardware counted the abort on the sixth cycle.
@@ -292,7 +307,7 @@ def test_the_accepted_ramp_runs_clean_to_the_velocity_it_reached_on_hardware(arm
 
     _, velocity, acceleration = checker.cartesian_joint_history()
     assert abs(velocity[1]) > 0.5, "joint 2 is the joint this ramp loads"
-    assert max(abs(a) for a in acceleration) < JOINT_VELOCITY_DISCONTINUITY_LIMIT[1]
+    assert max(abs(a) for a in acceleration) < FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1]
 
 
 @pytest.mark.parametrize(
@@ -355,6 +370,97 @@ def test_the_cartesian_side_still_comes_first(arm):
     assert violation.error_index == CARTESIAN_MOTION_GENERATOR_ACCELERATION_DISCONTINUITY_INDEX
 
 
+# -- the robot behind the FCI version ----------------------------------------
+
+
+def test_the_tables_follow_the_fci_version():
+    """v5: libfranka 0.9's FER tables; v10: libfranka >= 0.10's FR3 ones; else refused."""
+    assert joint_discontinuity_limits(FER) == (
+        (15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0),
+        (7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0),
+    )
+    assert joint_discontinuity_limits(FR3) == ((10.0,) * 7, (5000.0,) * 7)
+    assert joint_discontinuity_limits(FER) == (
+        FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT,
+        FER_JOINT_ACCELERATION_DISCONTINUITY_LIMIT,
+    )
+    assert joint_discontinuity_limits(FR3) == (
+        FR3_JOINT_VELOCITY_DISCONTINUITY_LIMIT,
+        FR3_JOINT_ACCELERATION_DISCONTINUITY_LIMIT,
+    )
+    with pytest.raises(ValueError, match="unsupported protocol version 7"):
+        joint_discontinuity_limits(7)
+    with pytest.raises(ValueError, match="unsupported protocol version 7"):
+        MotionLimitChecker(protocol_version=7)
+
+
+def test_the_server_hands_its_fci_version_to_the_checker():
+    """The version is chosen once, on the server, and reaches every checker it builds."""
+    server = FrankaSimServer(physics_sim=MagicMock(), enable_gripper=False)
+    assert server.protocol_version == FR3
+    assert server.motion_limits._joint_side_limits == joint_discontinuity_limits(FR3)
+    server = FrankaSimServer(physics_sim=MagicMock(), enable_gripper=False, protocol_version=FER)
+    assert server.motion_limits._joint_side_limits == joint_discontinuity_limits(FER)
+    server.reset_state()
+    assert server.motion_limits._joint_side_limits == joint_discontinuity_limits(FER), (
+        "reset_state rebuilds the checker"
+    )
+
+
+def test_a_ramp_between_the_two_tables_is_refused_as_an_fer_and_accepted_as_an_fr3(arm):
+    """2.7 m/s^2 / 500 m/s^3 in +x peaks at 8.5 rad/s^2 on joint 2.
+
+    Over the FER's 7.5 -- refused on the jerk phase's 8.0 rad/s^2 step, as the
+    calibration ramp is -- and under the FR3's 10: the same commands, clean.
+    """
+    ramp = limit_rate_ramp(0.5, 2.7, 500.0, 120)
+
+    checker = checker_for(arm, version=FER)
+    cycle, violation = stream(checker, pose_stream(checker_start_pose(checker), ramp))
+    assert violation is not None and violation.error_indices == (JOINT_VELOCITY,)
+    assert violation.axis == "joint 2"
+    assert violation.limit == pytest.approx(FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1])
+    assert abs(violation.value) == pytest.approx(8.0, abs=0.1)
+    assert cycle == 5
+
+    checker = checker_for(arm, version=FR3)
+    cycle, violation = stream(checker, pose_stream(checker_start_pose(checker), ramp))
+    assert violation is None, f"the FR3 refused ramp cycle {cycle}: {violation.describe()}"
+    _, _, acceleration = checker.cartesian_joint_history()
+    assert abs(acceleration[1]) == pytest.approx(8.5, abs=0.1), "the ramp did load joint 2"
+    assert FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1] < abs(acceleration[1]) < 10.0
+
+
+def test_a_ramp_over_both_tables_is_refused_by_both_robots(arm):
+    """3.5 m/s^2 / 500 m/s^3 reaches 11.2 rad/s^2 on joint 2: over 7.5 and over 10.
+
+    Each robot refuses it at its own limit -- the FER two cycles earlier, on the
+    8.0 step -- with 29 alone: 1600 rad/s^3 is inside both jerk tables.
+    """
+    ramp = limit_rate_ramp(0.5, 3.5, 500.0, 60)
+    expected = {FER: (5, 8.0, FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1]), FR3: (7, 11.2, 10.0)}
+    for version, (trip_cycle, value, limit) in expected.items():
+        checker = checker_for(arm, version=version)
+        cycle, violation = stream(checker, pose_stream(checker_start_pose(checker), ramp))
+        assert violation is not None, f"v{version} accepted the ramp"
+        assert violation.error_indices == (JOINT_VELOCITY,)
+        assert violation.axis == "joint 2"
+        assert violation.limit == pytest.approx(limit)
+        assert abs(violation.value) == pytest.approx(value, abs=0.1)
+        assert cycle == trip_cycle
+
+
+def test_the_scale_applies_to_the_fr3_tables_too(arm):
+    """0.7 x 10 = 7 rad/s^2 on every FR3 joint: the in-between ramp is refused."""
+    checker = checker_for(arm, version=FR3, scale=0.7)
+    cycle, violation = stream(
+        checker, pose_stream(checker_start_pose(checker), limit_rate_ramp(0.5, 2.7, 500.0, 120))
+    )
+    assert violation is not None and violation.error_index == JOINT_VELOCITY
+    assert violation.limit == pytest.approx(FR3_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1] * 0.7)
+    assert cycle == 5
+
+
 # -- the knob -----------------------------------------------------------------
 
 
@@ -372,7 +478,7 @@ def test_tightening_the_scale_refuses_the_ramp_hardware_accepted(arm, scale):
     )
     assert violation is not None and violation.error_index == JOINT_VELOCITY
     assert violation.axis == "joint 2"
-    assert violation.limit == pytest.approx(JOINT_VELOCITY_DISCONTINUITY_LIMIT[1] * scale)
+    assert violation.limit == pytest.approx(FER_JOINT_VELOCITY_DISCONTINUITY_LIMIT[1] * scale)
     assert cycle <= 8 * scale / 0.6 + 1
 
 
@@ -704,9 +810,11 @@ def client():
 def test_the_refused_ramp_is_a_reflex_over_the_wire_and_recovery_clears_it(live_server, client):
     """End to end: kReflexAborted, kReflex with bit 29, recovery, a clean re-Move.
 
-    Real physics, real sockets, enforcement on. The client is libfranka-shaped:
-    it opens the pose motion on the robot's own ``O_T_EE`` and ramps it exactly
-    as the calibration client did. The abort has to reach it as the same reflex
+    Real physics, real sockets, enforcement on, the server's default robot (an
+    FR3). The client is libfranka-shaped: it opens the pose motion on the
+    robot's own ``O_T_EE`` and ramps it as the calibration client did, at
+    3.5 m/s^2 -- 11 rad/s^2 on joint 2, refused by the FR3's table and the
+    FER's alike with 29 alone. The abort has to reach it as the same reflex
     every other motion-limit violation does, and ``AutomaticErrorRecovery`` has
     to leave the arm ready for a motion the robot accepts -- the 1 m/s^2 /
     100 m/s^3 ramp, run from wherever the reflex parked the arm.
@@ -719,7 +827,7 @@ def test_the_refused_ramp_is_a_reflex_over_the_wire_and_recovery_clears_it(live_
         == MoveStatus.kMotionStarted
     )
     start = np.asarray(server.physics_sim.get_robot_state()["O_T_EE"]).reshape(4, 4).T
-    waypoints = pose_stream(start, [0.0] * 3 + limit_rate_ramp(0.5, 2.5, 500.0, 40))
+    waypoints = pose_stream(start, [0.0] * 3 + limit_rate_ramp(0.5, 3.5, 500.0, 40))
     wire.ramp(waypoints, field="o_t_ee_c")
 
     assert wire.read_move_response() == MoveStatus.kReflexAborted

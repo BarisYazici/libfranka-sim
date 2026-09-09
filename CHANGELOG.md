@@ -19,12 +19,16 @@ come with a major version bump.
   the EE frame the arm is driven in, the solutions are differenced like `q_c`,
   and the per-joint velocity / acceleration steps latch 29 / 30 through the
   same reflex plumbing as every other motion-limit check (`kReflexAborted`,
-  `kReflex`, `AutomaticErrorRecovery`). Thresholds are the FER's
-  `kMaxJointAcceleration` / `kMaxJointJerk`, *calibrated against a real Panda*
-  (FCI v5, 2026-09-08: the 2.5 m/s² ramp trips joint 2 at 1.07× its 7.5 rad/s²,
-  the accepted 1.5 m/s² ramp peaks at 0.64×) and pending on the FR3;
-  `--joint-discontinuity-scale` / `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE`
-  re-tunes them without a code change. Silent on a motion's opening command,
+  `kReflex`, `AutomaticErrorRecovery`). Thresholds are the simulated robot's
+  own `kMaxJointAcceleration` / `kMaxJointJerk`, selected by the FCI version
+  the server is built for (`FrankaSimServer(protocol_version=...)`): under v5
+  the FER's per-joint tables (libfranka 0.9), *calibrated against a real
+  Panda* (2026-09-08: the 2.5 m/s² ramp trips joint 2 at 1.07× its 7.5 rad/s²,
+  the accepted 1.5 m/s² ramp peaks at 0.64×, so factor 1.0); under v10 the
+  FR3's published uniform 10 rad/s² / 5000 rad/s³ (libfranka ≥ 0.10) at the
+  same factor, not yet confirmed against an FR3. `--joint-discontinuity-scale`
+  / `FRANKA_SIM_JOINT_DISCONTINUITY_SCALE` re-tunes either without a code
+  change. Silent on a motion's opening command,
   across a held reference and through extrapolated cycles; off on backends
   without IK. See [the joint side of a Cartesian
   command](docs/robot-state.md#the-joint-side-of-a-cartesian-command-29-30).
