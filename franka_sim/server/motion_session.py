@@ -1293,19 +1293,10 @@ class MotionSessionMixin:
         ~70 us, so by the time the next one is due the socket has long been
         drained and the first ``poll(0)`` returns empty.
 
-        The gate also holds a cycle that is counted but still *unanswered* open
-        until ``answer_deadline``: the last state's publish time plus one
-        period, the robot's own "<1 ms constraint" (libfranka
-        ``docs/network_requirements.rst``). This loop's cycle is 1 ms only while
-        it keeps its schedule; when it ran long (600-990 Hz under load) it
-        closed cycles on answers still inside their window -- extrapolating a
-        miss the client had not made, echoing the guess, and rewinding it when
-        the real datagram landed a moment later. A client that re-anchors on
-        the echo (libfranka's rate limiter, franka-rs) then built on the guess
-        while the history held the real command: a float32 ulp of kink per
-        false miss, compounding over a run of them into error 30. A client
-        later than the window is judged exactly as before. The default deadline
-        is in the past, i.e. no window.
+        A counted but still unanswered cycle is also held open until
+        ``answer_deadline`` (the last send plus one period: the robot's "<1 ms
+        constraint"), so a state the pacer fires early to catch up after an
+        overrun cannot close a cycle the client is still inside as lost.
 
         Read-only on the socket. It never calls ``recvfrom`` -- the receive
         thread stays the only consumer -- so polling the same fd from here is

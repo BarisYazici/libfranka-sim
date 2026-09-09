@@ -2368,12 +2368,17 @@ def test_the_drain_gate_gives_the_last_state_its_whole_answering_window(
         # Nothing queued, nothing in flight, but state 2 is unanswered and its
         # window is open: the gate holds until the window closes, no longer.
         waited = server._drain_gate(answer_deadline=time.perf_counter() + window)
-        assert window - 1e-4 <= waited < server._DRAIN_GATE_TIMEOUT
+        assert window - 1e-4 <= waited < window + 1e-3
         # A window already over -- the client really is late -- costs nothing,
         # and neither does an answered cycle.
         assert server._drain_gate(answer_deadline=time.perf_counter() - window) == 0.0
         server.comm.command_received(2)
         assert server._drain_gate(answer_deadline=time.perf_counter() + window) == 0.0
+        # An answer landing inside the window releases the gate at once.
+        server.comm.tick(3)
+        threading.Timer(0.001, server.comm.command_received, (3,)).start()
+        waited = server._drain_gate(answer_deadline=time.perf_counter() + 10 * window)
+        assert 0.0 < waited < 10 * window
     finally:
         server.udp_socket.close()
 

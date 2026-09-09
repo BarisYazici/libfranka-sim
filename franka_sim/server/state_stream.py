@@ -340,7 +340,8 @@ class StateStreamMixin:
                     # accounting and the send, which is the only moment that
                     # sees every datagram this cycle could have brought. See
                     # _drain_gate -- nor before that answer has had its whole
-                    # 1 ms window, however late this loop itself is running.
+                    # 1 ms window, even when the floor below let this state go
+                    # out early.
                     # Whatever it waits for is this cycle's own time, not time
                     # to be made up: the deadline moves with it.
                     next_deadline += self._drain_gate(answer_deadline=last_send + period)
@@ -429,7 +430,9 @@ class StateStreamMixin:
                     # overshoots by, or every cycle would be charged that
                     # overshoot and the nominal 1 kHz would drift down to ~900 Hz.
                     # The client's observed turnaround is well under 100 us, so
-                    # 0.8 ms is still a whole answering window.
+                    # 0.8 ms is still a whole answering window -- and while the
+                    # cycle is counted and unanswered, _drain_gate tops it up to
+                    # the full period.
                     next_deadline = max(next_deadline, last_send + _MIN_STATE_SPACING * period)
 
                     # Log statistics every second
