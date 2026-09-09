@@ -438,6 +438,16 @@ class CommConstraintTracker:
             return self._motion and self._armed
 
     @property
+    def awaiting_answer(self) -> bool:
+        """Whether the open cycle is being counted and has no answer yet.
+
+        Read by the publish loop's drain gate: such a cycle is not closed
+        before the client has had the robot's whole 1 ms window to answer it.
+        """
+        with self._lock:
+            return self._motion and self._armed and not self._received_in_cycle
+
+    @property
     def consecutive_lost(self) -> int:
         """Cycles lost back-to-back, right now."""
         with self._lock:

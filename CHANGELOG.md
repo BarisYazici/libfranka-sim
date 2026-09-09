@@ -48,6 +48,22 @@ come with a major version bump.
   `--enforce-motion-limits` / `FRANKA_SIM_ENFORCE_MOTION_LIMITS`. MuJoCo backend
   only; see [Motion limits](docs/robot-state.md#self_collision_avoidance_violation-2-the-geometric-half).
 
+### Fixed
+
+- **A slow publish loop no longer manufactures lost cycles.** The state loop
+  closed each cycle the moment it got round to the next state, so whenever it
+  ran below 1 kHz (600–990 Hz measured under load) it extrapolated over an
+  answer that was still inside the robot's 1 ms window, echoed the guess in
+  `q_d` / `O_T_EE_c`, and rewound it when the real datagram landed a moment
+  later. A client that re-anchors on the echo every cycle — libfranka's
+  `limitRate`, franka-rs's target control — then built on the guess while the
+  history held the real command: a float32 ulp of kink per false miss,
+  compounding over a run of them into error 30
+  (`cartesian_motion_generator_joint_acceleration_discontinuity`, ~6000 rad/s³
+  on joint 4 against a smooth trajectory). The drain gate now gives the last
+  state its whole window — 1 ms from the moment it went out — before the cycle
+  can close as lost; a client later than that is judged exactly as before.
+
 ## [1.0.0] - 2026-08-24
 
 ### Changed

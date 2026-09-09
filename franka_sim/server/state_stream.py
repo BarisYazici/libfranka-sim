@@ -339,9 +339,11 @@ class StateStreamMixin:
                     # waypoint toward exactly that field. Immediately before the
                     # accounting and the send, which is the only moment that
                     # sees every datagram this cycle could have brought. See
-                    # _drain_gate. Whatever it waits for is this cycle's own
-                    # time, not time to be made up: the deadline moves with it.
-                    next_deadline += self._drain_gate()
+                    # _drain_gate -- nor before that answer has had its whole
+                    # 1 ms window, however late this loop itself is running.
+                    # Whatever it waits for is this cycle's own time, not time
+                    # to be made up: the deadline moves with it.
+                    next_deadline += self._drain_gate(answer_deadline=last_send + period)
 
                     # Close the cycle the previous state opened and open this
                     # one. Done immediately before the send, so "in time for

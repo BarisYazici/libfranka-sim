@@ -133,8 +133,12 @@ the first state tick after `Move`.
 franka-sim now measures whether your client actually keeps up. Every published
 `RobotState` opens a cycle, and the sim expects a `RobotCommand` echoing that
 state's `message_id` back before the next state goes out — precisely what
-libfranka's own control loop sends. Cycles that go unanswered are counted, the
-last command is held through them, and the damage is reported in
+libfranka's own control loop sends. The window is the robot's "<1 ms constraint"
+(libfranka `docs/network_requirements.rst`): a cycle is not closed before 1 ms
+has passed since its state went out, even when the sim's own publish loop is
+running late, so the sim's jitter never reads as your packet loss. Cycles that
+go unanswered are counted, the last command is held through them, and the
+damage is reported in
 `control_command_success_rate` (see
 [communication constraints](robot-state.md#communication-constraints)).
 
@@ -307,8 +311,9 @@ Five things worth knowing before you turn it on:
   client's resumed stream have parted company, the difference between them is a
   real discontinuity and hardware would report it too. Everything else the sim
   can control here is fixed: the publish loop no longer emits two states
-  microseconds apart after an overrun, and it no longer runs ahead of its own
-  receive path.
+  microseconds apart after an overrun, it no longer runs ahead of its own
+  receive path, and it no longer closes a cycle before the client's 1 ms window
+  to answer it is up.
 
 ## Cartesian control
 

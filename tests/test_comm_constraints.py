@@ -98,6 +98,26 @@ def test_cycles_are_not_counted_until_the_client_answers():
     assert tracker.tick(50).active is True
 
 
+def test_the_open_cycle_awaits_an_answer_only_while_it_is_counted():
+    """What the drain gate waits on: a counted cycle with no fresh echo yet."""
+    tracker = CommConstraintTracker()
+    tracker.tick(1)
+    assert tracker.awaiting_answer is False  # no motion
+    tracker.start_motion()
+    assert tracker.awaiting_answer is False  # not armed yet
+    tracker.command_received(1)
+    assert tracker.awaiting_answer is False  # answered
+    tracker.tick(2)
+    assert tracker.awaiting_answer is True
+    tracker.command_received(1)  # a stale echo is not an answer
+    assert tracker.awaiting_answer is True
+    tracker.command_received(2)
+    assert tracker.awaiting_answer is False
+    tracker.tick(3)
+    tracker.end_motion()
+    assert tracker.awaiting_answer is False
+
+
 def test_a_command_echoing_the_published_id_counts_for_that_cycle():
     tracker = CommConstraintTracker()
     tracker.start_motion()

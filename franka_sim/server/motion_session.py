@@ -1252,7 +1252,7 @@ class MotionSessionMixin:
     #: receive thread can run, which is usually all it was waiting for.
     _DRAIN_GATE_YIELD = 0.00005
 
-    def _drain_gate(self) -> float:
+    def _drain_gate(self, answer_deadline: float = 0.0) -> float:
         """Hold the state back while a command the client already sent is queued.
 
         The FCI is one loop: a cycle receives the client's answer, applies it,
@@ -1292,6 +1292,20 @@ class MotionSessionMixin:
         Costs nothing in the ordinary case: the receive path answers a state in
         ~70 us, so by the time the next one is due the socket has long been
         drained and the first ``poll(0)`` returns empty.
+
+        The gate also holds a cycle that is counted but still *unanswered* open
+        until ``answer_deadline``: the last state's publish time plus one
+        period, the robot's own "<1 ms constraint" (libfranka
+        ``docs/network_requirements.rst``). This loop's cycle is 1 ms only while
+        it keeps its schedule; when it ran long (600-990 Hz under load) it
+        closed cycles on answers still inside their window -- extrapolating a
+        miss the client had not made, echoing the guess, and rewinding it when
+        the real datagram landed a moment later. A client that re-anchors on
+        the echo (libfranka's rate limiter, franka-rs) then built on the guess
+        while the history held the real command: a float32 ulp of kink per
+        false miss, compounding over a run of them into error 30. A client
+        later than the window is judged exactly as before. The default deadline
+        is in the past, i.e. no window.
 
         Read-only on the socket. It never calls ``recvfrom`` -- the receive
         thread stays the only consumer -- so polling the same fd from here is
@@ -1356,10 +1370,11 @@ class MotionSessionMixin:
             # 110 urad short on exactly that cycle, i.e. 110 rad/s^2 against a
             # 10 rad/s^2 limit. So the gate waits for the datagram to be
             # *applied*, not merely read.
-            if not queued and self._commands_in_flight == 0:
-                return (time.perf_counter() - started) if waited else 0.0
             now = time.perf_counter()
-            if now >= deadline:
+            if not queued and self._commands_in_flight == 0:
+                if now >= answer_deadline or not self.comm.awaiting_answer:
+                    return (now - started) if waited else 0.0
+            elif now >= deadline:
                 logger.debug(
                     "State publish went ahead with a command still unapplied "
                     "after %.1f ms; the receive path is behind",

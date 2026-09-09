@@ -2342,6 +2342,42 @@ def test_the_drain_gate_waits_for_a_command_read_but_not_yet_applied(
         server.udp_socket.close()
 
 
+def test_the_drain_gate_gives_the_last_state_its_whole_answering_window(
+    mock_physics_sim,
+):
+    """A cycle is not closed as lost before the client had 1 ms to answer it.
+
+    The publish loop's cycle is 1 ms only while it keeps its schedule. When it
+    ran long, the cycle closed the moment the loop got round to it, over an
+    answer still inside its window: the loop extrapolated a miss the client
+    had not made, echoed the guess and rewound it when the real datagram
+    landed -- one float32 ulp of kink per manufactured miss for a client that
+    re-anchors on the echo, compounding over a run of them into error 30.
+    """
+    from franka_sim.franka_sim_server import FrankaSimServer
+
+    server = FrankaSimServer(physics_sim=mock_physics_sim, enable_gripper=False)
+    server.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.udp_socket.bind(("127.0.0.1", 0))
+    window = 0.002
+    try:
+        server.comm.start_motion()
+        server.comm.tick(1)
+        server.comm.command_received(1)
+        server.comm.tick(2)
+        # Nothing queued, nothing in flight, but state 2 is unanswered and its
+        # window is open: the gate holds until the window closes, no longer.
+        waited = server._drain_gate(answer_deadline=time.perf_counter() + window)
+        assert window - 1e-4 <= waited < server._DRAIN_GATE_TIMEOUT
+        # A window already over -- the client really is late -- costs nothing,
+        # and neither does an answered cycle.
+        assert server._drain_gate(answer_deadline=time.perf_counter() - window) == 0.0
+        server.comm.command_received(2)
+        assert server._drain_gate(answer_deadline=time.perf_counter() + window) == 0.0
+    finally:
+        server.udp_socket.close()
+
+
 # -- packet-loss extrapolation: the reference keeps moving through a gap --
 #
 # The FCI does not hold a missed motion-generator cycle, it continues it:
