@@ -194,9 +194,10 @@ FACTOR_CARTESIAN_ROTATION_POSE_INTERFACE = 0.99
 # ramp at 2.5 m/s^2 / 500 m/s^3 puts 8.01 rad/s^2 on joint 2 (1.069x its
 # 7.5) and was refused with 29; 1.5 m/s^2 / 200 m/s^3 (4.81 rad/s^2, 0.641x)
 # passed. Factor 1.0 sits in that bracket and reproduces the trip cycle, so
-# the FER tables are used unscaled. The FR3 uses libfranka >= 0.10's published
-# limits at the same factor 1.0; not yet confirmed against an FR3. The record
-# is in ``docs/robot-state.md``.
+# the FER tables are used unscaled. The FR3 uses the limits Franka publishes
+# (https://frankarobotics.github.io/docs/robot_specifications.html, the same
+# numbers as libfranka >= 0.10) at factor 1.0; the factor is not yet bracketed
+# on an FR3. The record is in ``docs/robot-state.md``.
 
 #: The FER's ``franka::kMaxJointAcceleration`` (libfranka 0.9), rad/s^2.
 LIBFRANKA_FER_JOINT_ACCELERATION_LIMITS = (15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0)
