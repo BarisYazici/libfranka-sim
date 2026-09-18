@@ -143,6 +143,49 @@ python -m franka_sim.run_server -v
 
 In your application, use standard libfranka commands. The simulation will respond exactly like the real robot.
 
+### Docker desktop visualization
+
+On a Linux desktop with X11 or XWayland, the MuJoCo viewer opens a native window.
+The published `1.1.6` server image lacks the graphics libraries needed by `--vis`.
+From this repository's root, build the viewer image once:
+
+```bash
+docker build -f Dockerfile.viewer -t franka-sim:viewer .
+```
+
+`franka-sim:viewer` is the local tag created by this command, not a published image.
+The recipe adds X11 and Mesa libraries to the pinned `1.1.6` server image. To use
+another compatible server image, pass `--build-arg FRANKA_SIM_IMAGE=<image:tag>`.
+
+Stop any other simulator using ports 1337/1338. From a terminal in your desktop session:
+
+```bash
+SIM_XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+test -n "$DISPLAY" && test -f "$SIM_XAUTHORITY"
+
+docker run --rm -it --name franka-sim-viewer --network host \
+  --user "$(id -u):$(id -g)" \
+  -e DISPLAY -e XAUTHORITY=/tmp/sim.xauthority \
+  -e LIBGL_ALWAYS_SOFTWARE=1 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
+  -v "$SIM_XAUTHORITY:/tmp/sim.xauthority:ro" \
+  franka-sim:viewer --physics mujoco --vis
+```
+
+The `test` command must succeed before running Docker. The container uses your existing
+X11 credentials; software rendering needs no GPU passthrough. On Wayland, XWayland must
+be available. A missing display or unreadable Xauthority file needs fixing in the desktop
+session first; this recipe is not for a headless SSH session.
+
+Keep the server terminal running and connect your client to `127.0.0.1` from a second
+terminal. Move the simulated arm with the client's usual example; use the mouse to orbit
+and zoom in the window. Add `--gripper-physics` to show moving fingers. Ctrl-C in the server
+terminal stops the simulator. The viewer and headless server expose the same FCI interface.
+
+`Failed to load Xlib` indicates the headless image was used instead of the viewer image;
+`Failed to open display` or an authorization error indicates the display/credential setup.
+This desktop recipe is tested on Linux, not macOS or Windows.
+
 ### Testing in CI (no robot required)
 
 Because the sim speaks the real wire protocol, your libfranka / franka_ros2 code can be

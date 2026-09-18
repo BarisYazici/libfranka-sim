@@ -1,0 +1,14 @@
+# Desktop viewer dependencies for the otherwise headless simulator image.
+ARG FRANKA_SIM_IMAGE=ghcr.io/barisyazici/franka-sim:1.1.6
+FROM ${FRANKA_SIM_IMAGE}
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libgl1-mesa-dri libglx-mesa0 libx11-6 libxcursor1 libxinerama1 \
+    libxrandr2 libxi6 && rm -rf /var/lib/apt/lists/*
+
+USER franka
+
+# The desktop command runs with the host UID, which may differ from user franka.
+WORKDIR /tmp
+ENV XDG_CACHE_HOME=/tmp/franka-viewer-cache
