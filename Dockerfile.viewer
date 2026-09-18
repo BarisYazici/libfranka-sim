@@ -1,4 +1,6 @@
 # Desktop viewer dependencies for the otherwise headless simulator image.
+# CI overrides this with the matching server it just built; this fallback is
+# an already-published release so local builds work before the next tag ships.
 ARG FRANKA_SIM_IMAGE=ghcr.io/barisyazici/franka-sim:1.1.6
 FROM ${FRANKA_SIM_IMAGE}
 

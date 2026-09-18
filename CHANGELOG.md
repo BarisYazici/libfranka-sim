@@ -7,6 +7,25 @@ come with a major version bump.
 
 ## [Unreleased]
 
+## [1.1.7]
+
+### Added
+
+- Docker desktop viewer with X11 and Mesa software rendering, published as
+  `1.1.7-viewer` and `latest-viewer`. The viewer is built on the matching server
+  image and checked under Xvfb before publication. Main builds publish `edge-viewer`.
+- Desktop launch instructions and a standalone `Dockerfile.viewer` recipe.
+
+### Fixed
+
+- Publish the original universal Python wheel and one source distribution.
+  Previously the release job renamed the same wheel into platform-specific
+  filenames without changing its internal compatibility tags.
+
+## [1.1.6]
+
+The following accumulated 1.1.x notes were already present in the v1.1.6 tag.
+
 ### Added
 
 - **`cartesian_motion_generator_joint_velocity_discontinuity` (29) and

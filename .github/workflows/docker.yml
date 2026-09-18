@@ -8,6 +8,8 @@ on:
   pull_request:
     paths:
       - 'Dockerfile'
+      - 'Dockerfile.viewer'
+      - 'scripts/check_docker_viewer.sh'
       - '.dockerignore'
       - 'action.yml'
       - 'franka_sim/**'
@@ -92,6 +94,19 @@ jobs:
           python -m pip install --quiet .
           franka-sim-check --host 127.0.0.1 --port 1337 --timeout 30
 
+      - name: Build the viewer on this server image
+        run: |
+          docker build -f Dockerfile.viewer \
+            --build-arg FRANKA_SIM_IMAGE='${{ steps.meta.outputs.image }}:ci' \
+            -t '${{ steps.meta.outputs.image }}:ci-viewer' .
+
+      - name: Check the native viewer on a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth x11-utils
+          xvfb-run -a -s '-screen 0 1280x720x24 -ac -nolisten tcp' \
+            bash scripts/check_docker_viewer.sh '${{ steps.meta.outputs.image }}:ci-viewer'
+
       - name: Server logs
         if: always()
         run: docker logs franka-sim || true
@@ -109,6 +124,8 @@ jobs:
         run: |
           docker tag '${{ steps.meta.outputs.image }}:ci' '${{ steps.meta.outputs.image }}:edge'
           docker push '${{ steps.meta.outputs.image }}:edge'
+          docker tag '${{ steps.meta.outputs.image }}:ci-viewer' '${{ steps.meta.outputs.image }}:edge-viewer'
+          docker push '${{ steps.meta.outputs.image }}:edge-viewer'
 
       - name: Publish :<version> and :latest (tag)
         if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch'
@@ -119,3 +136,7 @@ jobs:
           docker tag "$image:ci" "$image:latest"
           docker push "$image:$version"
           docker push "$image:latest"
+          docker tag "$image:ci-viewer" "$image:$version-viewer"
+          docker tag "$image:ci-viewer" "$image:latest-viewer"
+          docker push "$image:$version-viewer"
+          docker push "$image:latest-viewer"
