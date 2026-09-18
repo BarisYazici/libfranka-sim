@@ -146,16 +146,24 @@ In your application, use standard libfranka commands. The simulation will respon
 ### Docker desktop visualization
 
 On a Linux desktop with X11 or XWayland, the MuJoCo viewer opens a native window.
-The published `1.1.6` server image lacks the graphics libraries needed by `--vis`.
-From this repository's root, build the viewer image once:
+The standard server image is headless. Once the v1.1.7 Docker release workflow
+finishes, use the viewer image:
+
+```bash
+docker pull ghcr.io/barisyazici/franka-sim:1.1.7-viewer
+```
+
+To build locally before publication, run from this repository's root:
 
 ```bash
 docker build -f Dockerfile.viewer -t franka-sim:viewer .
 ```
 
 `franka-sim:viewer` is the local tag created by this command, not a published image.
-The recipe adds X11 and Mesa libraries to the pinned `1.1.6` server image. To use
-another compatible server image, pass `--build-arg FRANKA_SIM_IMAGE=<image:tag>`.
+The standalone recipe defaults to the already-published `1.1.6` server. To build
+on `1.1.7` after it is published, add
+`--build-arg FRANKA_SIM_IMAGE=ghcr.io/barisyazici/franka-sim:1.1.7`.
+The release workflow always uses its own matching server build.
 
 Stop any other simulator using ports 1337/1338. From a terminal in your desktop session:
 
@@ -169,9 +177,10 @@ docker run --rm -it --name franka-sim-viewer --network host \
   -e LIBGL_ALWAYS_SOFTWARE=1 \
   -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
   -v "$SIM_XAUTHORITY:/tmp/sim.xauthority:ro" \
-  franka-sim:viewer --physics mujoco --vis
+  ghcr.io/barisyazici/franka-sim:1.1.7-viewer --physics mujoco --vis
 ```
 
+For a local build, replace the image name with `franka-sim:viewer`.
 The `test` command must succeed before running Docker. The container uses your existing
 X11 credentials; software rendering needs no GPU passthrough. On Wayland, XWayland must
 be available. A missing display or unreadable Xauthority file needs fixing in the desktop
